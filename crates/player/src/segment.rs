@@ -19,9 +19,10 @@ pub enum SegmentId {
     UpperLegR,
     LowerLegR,
     FootR,
+    _Count,  // keep last — used to derive SEGMENT_COUNT
 }
 
-pub const SEGMENT_COUNT: usize = 17;
+pub const SEGMENT_COUNT: usize = SegmentId::_Count as usize;
 
 impl SegmentId {
     pub fn all() -> [SegmentId; SEGMENT_COUNT] {
@@ -45,7 +46,7 @@ pub enum BodyType {
     Quarterback,  // ~102 kg
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SegmentDef {
     pub mass: f64,
     pub radius: f64,       // capsule radius (m)
@@ -57,7 +58,7 @@ impl SegmentDef {
     pub fn inertia_tensor(&self) -> Mat3 {
         let m = self.mass;
         let r = self.radius;
-        let h = 2.0 * self.half_height;
+        let h = 2.0 * self.half_height;  // h = full cylinder height (not half_height)
         let i_axial = 0.5 * m * r * r;
         let i_trans = (1.0 / 12.0) * m * (3.0 * r * r + h * h);
         Mat3::new(
@@ -71,6 +72,10 @@ impl SegmentDef {
 /// Mass fraction and dimensions for each segment, scaled by total body mass.
 struct SegmentParams { mass_frac: f64, radius_m: f64, half_h_m: f64 }
 
+/// Mass fractions for each segment. These sum to ~0.932 (not 1.0) because
+/// the model omits extremity detail (finger bones, etc.). The remaining ~6.8%
+/// of body mass is considered distributed across modelled segments and does
+/// not affect relative segment proportions meaningfully for a physics simulation.
 fn params(seg: SegmentId) -> SegmentParams {
     match seg {
         SegmentId::Pelvis     => SegmentParams { mass_frac: 0.142, radius_m: 0.12, half_h_m: 0.10 },
@@ -90,6 +95,7 @@ fn params(seg: SegmentId) -> SegmentParams {
         SegmentId::UpperLegR  => SegmentParams { mass_frac: 0.100, radius_m: 0.07, half_h_m: 0.20 },
         SegmentId::LowerLegR  => SegmentParams { mass_frac: 0.047, radius_m: 0.05, half_h_m: 0.19 },
         SegmentId::FootR      => SegmentParams { mass_frac: 0.014, radius_m: 0.04, half_h_m: 0.12 },
+        SegmentId::_Count     => unreachable!("_Count is a sentinel, not a real segment"),
     }
 }
 
@@ -102,6 +108,12 @@ fn total_mass(body_type: BodyType) -> f64 {
 }
 
 pub fn segment_def(body_type: BodyType, seg: SegmentId) -> SegmentDef {
+    // Validate fraction sum in debug builds (excludes _Count sentinel)
+    #[cfg(debug_assertions)]
+    {
+        let sum: f64 = SegmentId::all().iter().map(|&s| params(s).mass_frac).sum();
+        debug_assert!((sum - 0.932).abs() < 0.01, "mass fraction sum changed: {}", sum);
+    }
     let p = params(seg);
     let mass = total_mass(body_type) * p.mass_frac;
     SegmentDef { mass, radius: p.radius_m, half_height: p.half_h_m }
