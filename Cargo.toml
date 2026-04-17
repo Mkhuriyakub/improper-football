@@ -15,6 +15,10 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
+[[bin]]
+name = "tackle_sim"
+path = "src/bin/tackle_sim.rs"
+
 [workspace]
 members = [
     ".",
