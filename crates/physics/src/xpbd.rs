@@ -28,14 +28,16 @@ impl XpbdWorld {
     pub fn step(&mut self, dt: f64) {
         let sub_dt = dt / SOLVER_ITERATIONS as f64;
 
+        // Accumulate each sub-step with the same external forces; clear once after all sub-steps.
+        // Forces represent a continuous load over the full dt, so they must act in every sub-step.
         for _ in 0..SOLVER_ITERATIONS {
             self.integrate_velocities(sub_dt);
             self.predict_positions(sub_dt);
             self.reset_lambdas();
             self.solve_constraints(sub_dt);
             self.update_velocities(sub_dt);
-            self.clear_accumulators();
         }
+        self.clear_accumulators();
     }
 
     fn integrate_velocities(&mut self, dt: f64) {

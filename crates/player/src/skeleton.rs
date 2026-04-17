@@ -70,27 +70,33 @@ fn joint_defs() -> [JointDef; JOINT_COUNT] {
     ]
 }
 
+// Y offsets derived from joint anchor chain so every joint starts with zero constraint error.
+// Chain: foot=0.04 → lower_leg=0.27 (+0.23) → upper_leg=0.66 (+0.39) → pelvis=0.96 (+0.30)
+//        pelvis → lumbar=1.15 (+0.19) → chest=1.38 (+0.23) → neck=1.58 (+0.20) → head=1.74 (+0.16)
+//        chest shoulder → upper_arm=1.33 → lower_arm=1.05 → hand=0.87
 fn segment_y_offset(seg: SegmentId) -> f64 {
     match seg {
-        SegmentId::FootL | SegmentId::FootR                         => 0.04,
-        SegmentId::LowerLegL | SegmentId::LowerLegR                => 0.28,
-        SegmentId::UpperLegL | SegmentId::UpperLegR                => 0.62,
-        SegmentId::Pelvis                                           => 0.90,
-        SegmentId::Lumbar                                           => 1.05,
-        SegmentId::Chest                                            => 1.22,
-        SegmentId::Neck                                             => 1.42,
-        SegmentId::Head                                             => 1.56,
-        SegmentId::UpperArmL | SegmentId::UpperArmR                => 1.38,
-        SegmentId::LowerArmL | SegmentId::LowerArmR                => 1.15,
-        SegmentId::HandL | SegmentId::HandR                        => 0.95,
-        SegmentId::_Count                                           => unreachable!(),
+        SegmentId::FootL | SegmentId::FootR                        => 0.04,
+        SegmentId::LowerLegL | SegmentId::LowerLegR               => 0.27,
+        SegmentId::UpperLegL | SegmentId::UpperLegR               => 0.66,
+        SegmentId::Pelvis                                          => 0.96,
+        SegmentId::Lumbar                                          => 1.15,
+        SegmentId::Chest                                           => 1.38,
+        SegmentId::Neck                                            => 1.58,
+        SegmentId::Head                                            => 1.74,
+        SegmentId::UpperArmL | SegmentId::UpperArmR               => 1.33,
+        SegmentId::LowerArmL | SegmentId::LowerArmR               => 1.05,
+        SegmentId::HandL | SegmentId::HandR                       => 0.87,
+        SegmentId::_Count                                          => unreachable!(),
     }
 }
 
+// X offsets match joint anchor X values so constraints start satisfied.
+// Chest shoulder anchor at x=±0.14, so arm segments share x=±0.14.
 fn segment_x_offset(seg: SegmentId) -> f64 {
     match seg {
-        SegmentId::UpperArmL | SegmentId::LowerArmL | SegmentId::HandL   => -0.24,
-        SegmentId::UpperArmR | SegmentId::LowerArmR | SegmentId::HandR   =>  0.24,
+        SegmentId::UpperArmL | SegmentId::LowerArmL | SegmentId::HandL   => -0.14,
+        SegmentId::UpperArmR | SegmentId::LowerArmR | SegmentId::HandR   =>  0.14,
         SegmentId::UpperLegL | SegmentId::LowerLegL | SegmentId::FootL   => -0.10,
         SegmentId::UpperLegR | SegmentId::LowerLegR | SegmentId::FootR   =>  0.10,
         _ => 0.0,
