@@ -72,8 +72,8 @@ impl SegmentDef {
 /// Mass fraction and dimensions for each segment, scaled by total body mass.
 struct SegmentParams { mass_frac: f64, radius_m: f64, half_h_m: f64 }
 
-/// Mass fractions for each segment. These sum to ~0.932 (not 1.0) because
-/// the model omits extremity detail (finger bones, etc.). The remaining ~6.8%
+/// Mass fractions for each segment. These sum to ~0.952 (not 1.0) because
+/// the model omits extremity detail (finger bones, etc.). The remaining ~4.8%
 /// of body mass is considered distributed across modelled segments and does
 /// not affect relative segment proportions meaningfully for a physics simulation.
 fn params(seg: SegmentId) -> SegmentParams {
@@ -112,7 +112,7 @@ pub fn segment_def(body_type: BodyType, seg: SegmentId) -> SegmentDef {
     #[cfg(debug_assertions)]
     {
         let sum: f64 = SegmentId::all().iter().map(|&s| params(s).mass_frac).sum();
-        debug_assert!((sum - 0.932).abs() < 0.01, "mass fraction sum changed: {}", sum);
+        debug_assert!((sum - 0.952).abs() < 0.01, "mass fraction sum changed: {}", sum);
     }
     let p = params(seg);
     let mass = total_mass(body_type) * p.mass_frac;
