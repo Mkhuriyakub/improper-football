@@ -1,0 +1,63 @@
+use bevy::prelude::*;
+use crate::plugins::sim::{CarrierRes, DefenderRes};
+use crate::render_util::nalgebra_vec3_to_bevy;
+use player::segment::SegmentId;
+
+#[derive(Resource)]
+pub struct CameraConfig {
+    pub offset: Vec3,
+    pub alpha: f32,
+}
+
+impl Default for CameraConfig {
+    fn default() -> Self {
+        Self {
+            offset: Vec3::new(-8.0, 6.0, 0.0),
+            alpha: 0.05,
+        }
+    }
+}
+
+pub fn spring_follow(current: Vec3, target: Vec3, alpha: f32) -> Vec3 {
+    current.lerp(target, alpha)
+}
+
+pub struct CameraPlugin;
+
+impl Plugin for CameraPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(CameraConfig::default())
+           .add_systems(Startup, spawn_camera)
+           .add_systems(Update, follow_action);
+    }
+}
+
+fn spawn_camera(mut commands: Commands) {
+    commands.spawn(Camera3dBundle {
+        transform: Transform::from_xyz(-8.0, 6.0, 26.0)
+            .looking_at(Vec3::new(4.0, 1.0, 26.0), Vec3::Y),
+        ..default()
+    });
+}
+
+fn follow_action(
+    carrier: Res<CarrierRes>,
+    defender: Res<DefenderRes>,
+    cfg: Res<CameraConfig>,
+    mut cam_query: Query<&mut Transform, With<Camera3d>>,
+) {
+    let c_pos = nalgebra_vec3_to_bevy(
+        carrier.player.skeleton.bodies[SegmentId::Pelvis.idx()].position
+    );
+    let d_pos = nalgebra_vec3_to_bevy(
+        defender.player.skeleton.bodies[SegmentId::Pelvis.idx()].position
+    );
+    let midpoint = (c_pos + d_pos) * 0.5;
+    let target = midpoint + cfg.offset;
+
+    for mut transform in &mut cam_query {
+        let new_pos = spring_follow(transform.translation, target, cfg.alpha);
+        *transform = Transform::from_translation(new_pos)
+            .looking_at(midpoint, Vec3::Y);
+    }
+}
