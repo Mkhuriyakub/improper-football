@@ -34,11 +34,11 @@ pub enum JointKind {
 
 pub fn default_pd(joint_type: JointKind) -> PdController {
     match joint_type {
-        JointKind::HipKnee    => PdController { kp: 800.0, kd: 80.0 },
-        JointKind::Ankle      => PdController { kp: 600.0, kd: 60.0 },
-        JointKind::Spine      => PdController { kp: 400.0, kd: 40.0 },
-        JointKind::Shoulder   => PdController { kp: 300.0, kd: 30.0 },
-        JointKind::ElbowWrist => PdController { kp: 150.0, kd: 15.0 },
-        JointKind::Neck       => PdController { kp: 200.0, kd: 20.0 },
+        JointKind::HipKnee    => PdController { kp: 2000.0, kd: 120.0 },
+        JointKind::Ankle      => PdController { kp: 1500.0, kd:  90.0 },
+        JointKind::Spine      => PdController { kp: 3000.0, kd: 180.0 },
+        JointKind::Shoulder   => PdController { kp: 1200.0, kd:  80.0 },
+        JointKind::ElbowWrist => PdController { kp:  600.0, kd:  40.0 },
+        JointKind::Neck       => PdController { kp: 1200.0, kd:  80.0 },
     }
 }

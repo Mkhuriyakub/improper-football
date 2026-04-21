@@ -1,5 +1,6 @@
 use crate::rigid_body::RigidBody;
 use crate::constraints::PositionalConstraint;
+use crate::angular_constraint::AngularLimitConstraint;
 use crate::math::Vec3;
 use nalgebra::UnitQuaternion;
 
@@ -9,6 +10,7 @@ pub const SOLVER_ITERATIONS: usize = 10;
 pub struct XpbdWorld {
     pub bodies: Vec<RigidBody>,
     pub constraints: Vec<PositionalConstraint>,
+    pub angular_constraints: Vec<AngularLimitConstraint>,
 }
 
 impl XpbdWorld {
@@ -16,6 +18,7 @@ impl XpbdWorld {
         Self {
             bodies: Vec::new(),
             constraints: Vec::new(),
+            angular_constraints: Vec::new(),
         }
     }
 
@@ -27,16 +30,23 @@ impl XpbdWorld {
 
     pub fn step(&mut self, dt: f64) {
         let sub_dt = dt / SOLVER_ITERATIONS as f64;
-
-        // Accumulate each sub-step with the same external forces; clear once after all sub-steps.
-        // Forces represent a continuous load over the full dt, so they must act in every sub-step.
         for _ in 0..SOLVER_ITERATIONS {
-            self.integrate_velocities(sub_dt);
-            self.predict_positions(sub_dt);
-            self.reset_lambdas();
-            self.solve_constraints(sub_dt);
-            self.update_velocities(sub_dt);
+            self.substep(sub_dt);
         }
+    }
+
+    /// Run one substep: integrate velocities → predict positions → solve constraints → clear.
+    /// Call this in a loop with external force application between iterations for per-substep
+    /// PD control (forces must be re-applied each call since clear_accumulators is called here).
+    pub fn substep(&mut self, sub_dt: f64) {
+        self.integrate_velocities(sub_dt);
+        self.predict_positions(sub_dt);
+        self.reset_lambdas();
+        self.solve_constraints(sub_dt);
+        // Velocities come from force/torque integration only. Constraint corrections
+        // act directly on positions/orientations each substep (PBD style). Deriving
+        // velocity from position delta amplifies tiny constraint corrections by 1/sub_dt
+        // (~1200x) into velocity spikes that cause visible shaking.
         self.clear_accumulators();
     }
 
@@ -45,7 +55,6 @@ impl XpbdWorld {
             if body.inv_mass == 0.0 {
                 continue;
             }
-            // Gravity + accumulated forces
             let accel = GRAVITY + body.force_accumulator * body.inv_mass;
             body.linear_velocity += accel * dt;
 
@@ -71,11 +80,13 @@ impl XpbdWorld {
         for c in &mut self.constraints {
             c.reset_lambda();
         }
+        for c in &mut self.angular_constraints {
+            c.reset_lambda();
+        }
     }
 
     fn solve_constraints(&mut self, dt: f64) {
         for i in 0..self.constraints.len() {
-            // Temporarily move constraint out to satisfy borrow checker
             let mut constraint = std::mem::replace(
                 &mut self.constraints[i],
                 PositionalConstraint::new(0, 0, 0.0, 0.0),
@@ -83,13 +94,14 @@ impl XpbdWorld {
             constraint.solve(&mut self.bodies, dt);
             self.constraints[i] = constraint;
         }
-    }
-
-    fn update_velocities(&mut self, dt: f64) {
-        // Velocities are derived from position deltas in full XPBD;
-        // here we rely on integrate_velocities for simplicity in this phase.
-        // Full velocity update (for restitution/friction) comes in Phase 3.
-        let _ = dt;
+        for i in 0..self.angular_constraints.len() {
+            let mut constraint = std::mem::replace(
+                &mut self.angular_constraints[i],
+                AngularLimitConstraint::new(0, 1, Vec3::z(), 0.0, 0.0),
+            );
+            constraint.solve(&mut self.bodies, dt);
+            self.angular_constraints[i] = constraint;
+        }
     }
 
     fn clear_accumulators(&mut self) {

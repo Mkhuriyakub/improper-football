@@ -23,9 +23,9 @@ impl Default for StrideGenerator {
     fn default() -> Self {
         Self {
             stride_length: 1.4,
-            hip_amplitude: 0.45,
-            knee_amplitude: 0.70,
-            ankle_amplitude: 0.25,
+            hip_amplitude: 0.25,
+            knee_amplitude: 0.35,
+            ankle_amplitude: 0.12,
         }
     }
 }
@@ -37,7 +37,7 @@ impl StrideGenerator {
         let stride_freq = if speed < 0.1 {
             0.0
         } else {
-            (speed / self.stride_length).clamp(0.5, 3.5)
+            (speed / self.stride_length).clamp(0.5, 2.5)
         };
 
         let phase_l = 2.0 * PI * stride_freq * t;
@@ -45,8 +45,9 @@ impl StrideGenerator {
 
         let hip_flex_l   =  self.hip_amplitude * phase_l.sin();
         let hip_flex_r   =  self.hip_amplitude * phase_r.sin();
-        let knee_flex_l  = self.knee_amplitude * (-phase_l.sin()).max(0.0);
-        let knee_flex_r  = self.knee_amplitude * (-phase_r.sin()).max(0.0);
+        // Knee bends during swing (sin > 0 = leg moving forward), straight during stance.
+        let knee_flex_l  = self.knee_amplitude * phase_l.sin().max(0.0);
+        let knee_flex_r  = self.knee_amplitude * phase_r.sin().max(0.0);
         let ankle_flex_l = self.ankle_amplitude * phase_l.cos();
         let ankle_flex_r = self.ankle_amplitude * phase_r.cos();
 

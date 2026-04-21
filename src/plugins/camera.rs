@@ -12,8 +12,8 @@ pub struct CameraConfig {
 impl Default for CameraConfig {
     fn default() -> Self {
         Self {
-            offset: Vec3::new(-8.0, 6.0, 0.0),
-            alpha: 0.05,
+            offset: Vec3::new(-8.0, 6.0, 8.0),
+            alpha: 0.15,
         }
     }
 }
@@ -34,8 +34,8 @@ impl Plugin for CameraPlugin {
 
 fn spawn_camera(mut commands: Commands) {
     commands.spawn(Camera3dBundle {
-        transform: Transform::from_xyz(-8.0, 6.0, 26.0)
-            .looking_at(Vec3::new(4.0, 1.0, 26.0), Vec3::Y),
+        transform: Transform::from_xyz(37.0, 8.0, 34.5)
+            .looking_at(Vec3::new(48.5, 1.0, 26.5), Vec3::Y),
         ..default()
     });
 }

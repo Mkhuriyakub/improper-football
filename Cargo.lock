@@ -2200,6 +2200,7 @@ version = "0.1.0"
 dependencies = [
  "ball",
  "bevy",
+ "nalgebra",
  "physics",
  "player",
 ]
