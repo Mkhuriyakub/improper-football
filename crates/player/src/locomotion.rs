@@ -10,6 +10,9 @@ pub struct LegTargets {
     pub knee_flex_r: f64,
     pub ankle_flex_l: f64,
     pub ankle_flex_r: f64,
+    /// Arm swing angle (negative Z = forward). Arms counter-swing opposite legs.
+    pub arm_swing_l: f64,
+    pub arm_swing_r: f64,
 }
 
 pub struct StrideGenerator {
@@ -23,9 +26,9 @@ impl Default for StrideGenerator {
     fn default() -> Self {
         Self {
             stride_length: 1.4,
-            hip_amplitude: 0.25,
-            knee_amplitude: 0.35,
-            ankle_amplitude: 0.12,
+            hip_amplitude: 0.15,
+            knee_amplitude: 0.20,
+            ankle_amplitude: 0.10,
         }
     }
 }
@@ -51,8 +54,15 @@ impl StrideGenerator {
         let ankle_flex_l = self.ankle_amplitude * phase_l.cos();
         let ankle_flex_r = self.ankle_amplitude * phase_r.cos();
 
+        // Arms counter-swing opposite to legs: left arm forward when right leg forward.
+        // Negative Z = forward swing (same convention as hip_flex → upper-leg Z rotation).
+        let arm_amp    = 0.22_f64;
+        let arm_swing_l = -arm_amp * phase_r.sin();
+        let arm_swing_r = -arm_amp * phase_l.sin();
+
         LegTargets { stride_freq, hip_flex_l, hip_flex_r,
-                     knee_flex_l, knee_flex_r, ankle_flex_l, ankle_flex_r }
+                     knee_flex_l, knee_flex_r, ankle_flex_l, ankle_flex_r,
+                     arm_swing_l, arm_swing_r }
     }
 }
 

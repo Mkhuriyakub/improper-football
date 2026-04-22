@@ -48,11 +48,11 @@ impl Player {
                 body.apply_force(Vec3::new(0.0, body.mass * 9.81, 0.0));
             }
 
-            // Pelvis height spring (target y = 0.96 m).
+            // Pelvis height spring (target y = 0.90 m — running crouch; leg chain = 0.92 m gives 2 cm knee slack).
             {
                 let py  = world.bodies[SegmentId::Pelvis.idx()].position.y;
                 let pvy = world.bodies[SegmentId::Pelvis.idx()].linear_velocity.y;
-                let f   = (0.96 - py) * 6000.0 - pvy * 400.0;
+                let f   = (0.90 - py) * 6000.0 - pvy * 400.0;
                 world.bodies[SegmentId::Pelvis.idx()]
                     .apply_force(Vec3::new(0.0, f, 0.0));
             }
@@ -107,7 +107,7 @@ impl Player {
             (SegmentId::LowerLegR, 0.05),
             (SegmentId::UpperLegL, 0.07),
             (SegmentId::UpperLegR, 0.07),
-            (SegmentId::Pelvis,    0.12),
+            (SegmentId::Pelvis,    0.10),
         ];
         for (seg, min_y) in clamps {
             let body = &mut self.skeleton.bodies[seg.idx()];
@@ -138,7 +138,6 @@ impl Player {
         );
 
         // ── Spine ─────────────────────────────────────────────────────────────
-        // kp/kd = 12 → ω_eq ≤ 12 × 0.4 = 4.8 rad/s at max lean
         let spine_kp = 1200.0_f64;
         let spine_kd =  100.0_f64;
         for seg in [SegmentId::Pelvis, SegmentId::Lumbar, SegmentId::Chest,
@@ -146,28 +145,32 @@ impl Player {
         {
             Self::orient_spring(&mut bodies[seg.idx()], fwd_lean, spine_kp, spine_kd);
         }
-        // Extra anti-roll on pelvis.
         Self::orient_spring(&mut bodies[SegmentId::Pelvis.idx()], upright, 400.0, 60.0);
 
-        // ── Arms ──────────────────────────────────────────────────────────────
-        let arm_kp  = 400.0_f64;
-        let arm_kd  =  60.0_f64;
-        let arm_l   = UnitQuaternion::from_scaled_axis(
-            Vec3::new(0.0, 0.0,  pose.left_shoulder_flex  * 0.3),
-        );
-        let arm_r   = UnitQuaternion::from_scaled_axis(
-            Vec3::new(0.0, 0.0, -pose.right_shoulder_flex * 0.3),
-        );
+        // ── Arms — counter-swing opposite to legs, elbow gently bent ─────────
+        // Arm inertia is tiny (~0.0085 kg·m²), so gains must be very low.
+        // kp/kd = 50/30 → ω_eq ≤ 1.7 × 0.22 = 0.37 rad/s — no flailing possible.
+        let arm_kp   =  50.0_f64;
+        let arm_kd   =  30.0_f64;
+
+        // Upper arm swings in sagittal plane (Z axis).
+        let arm_l = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, targets.arm_swing_l));
+        let arm_r = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, targets.arm_swing_r));
         Self::orient_spring(&mut bodies[SegmentId::UpperArmL.idx()], arm_l, arm_kp, arm_kd);
         Self::orient_spring(&mut bodies[SegmentId::UpperArmR.idx()], arm_r, arm_kp, arm_kd);
-        for seg in [SegmentId::LowerArmL, SegmentId::HandL,
-                    SegmentId::LowerArmR, SegmentId::HandR]
-        {
-            Self::orient_spring(&mut bodies[seg.idx()], upright, arm_kp * 0.5, arm_kd * 0.5);
-        }
+
+        // Forearm: gentle elbow bend (0.40 rad ≈ 23° of additional Z rotation).
+        // Kept small to avoid large initial error — arms start at identity orientation.
+        let elbow_bend = 0.40_f64;
+        let la_l = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, targets.arm_swing_l + elbow_bend));
+        let la_r = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, targets.arm_swing_r + elbow_bend));
+        Self::orient_spring(&mut bodies[SegmentId::LowerArmL.idx()], la_l, arm_kp, arm_kd);
+        Self::orient_spring(&mut bodies[SegmentId::LowerArmR.idx()], la_r, arm_kp, arm_kd);
+        Self::orient_spring(&mut bodies[SegmentId::HandL.idx()], upright, arm_kp * 0.4, arm_kd * 0.4);
+        Self::orient_spring(&mut bodies[SegmentId::HandR.idx()], upright, arm_kp * 0.4, arm_kd * 0.4);
 
         // ── Legs ──────────────────────────────────────────────────────────────
-        // kp/kd = 12.5 → ω_eq ≤ 12.5 × 1.2 = 15 rad/s at max knee flex (within 20 clamp)
+        // kp=550 tracks smoothly without snapping (ω_eq = 550/75 × 0.25 = 1.8 rad/s).
         let hip_l  = targets.hip_flex_l .clamp(-0.52, 0.70);
         let hip_r  = targets.hip_flex_r .clamp(-0.52, 0.70);
         let knee_l = targets.knee_flex_l.clamp( 0.00, 1.20);
@@ -175,8 +178,10 @@ impl Player {
         let ank_l  = targets.ankle_flex_l.clamp(-0.30, 0.30);
         let ank_r  = targets.ankle_flex_r.clamp(-0.30, 0.30);
 
-        let leg_kp = 1000.0_f64;
-        let leg_kd =   80.0_f64;
+        let leg_kp  = 550.0_f64;
+        let leg_kd  =  75.0_f64;
+        let foot_kp = 220.0_f64;
+        let foot_kd =  55.0_f64;
 
         let ul_l = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, -hip_l));
         let ul_r = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, -hip_r));
@@ -190,7 +195,7 @@ impl Player {
 
         let ft_l = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, -hip_l + knee_l + ank_l));
         let ft_r = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, -hip_r + knee_r + ank_r));
-        Self::orient_spring(&mut bodies[SegmentId::FootL.idx()], ft_l, leg_kp * 0.5, leg_kd * 0.5);
-        Self::orient_spring(&mut bodies[SegmentId::FootR.idx()], ft_r, leg_kp * 0.5, leg_kd * 0.5);
+        Self::orient_spring(&mut bodies[SegmentId::FootL.idx()], ft_l, foot_kp, foot_kd);
+        Self::orient_spring(&mut bodies[SegmentId::FootR.idx()], ft_r, foot_kp, foot_kd);
     }
 }
