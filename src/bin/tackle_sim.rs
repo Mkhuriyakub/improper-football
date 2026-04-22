@@ -23,6 +23,14 @@ fn pelvis_y(player: &Player) -> f64 {
     player.skeleton.bodies[SegmentId::Pelvis.idx()].position.y
 }
 
+fn foot_y(player: &Player, seg: SegmentId) -> f64 {
+    player.skeleton.bodies[seg.idx()].position.y
+}
+
+fn arm_ang(player: &Player, seg: SegmentId) -> f64 {
+    player.skeleton.bodies[seg.idx()].angular_velocity.norm()
+}
+
 fn pelvis_x(player: &Player) -> f64 {
     player.skeleton.bodies[SegmentId::Pelvis.idx()].position.x
 }
@@ -37,9 +45,9 @@ fn main() {
     defender.role = Role::DefenderRush;
 
     println!("TACKLE SIMULATION");
-    println!("{:<8} {:<12} {:<12} {:<12} {:<12}",
-             "t(s)", "carrier_x", "carrier_y", "def_x", "def_y");
-    println!("{}", "-".repeat(60));
+    println!("{:<7} {:<8} {:<7} {:<7} {:<8} {:<8} {:<8}",
+             "t", "pel_y", "fL", "fR", "GAIT", "armL_ω", "armR_ω");
+    println!("{}", "-".repeat(62));
 
     let mut t = 0.0;
     let mut next_print = 0.0;
@@ -70,9 +78,18 @@ fn main() {
         t += DT;
 
         if t >= next_print {
-            println!("{:<8.2} {:<12.3} {:<12.3} {:<12.3} {:<12.3}",
-                     t, pelvis_x(&carrier), pelvis_y(&carrier),
-                     pelvis_x(&defender), pelvis_y(&defender));
+            let fl = foot_y(&carrier, SegmentId::FootL);
+            let fr = foot_y(&carrier, SegmentId::FootR);
+            let gait = match (fl < 0.06, fr < 0.06) {
+                (true, false)  => "L-sta",
+                (false, true)  => "R-sta",
+                (true, true)   => "both-gnd",
+                (false, false) => "AIRBORNE",
+            };
+            println!("{:<7.2} {:<8.3} {:<7.3} {:<7.3} {:<8} {:<8.2} {:<8.2}",
+                     t, pelvis_y(&carrier), fl, fr, gait,
+                     arm_ang(&carrier, SegmentId::UpperArmL),
+                     arm_ang(&carrier, SegmentId::UpperArmR));
             next_print += PRINT_INTERVAL;
         }
     }

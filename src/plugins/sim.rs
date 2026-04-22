@@ -125,18 +125,29 @@ fn step_physics(
     ).unwrap();
 
     if dist < 0.8 {
+        // Tackle state: kill drive, disable gravity cancel, lower pelvis target.
+        // Without gravity cancel the carrier falls under real gravity (~9.81 m/s²).
+        // The lowered pelvis spring then adds an additional ~50 m/s² downward pull.
+        carrier.player.velocity_drive_scale = 0.0;
+        carrier.player.gravity_cancel_active = false;
+        carrier.player.pelvis_height_target = 0.15;
+
         let contact_dir = if dist > 1e-6 {
             (d_pos - c_pos).normalize()
         } else {
             Vec3::new(1.0, 0.0, 0.0)
         };
-        let impulse_mag = 2000.0 * dt;
-        carrier.player.skeleton.bodies[SegmentId::Pelvis.idx()]
-            .apply_impulse(-contact_dir * impulse_mag, c_pos);
-        defender.player.skeleton.bodies[SegmentId::Pelvis.idx()]
-            .apply_impulse(contact_dir * impulse_mag, d_pos);
+
+        // Impulse at chest (above pelvis COM) creates angular momentum that topples
+        // the carrier forward rather than just sliding them back.
+        let c_chest_pos = carrier.player.skeleton.bodies[SegmentId::Chest.idx()].position;
+        let topple = (-contact_dir * 120.0 + Vec3::new(0.0, -80.0, 0.0)) * dt;
         carrier.player.skeleton.bodies[SegmentId::Chest.idx()]
-            .apply_force(Vec3::new(0.0, -2000.0, 0.0));
+            .apply_impulse(topple, c_chest_pos);
+
+        // Defender absorbs a push-back impulse.
+        defender.player.skeleton.bodies[SegmentId::Pelvis.idx()]
+            .apply_impulse(contact_dir * 60.0 * dt, d_pos);
     }
 
     carrier.player.step(dt);

@@ -12,6 +12,12 @@ pub struct Player {
     pub role: Role,
     pub elapsed_time: f64,
     pub stride_gen: StrideGenerator,
+    /// 1.0 = full drive, 0.0 = disabled when tackled.
+    pub velocity_drive_scale: f64,
+    /// Pelvis height spring target. Lowered during a tackle to pull the carrier to ground.
+    pub pelvis_height_target: f64,
+    /// When false, gravity cancel is off and bodies fall under real gravity (tackle state).
+    pub gravity_cancel_active: bool,
 }
 
 impl Player {
@@ -22,6 +28,9 @@ impl Player {
             role: Role::Neutral,
             elapsed_time: 0.0,
             stride_gen: StrideGenerator::default(),
+            velocity_drive_scale: 1.0,
+            pelvis_height_target: 0.90,
+            gravity_cancel_active: true,
         }
     }
 
@@ -43,22 +52,26 @@ impl Player {
         // substeps had no gravity cancel and bodies fell under full gravity.
         let sub_dt = dt / SOLVER_ITERATIONS as f64;
         for _ in 0..SOLVER_ITERATIONS {
-            // Gravity cancel — every body stays afloat until the ground clamp takes over.
-            for body in &mut world.bodies {
-                body.apply_force(Vec3::new(0.0, body.mass * 9.81, 0.0));
+            // Gravity cancel keeps bodies weightless during normal play.
+            // Disabled when tackled so the player falls under real gravity.
+            if self.gravity_cancel_active {
+                for body in &mut world.bodies {
+                    body.apply_force(Vec3::new(0.0, body.mass * 9.81, 0.0));
+                }
             }
 
-            // Pelvis height spring (target y = 0.90 m — running crouch; leg chain = 0.92 m gives 2 cm knee slack).
+            // Pelvis height spring. Target drops during tackle to pull the carrier to the ground.
             {
                 let py  = world.bodies[SegmentId::Pelvis.idx()].position.y;
                 let pvy = world.bodies[SegmentId::Pelvis.idx()].linear_velocity.y;
-                let f   = (0.90 - py) * 6000.0 - pvy * 400.0;
+                let f   = (self.pelvis_height_target - py) * 6000.0 - pvy * 400.0;
                 world.bodies[SegmentId::Pelvis.idx()]
                     .apply_force(Vec3::new(0.0, f, 0.0));
             }
 
             // Velocity drive — apply equal acceleration to every body so constraint
             // reactions don't cancel the drive (all bodies accelerate together).
+            // velocity_drive_scale = 0 when tackled, disabling drive so collision forces dominate.
             {
                 let pelvis_vel = world.bodies[SegmentId::Pelvis.idx()].linear_velocity;
                 let err = Vec3::new(
@@ -66,16 +79,14 @@ impl Player {
                     0.0,
                     self.desired_velocity.z - pelvis_vel.z,
                 );
-                if err.norm() > 0.1 {
-                    let raw_accel = err * 40.0;
-                    let accel = if raw_accel.norm() > 18.0 {
-                        raw_accel.normalize() * 18.0
-                    } else {
-                        raw_accel
-                    };
-                    for body in &mut world.bodies {
-                        body.apply_force(accel * body.mass);
-                    }
+                let raw_accel = err * 20.0;
+                let accel = (if raw_accel.norm() > 10.0 {
+                    raw_accel.normalize() * 10.0
+                } else {
+                    raw_accel
+                }) * self.velocity_drive_scale;
+                for body in &mut world.bodies {
+                    body.apply_force(accel * body.mass);
                 }
             }
 
@@ -83,6 +94,20 @@ impl Player {
             // Per-substep application keeps equilibrium angular velocity bounded:
             //   ω_eq = (kp/kd) × error, which remains well below MAX_OMEGA at these gains.
             Self::apply_orientation_springs(&mut world.bodies, &leg_targets, &pose);
+
+            // Remove axial spin from arm/hand bodies every substep.
+            // The leg springs transmit torque through the constraint chain, spinning arms
+            // around their long axis (local Y). I_yy ≈ 0.002 kg·m² so even tiny torques
+            // reach MAX_OMEGA instantly. Zeroing the axial component each substep leaves
+            // sagittal swing (local Z/X) untouched.
+            for seg in [SegmentId::UpperArmL, SegmentId::UpperArmR,
+                        SegmentId::LowerArmL, SegmentId::LowerArmR,
+                        SegmentId::HandL,     SegmentId::HandR] {
+                let body = &mut world.bodies[seg.idx()];
+                let arm_long = body.orientation * Vec3::y();
+                let axial = body.angular_velocity.dot(&arm_long);
+                body.angular_velocity -= arm_long * axial;
+            }
 
             world.substep(sub_dt);
         }
@@ -145,6 +170,7 @@ impl Player {
         {
             Self::orient_spring(&mut bodies[seg.idx()], fwd_lean, spine_kp, spine_kd);
         }
+
         Self::orient_spring(&mut bodies[SegmentId::Pelvis.idx()], upright, 400.0, 60.0);
 
         // ── Arms — counter-swing opposite to legs, elbow gently bent ─────────
