@@ -24,11 +24,13 @@ pub struct StrideGenerator {
 
 impl Default for StrideGenerator {
     fn default() -> Self {
+        // Phase 1 baseline: zero amplitude — body stands still so we can verify
+        // that the physics are stable before adding any movement.
         Self {
-            stride_length: 1.4,
-            hip_amplitude: 0.15,
-            knee_amplitude: 0.20,
-            ankle_amplitude: 0.10,
+            stride_length:  1.4,
+            hip_amplitude:  0.00,
+            knee_amplitude: 0.00,
+            ankle_amplitude: 0.00,
         }
     }
 }
@@ -54,9 +56,9 @@ impl StrideGenerator {
         let ankle_flex_l = self.ankle_amplitude * phase_l.cos();
         let ankle_flex_r = self.ankle_amplitude * phase_r.cos();
 
-        // Arms counter-swing opposite to legs: left arm forward when right leg forward.
-        // Negative Z = forward swing (same convention as hip_flex → upper-leg Z rotation).
-        let arm_amp    = 0.22_f64;
+        // Arms counter-swing: left arm forward when right leg forward.
+        // Amplitude matches typical running arm carriage (~17°).
+        let arm_amp     = 0.30_f64;
         let arm_swing_l = -arm_amp * phase_r.sin();
         let arm_swing_r = -arm_amp * phase_l.sin();
 

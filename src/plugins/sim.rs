@@ -1,11 +1,16 @@
 use bevy::prelude::*;
 use player::player::Player;
 use player::segment::{BodyType, SegmentId};
-use player::locomotion::Role;
+use player::locomotion::{Role, LegTargets};
 use ball::football::Football;
 use physics::math::Vec3;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::f64::consts::PI;
+
+const BREATHING_FREQ: f64 = 0.25;   // Hz — 15 breaths/min
+const BREATHING_AMP:  f64 = 0.01;   // m  — 1 cm excursion
+const BASE_PELVIS_Y:  f64 = 0.96;
 
 pub const DT: f64 = 1.0 / 120.0;
 
@@ -17,7 +22,7 @@ pub struct CarrierRes {
 impl Default for CarrierRes {
     fn default() -> Self {
         let mut p = Player::new(BodyType::Receiver, Vec3::new(45.0, 0.0, 26.5));
-        p.desired_velocity = Vec3::new(5.0, 0.0, 0.0);
+        p.desired_velocity = Vec3::zeros(); // Phase 1: standing still
         p.role = Role::RunningBack;
         Self { player: p }
     }
@@ -30,8 +35,9 @@ pub struct DefenderRes {
 
 impl Default for DefenderRes {
     fn default() -> Self {
-        let mut p = Player::new(BodyType::Lineman, Vec3::new(52.0, 0.0, 26.5));
-        p.desired_velocity = Vec3::new(-5.0, 0.0, 0.0);
+        // Placed far away while tuning single-player running motion.
+        let mut p = Player::new(BodyType::Lineman, Vec3::new(500.0, 0.0, 26.5));
+        p.desired_velocity = Vec3::zeros();
         p.role = Role::DefenderRush;
         Self { player: p }
     }
@@ -149,6 +155,30 @@ fn step_physics(
         defender.player.skeleton.bodies[SegmentId::Pelvis.idx()]
             .apply_impulse(contact_dir * 60.0 * dt, d_pos);
     }
+
+    // Breathing: oscillate pelvis height target at resting respiratory rate.
+    carrier.player.pelvis_height_target =
+        BASE_PELVIS_Y + BREATHING_AMP * (2.0 * PI * BREATHING_FREQ * sim.elapsed).sin();
+
+    // Arms-to-sky sequence: left arm ramps up first, then right arm follows.
+    // Ramp rate is slow (4s per arm) to stay within the overdamped spring response.
+    const ARM_SKY:   f64 = -2.50;
+    const RAMP_SECS: f64 =  4.0;
+    let arm_l = if sim.elapsed >= 2.0 {
+        (ARM_SKY * ((sim.elapsed - 2.0) / RAMP_SECS)).max(ARM_SKY)
+    } else { 0.0 };
+    let arm_r = if sim.elapsed >= 7.0 {
+        (ARM_SKY * ((sim.elapsed - 7.0) / RAMP_SECS)).max(ARM_SKY)
+    } else { 0.0 };
+
+    carrier.player.pose_override = Some(LegTargets {
+        stride_freq:  0.0,
+        hip_flex_l:   0.0, hip_flex_r:   0.0,
+        knee_flex_l:  0.0, knee_flex_r:  0.0,
+        ankle_flex_l: 0.0, ankle_flex_r: 0.0,
+        arm_swing_l:  arm_l,
+        arm_swing_r:  arm_r,
+    });
 
     carrier.player.step(dt);
     defender.player.step(dt);

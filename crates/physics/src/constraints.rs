@@ -1,6 +1,5 @@
 use crate::math::Vec3;
 use crate::rigid_body::RigidBody;
-use nalgebra::UnitQuaternion;
 
 /// XPBD positional constraint between two bodies.
 /// compliance = 0 gives rigid (PBD), higher values give soft constraints.
@@ -69,18 +68,14 @@ impl PositionalConstraint {
 
         let p = n * delta_lambda;
 
-        // Linear corrections
+        // Position-only corrections. Angular corrections (dtheta = I⁻¹·r×p) are omitted:
+        // when a hub body (e.g. pelvis) is connected to multiple children, each child's
+        // dtheta accumulates on the parent every substep, creating a spin that the spring
+        // kd cannot damp because angular velocity is never updated by constraint corrections.
+        // Orientation is controlled entirely by springs and angular-limit constraints.
+        // SOLVER_ITERATIONS is raised to 30 so position-only convergence stays tight.
         bodies[self.body_a].position -= p * inv_mass_a;
         bodies[self.body_b].position += p * inv_mass_b;
-
-        // Angular corrections: rotate each body so its anchor moves with the position fix
-        // Force on A is -p, force on B is +p
-        let dtheta_a = i_inv_a * r_a.cross(&(-p));
-        let dtheta_b = i_inv_b * r_b.cross(&p);
-        bodies[self.body_a].orientation =
-            UnitQuaternion::from_scaled_axis(dtheta_a) * bodies[self.body_a].orientation;
-        bodies[self.body_b].orientation =
-            UnitQuaternion::from_scaled_axis(dtheta_b) * bodies[self.body_b].orientation;
     }
 
     pub fn reset_lambda(&mut self) {

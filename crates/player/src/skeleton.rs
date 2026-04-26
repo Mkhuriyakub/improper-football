@@ -135,25 +135,33 @@ fn build_angular_constraints() -> Vec<AngularLimitConstraint> {
         ang(Neck, Head, y, -0.35, 0.35),
 
         // ── Arms ───────────────────────────────────────────────────────────
-        // Chest → UpperArm (ball-and-socket — wide)
-        ang(Chest, UpperArmL, z, -1.57, 1.57),
+        // Chest → UpperArm (ball-and-socket)
+        // Z forward-flexion limit is -2.97 rad (~170°). Stopping before -π = -3.14
+        // is critical: at -π the quaternion error representation wraps sign and the
+        // spring drives the arm in the wrong direction, causing divergent oscillation.
+        ang(Chest, UpperArmL, z, -2.97, 1.57),
         ang(Chest, UpperArmL, x, -1.57, 1.57),
         ang(Chest, UpperArmL, y, -1.57, 1.57),
-        ang(Chest, UpperArmR, z, -1.57, 1.57),
+        ang(Chest, UpperArmR, z, -2.97, 1.57),
         ang(Chest, UpperArmR, x, -1.57, 1.57),
         ang(Chest, UpperArmR, y, -1.57, 1.57),
         // UpperArm → LowerArm (elbow — hinge)
-        ang(UpperArmL, LowerArmL, z,  0.00, 2.20),
+        // Lower bound is -0.40 (not 0) so the lighter lower arm can lag the upper
+        // arm slightly during large swings without triggering the constraint.
+        ang(UpperArmL, LowerArmL, z, -0.40, 2.20),
         ang(UpperArmL, LowerArmL, x, -0.15, 0.15),
         ang(UpperArmL, LowerArmL, y, -0.30, 0.30),
-        ang(UpperArmR, LowerArmR, z,  0.00, 2.20),
+        ang(UpperArmR, LowerArmR, z, -0.40, 2.20),
         ang(UpperArmR, LowerArmR, x, -0.15, 0.15),
         ang(UpperArmR, LowerArmR, y, -0.30, 0.30),
         // LowerArm → Hand (wrist)
-        ang(LowerArmL, HandL, z, -0.50, 0.50),
+        // Z limit is wide so the wrist never fires when the arm swings to large angles
+        // while the hand spring holds near identity. A tight Z limit caused the lower
+        // arm to oscillate, which propagated up and destabilized the upper arm.
+        ang(LowerArmL, HandL, z, -3.14, 3.14),
         ang(LowerArmL, HandL, x, -0.40, 0.40),
         ang(LowerArmL, HandL, y, -0.30, 0.30),
-        ang(LowerArmR, HandR, z, -0.50, 0.50),
+        ang(LowerArmR, HandR, z, -3.14, 3.14),
         ang(LowerArmR, HandR, x, -0.40, 0.40),
         ang(LowerArmR, HandR, y, -0.30, 0.30),
 

@@ -5,7 +5,7 @@ use crate::math::Vec3;
 use nalgebra::UnitQuaternion;
 
 pub const GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
-pub const SOLVER_ITERATIONS: usize = 10;
+pub const SOLVER_ITERATIONS: usize = 30;
 
 pub struct XpbdWorld {
     pub bodies: Vec<RigidBody>,
@@ -43,10 +43,9 @@ impl XpbdWorld {
         self.predict_positions(sub_dt);
         self.reset_lambdas();
         self.solve_constraints(sub_dt);
-        // Velocities come from force/torque integration only. Constraint corrections
-        // act directly on positions/orientations each substep (PBD style). Deriving
-        // velocity from position delta amplifies tiny constraint corrections by 1/sub_dt
-        // (~1200x) into velocity spikes that cause visible shaking.
+        // No velocity feedback from constraint corrections: the spine spring kd provides
+        // sufficient absolute-frame damping. The forward-lean initial torque (which caused
+        // prior ω accumulation) is eliminated by scaling lean with stride frequency.
         self.clear_accumulators();
     }
 

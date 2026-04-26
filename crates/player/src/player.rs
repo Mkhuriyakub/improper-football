@@ -18,6 +18,8 @@ pub struct Player {
     pub pelvis_height_target: f64,
     /// When false, gravity cancel is off and bodies fall under real gravity (tackle state).
     pub gravity_cancel_active: bool,
+    /// When set, overrides stride generator output for independent appendage testing.
+    pub pose_override: Option<LegTargets>,
 }
 
 impl Player {
@@ -29,15 +31,20 @@ impl Player {
             elapsed_time: 0.0,
             stride_gen: StrideGenerator::default(),
             velocity_drive_scale: 1.0,
-            pelvis_height_target: 0.90,
+            // 0.96 matches the skeleton's natural init height — zero initial spring
+            // error means no transient force to perturb the standing pose.
+            pelvis_height_target: 0.96,
             gravity_cancel_active: true,
+            pose_override: None,
         }
     }
 
     pub fn step(&mut self, dt: f64) {
         self.elapsed_time += dt;
 
-        let leg_targets = self.stride_gen.compute(self.desired_velocity, self.elapsed_time);
+        let leg_targets = self.pose_override.clone().unwrap_or_else(|| {
+            self.stride_gen.compute(self.desired_velocity, self.elapsed_time)
+        });
         let pose        = UpperBodyPose::for_role(self.role);
 
         // Build XPBD world.
@@ -90,22 +97,26 @@ impl Player {
                 }
             }
 
-            // World-space orientation springs (applied per-substep for stability).
-            // Per-substep application keeps equilibrium angular velocity bounded:
-            //   ω_eq = (kp/kd) × error, which remains well below MAX_OMEGA at these gains.
-            Self::apply_orientation_springs(&mut world.bodies, &leg_targets, &pose);
+            // Orientation springs only during upright play. Post-tackle the player is a
+            // ragdoll — joints fall under gravity + angular limits. Running springs during
+            // the fall fight the contact impulses and cause chaotic barrel rolls.
+            if self.gravity_cancel_active {
+                Self::apply_orientation_springs(&mut world.bodies, &leg_targets, &pose);
+            }
 
-            // Remove axial spin from arm/hand bodies every substep.
-            // The leg springs transmit torque through the constraint chain, spinning arms
-            // around their long axis (local Y). I_yy ≈ 0.002 kg·m² so even tiny torques
-            // reach MAX_OMEGA instantly. Zeroing the axial component each substep leaves
-            // sagittal swing (local Z/X) untouched.
+            // Remove axial (long-axis) spin from arm/hand bodies every substep.
+            // Arms use world-space springs (not relative joint torques) because arm
+            // inertia ~0.005 kg·m² makes any reaction torque immediately hit MAX_OMEGA.
+            // The positional elbow constraint transmits forearm angular velocity to the
+            // upper arm around its local Y axis (the axial direction). Zeroing this
+            // component each substep suppresses the accumulation without affecting
+            // sagittal swing (around world Z), which is what we actually want to control.
             for seg in [SegmentId::UpperArmL, SegmentId::UpperArmR,
                         SegmentId::LowerArmL, SegmentId::LowerArmR,
                         SegmentId::HandL,     SegmentId::HandR] {
                 let body = &mut world.bodies[seg.idx()];
                 let arm_long = body.orientation * Vec3::y();
-                let axial = body.angular_velocity.dot(&arm_long);
+                let axial    = body.angular_velocity.dot(&arm_long);
                 body.angular_velocity -= arm_long * axial;
             }
 
@@ -143,51 +154,87 @@ impl Player {
         }
     }
 
-    /// World-space orientation spring: Torque = kp×(target×q⁻¹).scaled_axis() − kd×ω
+    /// World-space orientation spring for spine/balance: applies torque to one body only.
+    /// Represents the postural reflex — intentionally not Newton's-3rd-law balanced
+    /// because the vestibular ground reaction is the implicit counter-force.
     fn orient_spring(body: &mut RigidBody, target: UnitQuaternion<f64>, kp: f64, kd: f64) {
         let err    = target * body.orientation.inverse();
         let torque = err.scaled_axis() * kp - body.angular_velocity * kd;
         body.apply_torque(torque);
     }
 
-    /// Apply per-substep world-space PD orientation springs to all segments.
-    /// Gains are tuned so ω_eq = kp/kd × max_error ≪ MAX_OMEGA.
+    /// Relative joint torque spring (Newton's 3rd law muscle model).
+    /// +torque applied to child, −torque applied to parent.
+    /// Net angular momentum added to the whole skeleton = 0, so leg/arm spring torques
+    /// cannot propagate through the constraint chain and spin the trunk.
+    fn joint_spring_rel(
+        bodies:     &mut Vec<RigidBody>,
+        parent: usize, child: usize,
+        target_rel: UnitQuaternion<f64>,
+        kp: f64, kd: f64,
+    ) {
+        // Copy out what we need before taking any mut borrows.
+        let q_p     = bodies[parent].orientation;
+        let q_c     = bodies[child].orientation;
+        let omega_p = bodies[parent].angular_velocity;
+        let omega_c = bodies[child].angular_velocity;
+
+        // Actual relative rotation (child in parent's frame) and error vs target.
+        let q_rel        = q_p.inverse() * q_c;
+        let err          = (target_rel * q_rel.inverse()).scaled_axis();
+        let omega_rel    = omega_c - omega_p;
+        let torque_world = q_p * (err * kp - omega_rel * kd);
+
+        bodies[child].apply_torque( torque_world);
+        bodies[parent].apply_torque(-torque_world);
+    }
+
+    /// Apply per-substep orientation springs to all segments.
+    ///
+    /// Spine  — world-space balance springs (postural reflex; one body at a time).
+    /// Legs & arms — relative joint torques (Newton's 3rd law) so that gait
+    ///   spring torques are internally balanced and cannot pump angular momentum
+    ///   into the trunk via positional constraint reactions.
     fn apply_orientation_springs(
         bodies:  &mut Vec<RigidBody>,
         targets: &LegTargets,
         pose:    &UpperBodyPose,
     ) {
-        let upright  = UnitQuaternion::identity();
-        let fwd_lean = UnitQuaternion::from_scaled_axis(
-            Vec3::new(0.0, 0.0, -pose.torso_lean_forward * 0.4),
+        let upright = UnitQuaternion::identity();
+
+        // Lean angle scales with stride frequency so the body stands fully upright
+        // at rest (zero initial spring error) and leans forward when running.
+        let lean_scale = (targets.stride_freq / 2.5).clamp(0.0, 1.0);
+        let spine_target = UnitQuaternion::from_scaled_axis(
+            Vec3::new(0.0, 0.0, -pose.torso_lean_forward * 0.4 * lean_scale),
         );
 
-        // ── Spine ─────────────────────────────────────────────────────────────
+        // ── Spine: world-space balance ────────────────────────────────────────
         let spine_kp = 1200.0_f64;
-        let spine_kd =  100.0_f64;
+        let spine_kd =  150.0_f64;
         for seg in [SegmentId::Pelvis, SegmentId::Lumbar, SegmentId::Chest,
                     SegmentId::Neck,   SegmentId::Head]
         {
-            Self::orient_spring(&mut bodies[seg.idx()], fwd_lean, spine_kp, spine_kd);
+            Self::orient_spring(&mut bodies[seg.idx()], spine_target, spine_kp, spine_kd);
         }
+        // Extra upright spring on pelvis only — resist lateral/twist drift.
+        Self::orient_spring(&mut bodies[SegmentId::Pelvis.idx()], upright, 500.0, 80.0);
 
-        Self::orient_spring(&mut bodies[SegmentId::Pelvis.idx()], upright, 400.0, 60.0);
+        // ── Arms: world-space springs (arm inertia ≈ 0.005 kg·m² is too small for
+        //   relative joint springs — the reaction torque on UpperArm from an elbow
+        //   spring hits MAX_OMEGA within one substep at any useful gain).
+        //   Axial (long-axis) spin is removed each substep in the outer loop instead.
+        let arm_kp     =  50.0_f64;
+        let arm_kd     =  60.0_f64;  // increased: prevents bouncing at large arm angles
+        // Elbow bend scales with stride frequency: arms hang straight at rest,
+        // flex to ~40° during running (same lean_scale used for spine).
+        let elbow_bend = 0.70_f64 * lean_scale;
 
-        // ── Arms — counter-swing opposite to legs, elbow gently bent ─────────
-        // Arm inertia is tiny (~0.0085 kg·m²), so gains must be very low.
-        // kp/kd = 50/30 → ω_eq ≤ 1.7 × 0.22 = 0.37 rad/s — no flailing possible.
-        let arm_kp   =  50.0_f64;
-        let arm_kd   =  30.0_f64;
-
-        // Upper arm swings in sagittal plane (Z axis).
         let arm_l = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, targets.arm_swing_l));
         let arm_r = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, targets.arm_swing_r));
         Self::orient_spring(&mut bodies[SegmentId::UpperArmL.idx()], arm_l, arm_kp, arm_kd);
         Self::orient_spring(&mut bodies[SegmentId::UpperArmR.idx()], arm_r, arm_kp, arm_kd);
 
-        // Forearm: gentle elbow bend (0.40 rad ≈ 23° of additional Z rotation).
-        // Kept small to avoid large initial error — arms start at identity orientation.
-        let elbow_bend = 0.40_f64;
         let la_l = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, targets.arm_swing_l + elbow_bend));
         let la_r = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, targets.arm_swing_r + elbow_bend));
         Self::orient_spring(&mut bodies[SegmentId::LowerArmL.idx()], la_l, arm_kp, arm_kd);
@@ -195,33 +242,35 @@ impl Player {
         Self::orient_spring(&mut bodies[SegmentId::HandL.idx()], upright, arm_kp * 0.4, arm_kd * 0.4);
         Self::orient_spring(&mut bodies[SegmentId::HandR.idx()], upright, arm_kp * 0.4, arm_kd * 0.4);
 
-        // ── Legs ──────────────────────────────────────────────────────────────
-        // kp=550 tracks smoothly without snapping (ω_eq = 550/75 × 0.25 = 1.8 rad/s).
+        // ── Legs: relative joint torques (anatomical angles) ─────────────────
+        // hip_flex > 0  → leg forward  (−Z rotation of UpperLeg relative to Pelvis)
+        // knee_flex > 0 → knee bends   (+Z rotation of LowerLeg relative to UpperLeg)
+        // ankle_flex > 0 → dorsiflexion (+Z rotation of Foot relative to LowerLeg)
         let hip_l  = targets.hip_flex_l .clamp(-0.52, 0.70);
         let hip_r  = targets.hip_flex_r .clamp(-0.52, 0.70);
-        let knee_l = targets.knee_flex_l.clamp( 0.00, 1.20);
-        let knee_r = targets.knee_flex_r.clamp( 0.00, 1.20);
-        let ank_l  = targets.ankle_flex_l.clamp(-0.30, 0.30);
-        let ank_r  = targets.ankle_flex_r.clamp(-0.30, 0.30);
+        let knee_l = targets.knee_flex_l.clamp( 0.00, 1.40);
+        let knee_r = targets.knee_flex_r.clamp( 0.00, 1.40);
+        let ank_l  = targets.ankle_flex_l.clamp(-0.40, 0.40);
+        let ank_r  = targets.ankle_flex_r.clamp(-0.40, 0.40);
 
-        let leg_kp  = 550.0_f64;
-        let leg_kd  =  75.0_f64;
-        let foot_kp = 220.0_f64;
-        let foot_kd =  55.0_f64;
+        let leg_kp  = 600.0_f64;
+        let leg_kd  =  80.0_f64;
+        let foot_kp = 250.0_f64;
+        let foot_kd =  60.0_f64;
 
-        let ul_l = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, -hip_l));
-        let ul_r = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, -hip_r));
-        Self::orient_spring(&mut bodies[SegmentId::UpperLegL.idx()], ul_l, leg_kp, leg_kd);
-        Self::orient_spring(&mut bodies[SegmentId::UpperLegR.idx()], ul_r, leg_kp, leg_kd);
+        let hip_l_rel = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, -hip_l));
+        let hip_r_rel = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, -hip_r));
+        Self::joint_spring_rel(bodies, SegmentId::Pelvis.idx(),   SegmentId::UpperLegL.idx(), hip_l_rel,  leg_kp, leg_kd);
+        Self::joint_spring_rel(bodies, SegmentId::Pelvis.idx(),   SegmentId::UpperLegR.idx(), hip_r_rel,  leg_kp, leg_kd);
 
-        let ll_l = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, -hip_l + knee_l));
-        let ll_r = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, -hip_r + knee_r));
-        Self::orient_spring(&mut bodies[SegmentId::LowerLegL.idx()], ll_l, leg_kp, leg_kd);
-        Self::orient_spring(&mut bodies[SegmentId::LowerLegR.idx()], ll_r, leg_kp, leg_kd);
+        let knee_l_rel = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, knee_l));
+        let knee_r_rel = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, knee_r));
+        Self::joint_spring_rel(bodies, SegmentId::UpperLegL.idx(), SegmentId::LowerLegL.idx(), knee_l_rel, leg_kp, leg_kd);
+        Self::joint_spring_rel(bodies, SegmentId::UpperLegR.idx(), SegmentId::LowerLegR.idx(), knee_r_rel, leg_kp, leg_kd);
 
-        let ft_l = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, -hip_l + knee_l + ank_l));
-        let ft_r = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, -hip_r + knee_r + ank_r));
-        Self::orient_spring(&mut bodies[SegmentId::FootL.idx()], ft_l, foot_kp, foot_kd);
-        Self::orient_spring(&mut bodies[SegmentId::FootR.idx()], ft_r, foot_kp, foot_kd);
+        let ank_l_rel = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, ank_l));
+        let ank_r_rel = UnitQuaternion::from_scaled_axis(Vec3::new(0.0, 0.0, ank_r));
+        Self::joint_spring_rel(bodies, SegmentId::LowerLegL.idx(), SegmentId::FootL.idx(), ank_l_rel, foot_kp, foot_kd);
+        Self::joint_spring_rel(bodies, SegmentId::LowerLegR.idx(), SegmentId::FootR.idx(), ank_r_rel, foot_kp, foot_kd);
     }
 }

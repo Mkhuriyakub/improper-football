@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use crate::plugins::sim::{CarrierRes, DefenderRes};
+use crate::plugins::sim::CarrierRes;
 use crate::render_util::nalgebra_vec3_to_bevy;
 use player::segment::SegmentId;
 
@@ -12,7 +12,9 @@ pub struct CameraConfig {
 impl Default for CameraConfig {
     fn default() -> Self {
         Self {
-            offset: Vec3::new(-8.0, 6.0, 8.0),
+            // Close-up: 1.8m in front of the player at chest height.
+            // Change to Vec3::new(-8.0, 6.0, 8.0) for the full-field view.
+            offset: Vec3::new(0.0, 0.42, 1.8),
             alpha: 0.15,
         }
     }
@@ -42,22 +44,23 @@ fn spawn_camera(mut commands: Commands) {
 
 fn follow_action(
     carrier: Res<CarrierRes>,
-    defender: Res<DefenderRes>,
     cfg: Res<CameraConfig>,
     mut cam_query: Query<&mut Transform, With<Camera3d>>,
 ) {
-    let c_pos = nalgebra_vec3_to_bevy(
+    let pelvis = nalgebra_vec3_to_bevy(
         carrier.player.skeleton.bodies[SegmentId::Pelvis.idx()].position
     );
-    let d_pos = nalgebra_vec3_to_bevy(
-        defender.player.skeleton.bodies[SegmentId::Pelvis.idx()].position
+    let chest  = nalgebra_vec3_to_bevy(
+        carrier.player.skeleton.bodies[SegmentId::Chest.idx()].position
     );
-    let midpoint = (c_pos + d_pos) * 0.5;
-    let target = midpoint + cfg.offset;
+    // Focus on mid-torso (halfway between pelvis and chest) so the camera
+    // looks at the part of the body where breathing is visible.
+    let focus  = (pelvis + chest) * 0.5;
+    let target = pelvis + cfg.offset;
 
     for mut transform in &mut cam_query {
         let new_pos = spring_follow(transform.translation, target, cfg.alpha);
         *transform = Transform::from_translation(new_pos)
-            .looking_at(midpoint, Vec3::Y);
+            .looking_at(focus, Vec3::Y);
     }
 }
