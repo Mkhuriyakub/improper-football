@@ -21,10 +21,6 @@ opt-level = 3
 name = "improper_football"
 path = "src/lib.rs"
 
-[[bin]]
-name = "tackle_sim"
-path = "src/bin/tackle_sim.rs"
-
 [workspace]
 members = [
     ".",

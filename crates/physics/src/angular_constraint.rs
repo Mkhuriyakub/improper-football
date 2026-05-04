@@ -1,21 +1,22 @@
 use crate::math::Vec3;
 use crate::rigid_body::RigidBody;
-use nalgebra::UnitQuaternion;
 
-/// XPBD angular limit constraint.
-///
-/// Constrains the relative rotation of body_b w.r.t. body_a about one axis to
-/// [min_angle, max_angle] radians.  Three constraints per joint (Z, X, Y) give
-/// full anatomical limits.
+/// Velocity-level angular limit constraint, solved by sequential impulse with
+/// Baumgarte stabilization. Inequality (one-sided) constraint: only fires
+/// when the relative angle is outside `[min_angle, max_angle]`, and the
+/// impulse only pushes the joint *back into range* — never deeper into a
+/// limit. This makes it a hard kinematic stop in steady state, but the
+/// impulse magnitude is bounded by the velocity-error formula so there's no
+/// per-substep amplification.
 pub struct AngularLimitConstraint {
     pub body_a: usize,
     pub body_b: usize,
-    /// Constraint axis expressed in body_a's local frame.
+    /// Constraint axis in body_a's local frame.
     pub axis_local_a: Vec3,
     pub min_angle: f64,
     pub max_angle: f64,
     pub compliance: f64,
-    pub lambda: f64,
+    pub baumgarte: f64,
 }
 
 impl AngularLimitConstraint {
@@ -27,56 +28,62 @@ impl AngularLimitConstraint {
             min_angle: min,
             max_angle: max,
             compliance: 0.0,
-            lambda: 0.0,
+            baumgarte: 0.2,
         }
     }
 
     pub fn solve(&mut self, bodies: &mut Vec<RigidBody>, dt: f64) {
-        let alpha = self.compliance / (dt * dt);
-
-        // Constraint axis in world space (follows body_a orientation).
+        // Constraint axis in world frame (follows body_a's orientation).
         let n = bodies[self.body_a].orientation * self.axis_local_a;
 
-        // Relative rotation: q_rel = q_b * q_a^-1
-        // Project its rotation vector onto the constraint axis to get the angle.
+        // Relative rotation projected onto the axis gives the joint angle.
         let q_rel = bodies[self.body_b].orientation
             * bodies[self.body_a].orientation.inverse();
         let angle = q_rel.scaled_axis().dot(&n);
 
-        let c = if angle < self.min_angle {
-            angle - self.min_angle
-        } else if angle > self.max_angle {
+        // Position error: signed distance into the violated half-space.
+        let c = if angle > self.max_angle {
             angle - self.max_angle
+        } else if angle < self.min_angle {
+            angle - self.min_angle
         } else {
             return;
         };
 
-        let i_inv_a = bodies[self.body_a].world_inv_inertia();
-        let i_inv_b = bodies[self.body_b].world_inv_inertia();
+        // Relative angular velocity along the axis.
+        let omega_rel = bodies[self.body_b].angular_velocity
+            - bodies[self.body_a].angular_velocity;
+        let v_rel_n = omega_rel.dot(&n);
 
-        let w_a = n.dot(&(i_inv_a * n));
-        let w_b = n.dot(&(i_inv_b * n));
-        let w = w_a + w_b;
-        if w < 1e-10 {
+        // Baumgarte velocity bias (pushes back toward range).
+        let bias = -self.baumgarte / dt * c;
+        let velocity_error = v_rel_n - bias;
+
+        // One-sided: only apply impulse if it would push back toward range.
+        // Equivalently: skip when velocity_error has the same sign as -c.
+        // For c > 0 (above max), we apply only if velocity_error > 0.
+        // For c < 0 (below min), we apply only if velocity_error < 0.
+        if velocity_error * c <= 0.0 {
             return;
         }
 
-        let delta_lambda = (-c - alpha * self.lambda) / (w + alpha);
-        self.lambda += delta_lambda;
+        // Generalized inverse mass along n.
+        let i_inv_a = bodies[self.body_a].world_inv_inertia();
+        let i_inv_b = bodies[self.body_b].world_inv_inertia();
+        let w_a = n.dot(&(i_inv_a * n));
+        let w_b = n.dot(&(i_inv_b * n));
+        let w = w_a + w_b;
+        let cfm = self.compliance / dt;
+        let denom = w + cfm;
+        if denom < 1e-10 {
+            return;
+        }
 
-        // Sign convention mirrors PositionalConstraint:
-        //   body_a: dθ = -I_a_inv * n * Δλ
-        //   body_b: dθ = +I_b_inv * n * Δλ
-        let dtheta_a = -(i_inv_a * n) * delta_lambda;
-        let dtheta_b = (i_inv_b * n) * delta_lambda;
-
-        bodies[self.body_a].orientation =
-            UnitQuaternion::from_scaled_axis(dtheta_a) * bodies[self.body_a].orientation;
-        bodies[self.body_b].orientation =
-            UnitQuaternion::from_scaled_axis(dtheta_b) * bodies[self.body_b].orientation;
+        let lambda = -velocity_error / denom;
+        bodies[self.body_a].angular_velocity -= i_inv_a * n * lambda;
+        bodies[self.body_b].angular_velocity += i_inv_b * n * lambda;
     }
 
-    pub fn reset_lambda(&mut self) {
-        self.lambda = 0.0;
-    }
+    /// No-op for the SI solver. Kept for API compatibility.
+    pub fn reset_lambda(&mut self) {}
 }

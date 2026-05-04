@@ -1,6 +1,6 @@
 use improper_football::render_util::{nalgebra_vec3_to_bevy, nalgebra_quat_to_bevy, rigid_body_to_transform};
 use nalgebra::{Vector3, UnitQuaternion};
-use bevy::math::{Vec3, Quat};
+use bevy::math::Vec3;
 use physics::rigid_body::RigidBody;
 use physics::math::Mat3;
 

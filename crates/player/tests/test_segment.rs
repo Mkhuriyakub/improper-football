@@ -1,4 +1,4 @@
-use player::segment::{BodyType, SegmentId, SegmentDef, segment_def};
+use player::segment::{BodyType, SegmentId, segment_def};
 
 #[test]
 fn lineman_pelvis_mass_is_realistic() {

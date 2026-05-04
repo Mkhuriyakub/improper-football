@@ -1,8 +1,15 @@
 use crate::math::Vec3;
 use crate::rigid_body::RigidBody;
 
-/// XPBD positional constraint between two bodies.
-/// compliance = 0 gives rigid (PBD), higher values give soft constraints.
+/// Velocity-level 3-DOF ball-and-socket joint between two bodies, solved by
+/// sequential impulse with Baumgarte stabilization for position drift.
+///
+/// Implementation: three sequential 1-D scalar constraints along world X, Y,
+/// and Z axes. Each iteration of the outer SI solver runs all three axes,
+/// and convergence to the true 3-DOF constraint comes from iteration. This
+/// avoids any 3×3 matrix inversion and has straightforward numerics.
+///
+/// `rest_length` is kept as 0 (zero-rest-length ball-and-socket joint).
 pub struct PositionalConstraint {
     pub body_a: usize,
     pub body_b: usize,
@@ -10,7 +17,8 @@ pub struct PositionalConstraint {
     pub local_anchor_b: Vec3,
     pub rest_length: f64,
     pub compliance: f64,
-    pub lambda: f64,
+    /// Baumgarte position-error feedback coefficient.
+    pub baumgarte: f64,
 }
 
 impl PositionalConstraint {
@@ -22,63 +30,66 @@ impl PositionalConstraint {
             local_anchor_b: Vec3::zeros(),
             rest_length,
             compliance,
-            lambda: 0.0,
+            baumgarte: 0.2,
         }
     }
 
-    /// XPBD constraint solve with full angular correction for extended rigid bodies.
-    /// Generalized inverse mass includes the rotational inertia contribution so that
-    /// joint anchors (not just body centers) are correctly constrained.
     pub fn solve(&mut self, bodies: &mut Vec<RigidBody>, dt: f64) {
-        let alpha = self.compliance / (dt * dt);
+        // Solve each world axis independently. Convergence to the full
+        // 3-DOF constraint emerges from outer SI iterations.
+        self.solve_axis(bodies, dt, Vec3::x());
+        self.solve_axis(bodies, dt, Vec3::y());
+        self.solve_axis(bodies, dt, Vec3::z());
+    }
 
-        // World-space lever arms from each body center to its joint anchor
+    fn solve_axis(&mut self, bodies: &mut Vec<RigidBody>, dt: f64, n: Vec3) {
         let r_a = bodies[self.body_a].orientation * self.local_anchor_a;
         let r_b = bodies[self.body_b].orientation * self.local_anchor_b;
         let pa = bodies[self.body_a].position + r_a;
         let pb = bodies[self.body_b].position + r_b;
 
-        let diff = pb - pa;
-        let dist = diff.norm();
-        if dist < 1e-10 {
-            return;
-        }
+        // Position error along this axis.
+        let c = (pb - pa).dot(&n) - self.rest_length * n.dot(&n).abs();
+        // (For zero rest_length, the above is just (pb - pa) · n.)
 
-        let n = diff / dist;
-        let c = dist - self.rest_length;
+        // Velocity at each anchor.
+        let v_a_anchor = bodies[self.body_a].linear_velocity
+            + bodies[self.body_a].angular_velocity.cross(&r_a);
+        let v_b_anchor = bodies[self.body_b].linear_velocity
+            + bodies[self.body_b].angular_velocity.cross(&r_b);
+        let v_rel_n = (v_b_anchor - v_a_anchor).dot(&n);
 
+        // Generalized inverse mass along n.
         let inv_mass_a = bodies[self.body_a].inv_mass;
         let inv_mass_b = bodies[self.body_b].inv_mass;
         let i_inv_a = bodies[self.body_a].world_inv_inertia();
         let i_inv_b = bodies[self.body_b].world_inv_inertia();
-
-        // Generalized inverse mass: translational + rotational contribution
-        // w_ang = (r × n) · I⁻¹(r × n)
         let ra_cross_n = r_a.cross(&n);
         let rb_cross_n = r_b.cross(&n);
         let w_a = inv_mass_a + ra_cross_n.dot(&(i_inv_a * ra_cross_n));
         let w_b = inv_mass_b + rb_cross_n.dot(&(i_inv_b * rb_cross_n));
         let w = w_a + w_b;
-        if w < 1e-10 {
+        let cfm = self.compliance / dt;
+        let denom = w + cfm;
+        if denom < 1e-10 {
             return;
         }
 
-        let delta_lambda = (-c - alpha * self.lambda) / (w + alpha);
-        self.lambda += delta_lambda;
+        // Baumgarte velocity bias.
+        let bias = -self.baumgarte / dt * c;
+        let velocity_error = v_rel_n - bias;
+        let lambda = -velocity_error / denom;
+        if lambda.abs() < 1e-15 {
+            return;
+        }
 
-        let p = n * delta_lambda;
-
-        // Position-only corrections. Angular corrections (dtheta = I⁻¹·r×p) are omitted:
-        // when a hub body (e.g. pelvis) is connected to multiple children, each child's
-        // dtheta accumulates on the parent every substep, creating a spin that the spring
-        // kd cannot damp because angular velocity is never updated by constraint corrections.
-        // Orientation is controlled entirely by springs and angular-limit constraints.
-        // SOLVER_ITERATIONS is raised to 30 so position-only convergence stays tight.
-        bodies[self.body_a].position -= p * inv_mass_a;
-        bodies[self.body_b].position += p * inv_mass_b;
+        // Apply impulse along n.
+        let p = n * lambda;
+        bodies[self.body_a].linear_velocity -= p * inv_mass_a;
+        bodies[self.body_b].linear_velocity += p * inv_mass_b;
+        bodies[self.body_a].angular_velocity -= i_inv_a * ra_cross_n * lambda;
+        bodies[self.body_b].angular_velocity += i_inv_b * rb_cross_n * lambda;
     }
 
-    pub fn reset_lambda(&mut self) {
-        self.lambda = 0.0;
-    }
+    pub fn reset_lambda(&mut self) {}
 }

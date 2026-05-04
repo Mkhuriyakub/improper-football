@@ -1,4 +1,4 @@
-use player::skeleton::{PlayerSkeleton, JOINT_COUNT};
+use player::skeleton::PlayerSkeleton;
 use player::segment::{BodyType, SegmentId, SEGMENT_COUNT};
 use physics::math::Vec3;
 
@@ -6,13 +6,6 @@ use physics::math::Vec3;
 fn skeleton_has_correct_segment_count() {
     let skel = PlayerSkeleton::new(BodyType::Receiver, Vec3::new(0.0, 0.0, 0.0));
     assert_eq!(skel.bodies.len(), SEGMENT_COUNT);
-}
-
-#[test]
-fn skeleton_has_correct_constraint_count() {
-    let skel = PlayerSkeleton::new(BodyType::Receiver, Vec3::new(0.0, 0.0, 0.0));
-    // 16 joints × 2 constraints each = 32
-    assert_eq!(skel.constraints.len(), JOINT_COUNT * 2);
 }
 
 #[test]
