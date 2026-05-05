@@ -1,4 +1,5 @@
-use crate::math::Vec3;
+use nalgebra::UnitQuaternion;
+use crate::math::{Vec3, swing_twist_angle};
 use crate::rigid_body::RigidBody;
 
 /// Active PD-controlled torque between two bodies along an axis.
@@ -32,6 +33,10 @@ pub struct AngularPDController {
     pub torque_limit: f64,
     /// If false, controller produces no torque. Models muscle deactivation.
     pub enabled: bool,
+    /// Rest orientation of body_b in body_a's frame (default identity).
+    /// `target_angle` is measured relative to this baseline using
+    /// swing-twist factorization.
+    pub baseline: UnitQuaternion<f64>,
 }
 
 impl AngularPDController {
@@ -42,6 +47,7 @@ impl AngularPDController {
             target_angle: 0.0,
             torque_limit: f64::INFINITY,
             enabled: true,
+            baseline: UnitQuaternion::identity(),
         }
     }
 
@@ -55,6 +61,19 @@ impl AngularPDController {
         self
     }
 
+    /// Set a non-identity rest orientation of body_b in body_a's frame.
+    pub fn with_baseline(mut self, baseline: UnitQuaternion<f64>) -> Self {
+        self.baseline = baseline;
+        self
+    }
+
+    fn angle(&self, bodies: &[RigidBody]) -> f64 {
+        let q_b_in_a = bodies[self.body_a].orientation.inverse()
+                     * bodies[self.body_b].orientation;
+        let q_from_rest = q_b_in_a * self.baseline.inverse();
+        swing_twist_angle(q_from_rest, self.axis_local_a)
+    }
+
     /// Scalar torque the controller would apply this substep, given the current
     /// state. Useful for logging the muscle effort.
     pub fn scalar_torque(&self, bodies: &[RigidBody]) -> f64 {
@@ -62,9 +81,7 @@ impl AngularPDController {
             return 0.0;
         }
         let n = bodies[self.body_a].orientation * self.axis_local_a;
-        let q_rel = bodies[self.body_b].orientation
-            * bodies[self.body_a].orientation.inverse();
-        let angle = q_rel.scaled_axis().dot(&n);
+        let angle = self.angle(bodies);
         let omega_rel = bodies[self.body_b].angular_velocity
             - bodies[self.body_a].angular_velocity;
         let omega_rel_n = omega_rel.dot(&n);

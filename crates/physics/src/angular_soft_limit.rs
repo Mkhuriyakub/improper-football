@@ -1,4 +1,5 @@
-use crate::math::Vec3;
+use nalgebra::UnitQuaternion;
+use crate::math::{Vec3, swing_twist_angle};
 use crate::rigid_body::RigidBody;
 
 /// Nonlinear soft range limit between two bodies along an axis fixed in body_a's
@@ -37,6 +38,10 @@ pub struct AngularSoftLimit {
     /// Latched on the first substep where |excess| exceeds `tear_threshold`.
     /// Persistent — there is no automatic healing.
     pub torn: bool,
+    /// Rest orientation of body_b in body_a's frame (default identity). The
+    /// angle compared against [min_angle, max_angle] is measured relative
+    /// to this baseline using swing-twist factorization.
+    pub baseline: UnitQuaternion<f64>,
 }
 
 impl AngularSoftLimit {
@@ -52,6 +57,7 @@ impl AngularSoftLimit {
             tear_threshold: f64::INFINITY,
             post_tear_factor: 0.0,
             torn: false,
+            baseline: UnitQuaternion::identity(),
         }
     }
 
@@ -62,6 +68,19 @@ impl AngularSoftLimit {
         self.tear_threshold = threshold;
         self.post_tear_factor = post_tear_factor;
         self
+    }
+
+    /// Set a non-identity rest orientation of body_b in body_a's frame.
+    pub fn with_baseline(mut self, baseline: UnitQuaternion<f64>) -> Self {
+        self.baseline = baseline;
+        self
+    }
+
+    fn angle(&self, bodies: &[RigidBody]) -> f64 {
+        let q_b_in_a = bodies[self.body_a].orientation.inverse()
+                     * bodies[self.body_b].orientation;
+        let q_from_rest = q_b_in_a * self.baseline.inverse();
+        swing_twist_angle(q_from_rest, self.axis_local_a)
     }
 
     fn effective_stiffness(&self) -> f64 {
@@ -83,9 +102,7 @@ impl AngularSoftLimit {
 
     pub fn apply(&mut self, bodies: &mut Vec<RigidBody>) {
         let n = bodies[self.body_a].orientation * self.axis_local_a;
-        let q_rel = bodies[self.body_b].orientation
-            * bodies[self.body_a].orientation.inverse();
-        let angle = q_rel.scaled_axis().dot(&n);
+        let angle = self.angle(bodies);
 
         // Check for tearing before computing torque, so the post-tear stiffness
         // applies on the same substep the threshold is crossed.
@@ -112,10 +129,7 @@ impl AngularSoftLimit {
     /// Elastic potential energy stored in the limit when out of range.
     /// Uses the current effective stiffness (post-tear if torn).
     pub fn potential_energy(&self, bodies: &[RigidBody]) -> f64 {
-        let n = bodies[self.body_a].orientation * self.axis_local_a;
-        let q_rel = bodies[self.body_b].orientation
-            * bodies[self.body_a].orientation.inverse();
-        let angle = q_rel.scaled_axis().dot(&n);
+        let angle = self.angle(bodies);
         let excess = if angle > self.max_angle {
             angle - self.max_angle
         } else if angle < self.min_angle {

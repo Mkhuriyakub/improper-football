@@ -1,4 +1,4 @@
-use crate::math::Vec3;
+use crate::math::{Vec3, swing_twist_angle};
 use crate::rigid_body::RigidBody;
 
 /// One joint that a tendon crosses. The tendon's "excursion" contribution
@@ -45,10 +45,10 @@ impl Tendon {
     pub fn excursion(&self, bodies: &[RigidBody]) -> f64 {
         let mut total = 0.0;
         for span in &self.spans {
-            let n = bodies[span.body_a].orientation * span.axis_local_a;
-            let q_rel = bodies[span.body_b].orientation
-                * bodies[span.body_a].orientation.inverse();
-            let angle = q_rel.scaled_axis().dot(&n);
+            // Swing-twist angle in body_a's local frame — bivector-free.
+            let q_b_in_a = bodies[span.body_a].orientation.inverse()
+                         * bodies[span.body_b].orientation;
+            let angle = swing_twist_angle(q_b_in_a, span.axis_local_a);
             total += span.moment_arm * angle;
         }
         total

@@ -1,4 +1,4 @@
-use crate::math::Vec3;
+use crate::math::{Vec3, swing_twist_angle};
 use crate::rigid_body::RigidBody;
 
 /// Velocity-level angular limit constraint, solved by sequential impulse with
@@ -36,10 +36,13 @@ impl AngularLimitConstraint {
         // Constraint axis in world frame (follows body_a's orientation).
         let n = bodies[self.body_a].orientation * self.axis_local_a;
 
-        // Relative rotation projected onto the axis gives the joint angle.
-        let q_rel = bodies[self.body_b].orientation
-            * bodies[self.body_a].orientation.inverse();
-        let angle = q_rel.scaled_axis().dot(&n);
+        // Joint angle via swing-twist factorization in body_a's local frame
+        // — invariant to rotations perpendicular to axis_local_a (no
+        // bivector cross-coupling that the older scaled_axis().dot()
+        // projection introduced).
+        let q_b_in_a = bodies[self.body_a].orientation.inverse()
+                     * bodies[self.body_b].orientation;
+        let angle = swing_twist_angle(q_b_in_a, self.axis_local_a);
 
         // Position error: signed distance into the violated half-space.
         let c = if angle > self.max_angle {
