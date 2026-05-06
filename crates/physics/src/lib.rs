@@ -9,4 +9,5 @@ pub mod angular_pd_controller;
 pub mod positional_spring;
 pub mod positional_damper;
 pub mod tendon;
+pub mod ground_contact;
 pub mod math;

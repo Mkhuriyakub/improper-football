@@ -8,6 +8,7 @@ use crate::angular_pd_controller::AngularPDController;
 use crate::positional_spring::PositionalSpring;
 use crate::positional_damper::PositionalDamper;
 use crate::tendon::Tendon;
+use crate::ground_contact::GroundContact;
 use crate::math::Vec3;
 use nalgebra::UnitQuaternion;
 
@@ -29,6 +30,7 @@ pub struct XpbdWorld {
     pub positional_springs: Vec<PositionalSpring>,
     pub positional_dampers: Vec<PositionalDamper>,
     pub tendons: Vec<Tendon>,
+    pub ground_contacts: Vec<GroundContact>,
     /// Number of Gauss-Seidel sequential-impulse iterations per substep.
     pub solver_iterations: usize,
 }
@@ -46,6 +48,7 @@ impl XpbdWorld {
             positional_springs: Vec::new(),
             positional_dampers: Vec::new(),
             tendons: Vec::new(),
+            ground_contacts: Vec::new(),
             solver_iterations: DEFAULT_SI_ITERATIONS,
         }
     }
@@ -84,6 +87,7 @@ impl XpbdWorld {
         self.apply_positional_springs();
         self.apply_positional_dampers();
         self.apply_tendons();
+        self.apply_ground_contacts();
         self.integrate_velocities(sub_dt);
         // Damping applied implicitly AFTER explicit velocity update — this is
         // unconditionally stable for any damping coefficient, fixing the
@@ -135,6 +139,12 @@ impl XpbdWorld {
     fn apply_positional_dampers(&mut self) {
         for d in &self.positional_dampers {
             d.apply(&mut self.bodies);
+        }
+    }
+
+    fn apply_ground_contacts(&mut self) {
+        for c in &self.ground_contacts {
+            c.apply(&mut self.bodies);
         }
     }
 
