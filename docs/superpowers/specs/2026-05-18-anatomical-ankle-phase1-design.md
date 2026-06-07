@@ -13,7 +13,7 @@
 
 Up to now the project has built a chain of joints (ankle, knee, hip, lumbar, etc.) at varying levels of fidelity, with each binary stripping or adding constraints as needed. Recent debugging revealed that bilateral disturbance recovery fails because the chain has under-constrained off-axis modes, and the controller can only operate in the sagittal plane. Before attempting a sophisticated whole-body controller, we should make sure the body parts the controller will use are actually complete.
 
-Phase 1 builds the **ankle assembly** as the first fully-anatomical unit: talocrural + subtalar + MTP, with active control authority on each axis, plus a validation test rig that exercises the unit on its own.
+Phase 1 builds the **ankle assembly's joint topology and passive structure**: talocrural + subtalar + MTP, with placeholder-PD active control on each primary axis, plus a validation test rig that exercises the unit on its own. ("Fully-anatomical" requires Phase 4 muscle model.)
 
 Subsequent phases (deferred):
 - Phase 2: multi-region foot contact (heel pad vs forefoot vs toes)
@@ -30,16 +30,10 @@ Subsequent phases (deferred):
 2. **Active commanded motion** — set each primary-axis target_angle, the joint reaches that angle within ±0.05 rad of target within 1 s and holds. Verifies the ankle can be *driven*, not just held passively.
 3. **Ankle-strategy disturbance recovery** — small impulse on the load stick, the ankle's own active PDs (no upper-body control) bring CoM back over support polygon within 1.5 s.
 4. **ROM compliance** — commanded targets outside anatomical range hit soft limits; joint stays within ROM ±10%.
-5. **Static moment at ROM end** matches anatomy — peak passive resistance at end of talocrural dorsiflexion ≈ 30 N·m within 30% of Riener & Edrich 1999 values.
+5. **Static moment near ROM end** matches anatomy — at 0.05 rad past the talocrural dorsiflexion soft-limit (i.e., angle = -0.40 rad), passive resistance ≈ 25 N·m within 30% of Riener & Edrich 1999 values. (Soft-limit torque is `K·(angle_past_limit)²` so the resistance at the limit itself is 0 and rises quadratically past it.)
 6. **No NaN / no explosion** — simulation stable for 10 s under normal commanded conditions.
 
-**Non-goals** (deferred to later phases):
-- Multi-region foot contact (Phase 2)
-- Plantar fascia / windlass (Phase 3)
-- Hill-type muscle model (Phase 4)
-- Stretch reflex (Phase 5)
-- Oblique anatomical joint axes (Phase 1 uses orthogonal axes)
-- Heel pad vs forefoot pad differential compliance (Phase 2)
+**Non-goals:** see §6 for the full breakdown (deferred to Phases 2-5, plus Phase 1 simplifications). High-level: no muscle model, no multi-region foot contact, no plantar fascia, no proprioception, no oblique joint axes.
 
 ## 3. Anatomical structure
 
@@ -96,9 +90,9 @@ The MTP joint enables toe dorsiflexion, which is essential for proper push-off a
 |---|---|---|
 | Primary axis (in shin local) | (1, 0, 0) | world +x at neutral. **Simplification:** real talocrural axis is oblique (~10° from frontal); orthogonal is Phase 1. |
 | Primary ROM | [-0.35, +0.70] rad | dorsi ~20°, plantar ~40° (Roaas & Andersson 1982) |
-| Active PD: KP / KD | placeholder for muscle (see §4 note) | not anatomical peak; replaced by Hill model in Phase 4 |
+| Active PD: KP / KD | 80 / 1.0 (postural placeholder) | not anatomical peak; see §4 muscle note; replaced by Hill model in Phase 4 |
 | Passive K / C | 4 / 1.2 | mid-range stiffness from Riener & Edrich 1999 |
-| Soft-limit K, exp | 10000 / 2.0 | sized so passive resistance at limit ≈ 30 N·m, matching Riener & Edrich curves |
+| Soft-limit K, exp | 10000 / 2.0 | sized so resistance at 0.05 rad past limit ≈ 25 N·m, matching Riener & Edrich curves at functional ROM extreme |
 | Off-axes (Y, Z) | locked: K=200, ROM ±0.05 rad, soft-limit K=10000 | strong off-axis lock |
 | Feedforward | exposed via `with_feedforward()` | for inverse-dynamics gravity compensation |
 
@@ -108,9 +102,9 @@ The MTP joint enables toe dorsiflexion, which is essential for proper push-off a
 |---|---|---|
 | Primary axis (in talus local) | (0, 0, 1) | world +z at neutral. **Simplification:** real subtalar axis is oblique (42° from horizontal, 23° from sagittal — Manter 1941); Phase 1 uses orthogonal. |
 | Primary ROM | [-0.26, +0.52] rad | eversion ~15°, inversion ~30° |
-| Active PD: KP / KD | placeholder for muscle (see §4 note) | replaced by Hill model in Phase 4 |
+| Active PD: KP / KD | 50 / 2.0 (postural placeholder) | see §4 muscle note; replaced by Hill model in Phase 4 |
 | Passive K / C | 3.5 / 1.0 | |
-| Soft-limit K, exp | 8000 / 2.0 | ~25 N·m at limit |
+| Soft-limit K, exp | 8000 / 2.0 | ~20 N·m at 0.05 rad past limit |
 | Twist axis (Y in talus local) | very limited: ROM ±0.10, K=8, C=0.5, soft-limit K=10000 | |
 | Other off-axis (X in talus local) | locked: K=200, ROM ±0.05, soft-limit K=10000 | |
 | Foot baseline `R_x(-π/2)` | applied at this joint | foot lies horizontal at neutral |
@@ -121,9 +115,9 @@ The MTP joint enables toe dorsiflexion, which is essential for proper push-off a
 |---|---|---|
 | Primary axis (in foot local) | (1, 0, 0) | world +x at neutral; toe dorsiflexion |
 | Primary ROM | [-0.35, +0.87] rad | plantar ~20° (clawing), dorsi ~50° (push-off) |
-| Active PD: KP / KD | placeholder for muscle (see §4 note) | replaced by Hill model in Phase 4 |
+| Active PD: KP / KD | 30 / 0.5 (postural placeholder) | see §4 muscle note; replaced by Hill model in Phase 4 |
 | Passive K / C | 5 / 1.5 | |
-| Soft-limit K, exp | 5000 / 2.0 | ~15 N·m at limit |
+| Soft-limit K, exp | 5000 / 2.0 | ~12 N·m at 0.05 rad past limit |
 | Off-axes (Y, Z) | locked: K=100, ROM ±0.05, soft-limit K=5000 | |
 
 ### Active PD gain rationale (and a real limitation)
@@ -166,7 +160,7 @@ A text-mode validation binary that prints PASS/FAIL per test scenario and a summ
 - Forefoot (0.10 kg, 0.07 m, radius 0.020 m) — capsule, connected to foot via MTP joint
 - Talus (0.05 kg, 0.05 m, radius 0.020 m) — capsule above foot
 - Shin (3.0 kg) — vertical, top is "ankle attachment" point
-- Load stick (test-dependent mass, typically 10 kg) — vertical capsule, pinned at shin top via rigid 6-DOF joint
+- Load stick (test-dependent mass, typically 10 kg) — vertical capsule, welded to shin top (stiff positional + angular springs on all 3 axes acting as a rigid attachment)
 
 Foot uses single-capsule `GroundContact`. Multi-region foot contact is Phase 2.
 
@@ -182,7 +176,7 @@ Foot uses single-capsule `GroundContact`. Multi-region foot contact is Phase 2.
 | 6 | Ankle-strategy disturbance recovery | Apply 50 N horizontal force for 40 ms (= 2 N·s impulse, ≈ "moderate shoulder bump" magnitude; references Hsiao-Wecksler et al. perturbation studies). Ankle alone brings tilt < 5° within 1.5 s | 3 s |
 | 7 | ROM clamping | target = -1.0 rad (beyond dorsi limit -0.35). Actual stays within ROM by ≤ 10% | 2 s |
 | 8 | Sustained stability | Normal load, no disturbance, no commands — no NaN, no joint runaway | 10 s |
-| 9 | Peak passive moment at ROM end | At max talocrural dorsiflexion (-0.35 rad), passive resistance ≈ 30 N·m within 30% (matches Riener & Edrich 1999 curve at functional ROM limit) | snapshot |
+| 9 | Passive moment past ROM limit | At talocrural angle = -0.40 rad (0.05 rad past dorsiflexion soft-limit), measure passive moment; expect ≈ 25 N·m within 30% (matches Riener & Edrich 1999 functional-extreme ROM data) | snapshot |
 
 ### Visual companion: `src/bin/ankle_anatomical_demo.rs`
 
@@ -190,7 +184,7 @@ A Bevy app that visualizes the assembly with a UI panel of live joint angles. Cy
 
 ### Why this matters
 
-Existing balance binaries test the *chain above* the ankle. This is the first binary that validates the ankle **as a unit** — that it can be commanded to specific configurations, that each joint reaches commanded targets, that disturbance recovery works without upper-body control. That's the bar for "fully functional ankle."
+Existing balance binaries test the *chain above* the ankle. This is the first binary that validates the ankle **as a unit** — that it can be commanded to specific configurations, that each joint reaches commanded targets, that disturbance recovery works without upper-body control. That's the bar for Phase 1 (joint topology + passive structure). The "fully functional" bar requires Phase 4 muscle dynamics.
 
 ## 6. Out of scope
 
@@ -236,7 +230,7 @@ Existing balance binaries test the *chain above* the ankle. This is the first bi
 | Joint stacking with 3 joints close together | All angular dampers and PD KD terms use implicit integration (engine fix 2026-05-08). Safe. |
 | Load stick attachment | Pinned via stiff positional + angular springs (effectively rigid weld). |
 | Tuning the active PD gains may require iteration | Listed values are starting points; validation harness reveals adjustments. |
-| Phase 1 axis simplifications limit realism | Talocrural (real axis oblique ~10° from frontal — Inman 1976) and subtalar (oblique 42°/23° — Manter 1941) use orthogonal axes in Phase 1. This means foot supination/pronation coupling and sprain-mechanism dynamics are absent. Acceptable for static balance and commanded motion; revisit when adding gait. |
+| Phase 1 axis simplifications limit realism | See §6 "deferred design choices" for the consequence breakdown. Adequate for static balance and commanded motion; revisit when adding gait. |
 
 ## 8. Effort estimate
 
