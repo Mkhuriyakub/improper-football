@@ -226,7 +226,7 @@ Existing balance binaries test the *chain above* the ankle. This is the first bi
 
 | Risk | Mitigation |
 |---|---|
-| Talus small-body coupling instability | **Explicit check:** talus inertia I_talus_trans = (1/12)·0.05·(3·0.020² + 0.05²) = 1.2e-5 kg·m². Positional joint K = 60000 N/m at the talocrural anchor with lever arm r ≈ 0.025 m gives effective angular stiffness K_ang = K·r² = 37.5 N·m/rad. Coupled mode ω = sqrt(K_ang/I) = sqrt(37.5/1.2e-5) = 1768 rad/s. Stable explicit-Euler bound sub_dt < 2/ω = 1.1 ms. Project sub_dt = 1.39e-4 s — within margin (8×). With the implicit damper engine fix, this is comfortable. |
+| Talus small-body coupling instability | **Explicit check:** talus inertia I_talus_trans = (1/12)·0.05·(3·0.020² + 0.05²) = 1.54e-5 kg·m². Positional joint K = 60000 N/m at the talocrural anchor with lever arm r ≈ 0.025 m gives effective angular stiffness K_ang = K·r² = 37.5 N·m/rad. Coupled mode ω = sqrt(K_ang/I) = sqrt(37.5/1.54e-5) = 1559 rad/s. Stable explicit-Euler bound sub_dt < 2/ω = 1.28 ms. Project sub_dt = 1.39e-4 s — within margin (9×). With the implicit damper engine fix, this is comfortable. |
 | Joint stacking with 3 joints close together | All angular dampers and PD KD terms use implicit integration (engine fix 2026-05-08). Safe. |
 | Load stick attachment | Pinned via stiff positional + angular springs (effectively rigid weld). |
 | Tuning the active PD gains may require iteration | Listed values are starting points; validation harness reveals adjustments. |
