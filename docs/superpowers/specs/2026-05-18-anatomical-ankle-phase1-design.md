@@ -1,4 +1,9 @@
-# Anatomically-correct ankle — Phase 1 design
+# Anatomical ankle — Phase 1: joint topology and passive structure
+
+**Note on naming:** Phase 1 builds the **kinematic structure and passive constraints** of an anatomical ankle, plus placeholder PD actuators. "Fully functional" requires Phase 4 (Hill-type muscle model). The original framing "fully functional ankle in Phase 1" was wrong — corrected here.
+
+---
+
 
 **Status:** Draft for review
 **Date:** 2026-05-18
@@ -25,7 +30,7 @@ Subsequent phases (deferred):
 2. **Active commanded motion** — set each primary-axis target_angle, the joint reaches that angle within ±0.05 rad of target within 1 s and holds. Verifies the ankle can be *driven*, not just held passively.
 3. **Ankle-strategy disturbance recovery** — small impulse on the load stick, the ankle's own active PDs (no upper-body control) bring CoM back over support polygon within 1.5 s.
 4. **ROM compliance** — commanded targets outside anatomical range hit soft limits; joint stays within ROM ±10%.
-5. **Static moment at ROM end** matches anatomy — peak passive resistance at end of dorsiflexion ROM ≈ 50 N·m within 30% of published values.
+5. **Static moment at ROM end** matches anatomy — peak passive resistance at end of talocrural dorsiflexion ≈ 30 N·m within 30% of Riener & Edrich 1999 values.
 6. **No NaN / no explosion** — simulation stable for 10 s under normal commanded conditions.
 
 **Non-goals** (deferred to later phases):
@@ -40,14 +45,16 @@ Subsequent phases (deferred):
 
 ### Bodies (4 total)
 
-| Body | Mass | Length | Role |
-|---|---|---|---|
-| Shin | 3.0 kg (existing) | 0.42 m | unchanged |
-| Talus (new) | 0.05 kg | 0.02 m capsule | tiny gimbal between shin and foot |
-| Foot | 0.70 kg (was 1.0) | 0.135 m | hindfoot through midfoot, heel to MTP |
-| Forefoot (new) | 0.25 kg | 0.045 m | toes, MTP to tip |
+| Body | Mass | Length | Radius | Role |
+|---|---|---|---|---|
+| Shin | 3.0 kg (existing) | 0.42 m | 0.05 m | unchanged |
+| Talus (new) | 0.05 kg | 0.05 m capsule | 0.020 m | gimbal between shin and foot (~anatomical talus size) |
+| Foot | 0.85 kg (was 1.0) | 0.18 m | 0.032 m | hindfoot+midfoot+metatarsals, heel to MTP heads |
+| Forefoot (new) | 0.10 kg | 0.07 m | 0.020 m | phalanges (toes only), MTP to tip |
 
-Total foot-region mass stays at 1.0 kg; redistributed across three bodies.
+Total foot-region mass stays at 1.0 kg; redistributed across three bodies. Mass split based on Zatsiorsky/Seluyanov segmental data (phalanges ≈ 10% of foot mass, talus alone ≈ 5%).
+
+Total foot+forefoot length = 0.25 m, matches anatomical adult foot (was 0.18 m, anatomically short).
 
 ### Joints (3 total)
 
@@ -62,14 +69,16 @@ Total foot-region mass stays at 1.0 kg; redistributed across three bodies.
 ```
        shin (vertical, knee at top, ankle attachment at bottom)
           |
-       (talocrural joint, world +x axis)
-          • talus
+       (talocrural joint, axis = world +x at neutral)
+          • talus (identity orientation, follows shin frame)
           |
-       (subtalar joint, world +z axis)
+       (subtalar joint, axis = world +z at neutral)
           |
-       foot (heel ─────────── MTP)
-                                  • forefoot ────→ toe tips
+       foot (heel ────────────── MTP) — baseline R_x(-π/2), local +Y → world -Z (heel)
+                                  • forefoot ────→ toe tips (foot baseline carried through)
 ```
+
+**Frame convention:** "world +x at neutral" means: when all bodies are at their starting orientations, the joint's axis points along world +x. Axes are specified in the *parent* body's local frame. The shin is at identity, so its (1,0,0) maps directly to world +x. The talus is also at identity, so subtalar axis (0,0,1) in talus-local = world +z. The foot has baseline `R_x(-π/2)` applied; its local (1,0,0) still maps to world +x (rotation about x doesn't move x), so MTP axis (1,0,0) in foot-local = world +x.
 
 ### Why split lumped 3-DOF ankle
 
@@ -85,25 +94,25 @@ The MTP joint enables toe dorsiflexion, which is essential for proper push-off a
 
 | Property | Value | Notes |
 |---|---|---|
-| Primary axis (in shin local) | (1, 0, 0) | world +x at neutral |
-| Primary ROM | [-0.35, +0.70] rad | dorsi ~20°, plantar ~40° |
-| Active PD: KP / KD | 80 / 8 (N·m/rad, N·m·s/rad) | gastroc-soleus + tib anterior lumped |
-| Passive K / C | 4 / 1.2 | existing ankle values |
-| Soft-limit K, exp | 100 / 2.0 | progressive end-of-range resistance |
-| Off-axes (Y, Z) | locked: K=200, ROM ±0.05, soft-limit K=400 | strong off-axis lock |
-| Feedforward | exposed via `with_feedforward()` | for future inverse-dynamics use |
+| Primary axis (in shin local) | (1, 0, 0) | world +x at neutral. **Simplification:** real talocrural axis is oblique (~10° from frontal); orthogonal is Phase 1. |
+| Primary ROM | [-0.35, +0.70] rad | dorsi ~20°, plantar ~40° (Roaas & Andersson 1982) |
+| Active PD: KP / KD | placeholder for muscle (see §4 note) | not anatomical peak; replaced by Hill model in Phase 4 |
+| Passive K / C | 4 / 1.2 | mid-range stiffness from Riener & Edrich 1999 |
+| Soft-limit K, exp | 10000 / 2.0 | sized so passive resistance at limit ≈ 30 N·m, matching Riener & Edrich curves |
+| Off-axes (Y, Z) | locked: K=200, ROM ±0.05 rad, soft-limit K=10000 | strong off-axis lock |
+| Feedforward | exposed via `with_feedforward()` | for inverse-dynamics gravity compensation |
 
 ### Subtalar (talus ↔ foot)
 
 | Property | Value | Notes |
 |---|---|---|
-| Primary axis (in talus local) | (0, 0, 1) | world +z at neutral; inversion/eversion |
+| Primary axis (in talus local) | (0, 0, 1) | world +z at neutral. **Simplification:** real subtalar axis is oblique (42° from horizontal, 23° from sagittal — Manter 1941); Phase 1 uses orthogonal. |
 | Primary ROM | [-0.26, +0.52] rad | eversion ~15°, inversion ~30° |
-| Active PD: KP / KD | 50 / 5 | peroneals + tib posterior |
+| Active PD: KP / KD | placeholder for muscle (see §4 note) | replaced by Hill model in Phase 4 |
 | Passive K / C | 3.5 / 1.0 | |
-| Soft-limit K, exp | 80 / 2.0 | |
-| Twist axis (Y in talus local) | very limited: ROM ±0.10, K=8, C=0.5, soft-limit K=200 | |
-| Other off-axis (X in talus local) | locked: K=200, ROM ±0.05, soft-limit K=400 | |
+| Soft-limit K, exp | 8000 / 2.0 | ~25 N·m at limit |
+| Twist axis (Y in talus local) | very limited: ROM ±0.10, K=8, C=0.5, soft-limit K=10000 | |
+| Other off-axis (X in talus local) | locked: K=200, ROM ±0.05, soft-limit K=10000 | |
 | Foot baseline `R_x(-π/2)` | applied at this joint | foot lies horizontal at neutral |
 
 ### MTP (foot ↔ forefoot)
@@ -111,17 +120,31 @@ The MTP joint enables toe dorsiflexion, which is essential for proper push-off a
 | Property | Value | Notes |
 |---|---|---|
 | Primary axis (in foot local) | (1, 0, 0) | world +x at neutral; toe dorsiflexion |
-| Primary ROM | [-0.087, +0.87] rad | plantar ~5°, dorsi ~50° |
-| Active PD: KP / KD | 30 / 3 | flexor digitorum + extensor digitorum |
+| Primary ROM | [-0.35, +0.87] rad | plantar ~20° (clawing), dorsi ~50° (push-off) |
+| Active PD: KP / KD | placeholder for muscle (see §4 note) | replaced by Hill model in Phase 4 |
 | Passive K / C | 5 / 1.5 | |
-| Soft-limit K, exp | 50 / 2.0 | |
-| Off-axes (Y, Z) | locked: K=100, ROM ±0.05 | |
+| Soft-limit K, exp | 5000 / 2.0 | ~15 N·m at limit |
+| Off-axes (Y, Z) | locked: K=100, ROM ±0.05, soft-limit K=5000 | |
 
-### Gain-selection rationale
+### Active PD gain rationale (and a real limitation)
 
-- PD KP values are sized so each joint can produce its anatomical peak torque at ~half its ROM. Example: peak ankle moment during walking is ~50 N·m; 80 × 0.6 rad ≈ 48 N·m. These are not muscle peak forces — those arrive in Phase 4.
-- KD ≈ 10% of KP for ~critical damping with the engine's implicit-integration `AngularDamper`.
-- Starting values; tuning during validation may adjust.
+**The active PDs are a placeholder for muscle.** A simple PD cannot reproduce:
+- Force-length and force-velocity dependence
+- Activation dynamics (~50 ms electromechanical delay)
+- Antagonist co-contraction
+- Tendon elasticity (Achilles stores/returns energy)
+- Real ankle peak torque dynamic range (postural ~10-20 N·m, walking peak ~100-150 N·m at heel-off, running 200+, jumping 250+) — Winter, Kuo et al.
+
+The Phase 1 PD is sized for **postural control only** (~50 N·m peak output, matches quiet-standing demand). Phase 4 (Hill-type muscle model) replaces these with real muscle dynamics. Calling Phase 1 a "research-grade" ankle is incorrect; Phase 1 is **"joint topology + passive structure + placeholder actuator."** The complete ankle requires Phase 4.
+
+**KP selection:** target ~50 N·m at typical operating range (~half ROM), giving KP_talocrural = 80, KP_subtalar = 50 (smaller muscles), KP_MTP = 30 (intrinsic foot muscles only). These produce postural-grade torques.
+
+**KD selection:** critical damping is `C = 2·sqrt(KP·I_red)` where I_red is the joint's reduced inertia. With the implicit `AngularDamper` integration, any value is stable. Per-joint values:
+- Talocrural: I_red ≈ I_talus_about_axis ≈ 5e-5 kg·m² (talus is the small body). C_crit ≈ 2·sqrt(80·5e-5) = 0.13. Use KD = 1.0 for over-damped postural feel.
+- Subtalar: I_red dominated by foot, ≈ 1e-3 kg·m². C_crit ≈ 0.45. Use KD = 2.0.
+- MTP: I_red dominated by forefoot, ≈ 1e-4 kg·m². C_crit ≈ 0.11. Use KD = 0.5.
+
+These compute differently from the 10%-of-KP rule of thumb; updated values reflect actual inertia.
 
 ### Engine primitives required
 
@@ -139,9 +162,9 @@ A text-mode validation binary that prints PASS/FAIL per test scenario and a summ
 ### World setup at startup
 
 - Ground plane at y=0
-- Foot (0.70 kg) — capsule, horizontal baseline `R_x(-π/2)`, settled on ground
-- Forefoot (0.25 kg) — capsule, connected to foot via MTP joint
-- Talus (0.05 kg) — small capsule above foot
+- Foot (0.85 kg, 0.18 m, radius 0.032 m) — capsule, horizontal baseline `R_x(-π/2)`, settled on ground
+- Forefoot (0.10 kg, 0.07 m, radius 0.020 m) — capsule, connected to foot via MTP joint
+- Talus (0.05 kg, 0.05 m, radius 0.020 m) — capsule above foot
 - Shin (3.0 kg) — vertical, top is "ankle attachment" point
 - Load stick (test-dependent mass, typically 10 kg) — vertical capsule, pinned at shin top via rigid 6-DOF joint
 
@@ -156,10 +179,10 @@ Foot uses single-capsule `GroundContact`. Multi-region foot contact is Phase 2.
 | 3 | Subtalar commanded motion | target = +0.26 rad. Within ±0.05 rad | 2 s |
 | 4 | MTP commanded motion | target = +0.52 rad. Within ±0.05 rad | 2 s |
 | 5 | Return-to-neutral | After 2-4, set targets to 0. All within ±0.02 rad | 3 s |
-| 6 | Ankle-strategy disturbance recovery | Impulse +2 N·s on stick (world +z direction). Ankle alone brings tilt < 5° within 1.5 s | 3 s |
+| 6 | Ankle-strategy disturbance recovery | Apply 50 N horizontal force for 40 ms (= 2 N·s impulse, ≈ "moderate shoulder bump" magnitude; references Hsiao-Wecksler et al. perturbation studies). Ankle alone brings tilt < 5° within 1.5 s | 3 s |
 | 7 | ROM clamping | target = -1.0 rad (beyond dorsi limit -0.35). Actual stays within ROM by ≤ 10% | 2 s |
 | 8 | Sustained stability | Normal load, no disturbance, no commands — no NaN, no joint runaway | 10 s |
-| 9 | Peak passive moment at ROM end | At max dorsiflexion, passive resistance ≈ 50 N·m within 30% | snapshot |
+| 9 | Peak passive moment at ROM end | At max talocrural dorsiflexion (-0.35 rad), passive resistance ≈ 30 N·m within 30% (matches Riener & Edrich 1999 curve at functional ROM limit) | snapshot |
 
 ### Visual companion: `src/bin/ankle_anatomical_demo.rs`
 
@@ -193,7 +216,10 @@ Existing balance binaries test the *chain above* the ankle. This is the first bi
 - Stretch reflex / spinal reflex arcs
 
 ### Phase 1 deferred design choices
-- Oblique anatomical joint axes (Phase 1 uses orthogonal axes — orthogonal is sufficient for functional balance; oblique is a future refinement)
+- **Oblique anatomical joint axes** — Phase 1 uses orthogonal:
+  - Talocrural real axis: ~10° from frontal plane (Inman 1976). Phase 1 uses (1,0,0).
+  - Subtalar real axis: 42° from horizontal, 23° from sagittal (Manter 1941). Phase 1 uses (0,0,1).
+  - Consequence: foot supination/pronation coupling and sprain-mechanism dynamics absent. Adequate for static balance; revisit for gait.
 - Off-axis ROM fine-tuning against cadaver studies (Phase 1 uses functional-feel values)
 
 ### Not in any current phase
@@ -206,10 +232,11 @@ Existing balance binaries test the *chain above* the ankle. This is the first bi
 
 | Risk | Mitigation |
 |---|---|
-| Talus's small mass / inertia could trigger the small-body instability (see `project_bilateral_pd_limit.md`) | Talus's joint dampers use the implicit `AngularDamper::apply_implicit`. Keep talus mass ≥ 0.05 kg. If still unstable, can raise talus mass to 0.10 kg without affecting overall fidelity. |
-| Joint stacking with 3 joints close together (talocrural, subtalar, MTP all near each other) may have explicit-integration coupling issues | All angular dampers and the PD KD term use implicit integration (the engine fix from 2026-05-08). Should be safe. |
-| Test rig's load stick attachment via 6-DOF rigid joint — what about reaction torques? | The stick is pinned via stiff positional + angular springs (effectively a rigid weld). For testing the ankle, the stick is a load to balance; its own kinematics don't matter. |
-| Tuning the active PD gains may require iteration | Listed values are starting points; the validation harness will reveal whether they need adjustment. |
+| Talus small-body coupling instability | **Explicit check:** talus inertia I_talus_trans = (1/12)·0.05·(3·0.020² + 0.05²) = 1.2e-5 kg·m². Positional joint K = 60000 N/m at the talocrural anchor with lever arm r ≈ 0.025 m gives effective angular stiffness K_ang = K·r² = 37.5 N·m/rad. Coupled mode ω = sqrt(K_ang/I) = sqrt(37.5/1.2e-5) = 1768 rad/s. Stable explicit-Euler bound sub_dt < 2/ω = 1.1 ms. Project sub_dt = 1.39e-4 s — within margin (8×). With the implicit damper engine fix, this is comfortable. |
+| Joint stacking with 3 joints close together | All angular dampers and PD KD terms use implicit integration (engine fix 2026-05-08). Safe. |
+| Load stick attachment | Pinned via stiff positional + angular springs (effectively rigid weld). |
+| Tuning the active PD gains may require iteration | Listed values are starting points; validation harness reveals adjustments. |
+| Phase 1 axis simplifications limit realism | Talocrural (real axis oblique ~10° from frontal — Inman 1976) and subtalar (oblique 42°/23° — Manter 1941) use orthogonal axes in Phase 1. This means foot supination/pronation coupling and sprain-mechanism dynamics are absent. Acceptable for static balance and commanded motion; revisit when adding gait. |
 
 ## 8. Effort estimate
 
