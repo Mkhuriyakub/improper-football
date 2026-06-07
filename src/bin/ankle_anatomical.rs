@@ -165,7 +165,87 @@ fn joint_angle(
     swing_twist_angle(q_b_in_a, axis_local_a)
 }
 
+#[derive(Clone, Copy)]
+struct AnkleHandles {
+    shin_idx: usize,
+    talus_idx: usize,
+    foot_idx: usize,
+    forefoot_idx: usize,
+    stick_idx: usize,
+    talocrural_pd_idx: usize,
+    subtalar_pd_idx: usize,
+    mtp_pd_idx: usize,
+}
+
+fn build_world() -> (XpbdWorld, AnkleHandles) {
+    let mut world = XpbdWorld::new();
+    let id = UnitQuaternion::identity();
+
+    // Foot baseline: R_x(-π/2). Local +Y maps to world -Z (heel direction),
+    // local -Y to world +Z (toe direction).
+    let foot_baseline = UnitQuaternion::from_scaled_axis(
+        Vec3::new(-std::f64::consts::FRAC_PI_2, 0.0, 0.0));
+
+    // Foot: center at world (0, 0.032, +0.09); heel at world (0, 0.032, 0).
+    let mut foot = RigidBody::new(FOOT_MASS,
+        capsule_inertia(FOOT_MASS, FOOT_RADIUS, FOOT_HALF_H));
+    foot.position = Vec3::new(0.0, FOOT_RADIUS, 0.09);
+    foot.orientation = foot_baseline;
+    let foot_idx = world.add_body(foot);
+
+    // Forefoot: attached to foot's toe end (world (0,0.032,+0.18)) at its
+    // own heel end (local +Y). Carries foot baseline.
+    let mut forefoot = RigidBody::new(FOREFOOT_MASS,
+        capsule_inertia(FOREFOOT_MASS, FOREFOOT_RADIUS, FOREFOOT_HALF_H));
+    let (pos, orient) = place_child(&world.bodies[foot_idx],
+        Vec3::new(0.0, -FOOT_HALF_H, 0.0),         // foot toe end (foot local)
+        Vec3::new(0.0, FOREFOOT_HALF_H, 0.0),      // forefoot heel end (forefoot local)
+        id);
+    forefoot.position = pos;
+    forefoot.orientation = orient;
+    let forefoot_idx = world.add_body(forefoot);
+
+    // Talus: above foot's heel (subtalar joint at world (0,0.032,0)).
+    // Talus is at identity orientation.
+    let mut talus = RigidBody::new(TALUS_MASS,
+        capsule_inertia(TALUS_MASS, TALUS_RADIUS, TALUS_HALF_H));
+    talus.position = Vec3::new(0.0, FOOT_RADIUS + TALUS_HALF_H, 0.0);  // (0, 0.057, 0)
+    talus.orientation = id;
+    let talus_idx = world.add_body(talus);
+
+    // Shin: above talus (talocrural joint at world (0, 0.082, 0)).
+    let mut shin = RigidBody::new(SHIN_MASS,
+        capsule_inertia(SHIN_MASS, SHIN_RADIUS, SHIN_HALF_H));
+    let talocrural_world_y = FOOT_RADIUS + 2.0 * TALUS_HALF_H;  // 0.082
+    shin.position = Vec3::new(0.0, talocrural_world_y + SHIN_HALF_H, 0.0);  // (0, 0.292, 0)
+    shin.orientation = id;
+    let shin_idx = world.add_body(shin);
+
+    // Stick (load): above shin, welded to shin top.
+    let mut stick = RigidBody::new(STICK_MASS,
+        capsule_inertia(STICK_MASS, STICK_RADIUS, STICK_HALF_H));
+    let shin_top_y = talocrural_world_y + 2.0 * SHIN_HALF_H;  // 0.502
+    stick.position = Vec3::new(0.0, shin_top_y + STICK_HALF_H, 0.0);  // (0, 0.902, 0)
+    stick.orientation = id;
+    let stick_idx = world.add_body(stick);
+
+    // PD indices: stub for now (filled in later tasks).
+    let talocrural_pd_idx = usize::MAX;
+    let subtalar_pd_idx = usize::MAX;
+    let mtp_pd_idx = usize::MAX;
+
+    (world, AnkleHandles {
+        shin_idx, talus_idx, foot_idx, forefoot_idx, stick_idx,
+        talocrural_pd_idx, subtalar_pd_idx, mtp_pd_idx,
+    })
+}
+
 fn main() {
-    println!("PHASE 1 ANATOMICAL ANKLE VALIDATION");
-    println!("(scaffold — tests not yet implemented)");
+    let (world, h) = build_world();
+    println!("Body positions at neutral:");
+    println!("  foot     y={:.4}, z={:+.4}", world.bodies[h.foot_idx].position.y,    world.bodies[h.foot_idx].position.z);
+    println!("  forefoot y={:.4}, z={:+.4}", world.bodies[h.forefoot_idx].position.y, world.bodies[h.forefoot_idx].position.z);
+    println!("  talus    y={:.4}, z={:+.4}", world.bodies[h.talus_idx].position.y,   world.bodies[h.talus_idx].position.z);
+    println!("  shin     y={:.4}, z={:+.4}", world.bodies[h.shin_idx].position.y,    world.bodies[h.shin_idx].position.z);
+    println!("  stick    y={:.4}, z={:+.4}", world.bodies[h.stick_idx].position.y,   world.bodies[h.stick_idx].position.z);
 }
