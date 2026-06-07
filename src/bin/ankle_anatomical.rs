@@ -221,6 +221,40 @@ fn build_world() -> (XpbdWorld, AnkleHandles) {
     shin.orientation = id;
     let shin_idx = world.add_body(shin);
 
+    // ── Talocrural joint (shin ↔ talus) ─────────────────────────────
+    // Positional joint at shin bottom / talus top.
+    add_elastic_joint(&mut world, shin_idx, talus_idx,
+        Vec3::new(0.0, -SHIN_HALF_H, 0.0),
+        Vec3::new(0.0, TALUS_HALF_H, 0.0),
+        TALOCRURAL_JOINT_K, TALOCRURAL_JOINT_C);
+
+    // Primary axis: world +x at neutral, in shin local frame.
+    let tc_primary = Vec3::new(1.0, 0.0, 0.0);
+    world.angular_soft_limits.push(AngularSoftLimit::new(
+        shin_idx, talus_idx, tc_primary,
+        TALOCRURAL_ROM_MIN, TALOCRURAL_ROM_MAX,
+        TALOCRURAL_LIMIT_K, TALOCRURAL_LIMIT_EXP));
+    world.angular_dampers.push(AngularDamper::new(
+        shin_idx, talus_idx, tc_primary, TALOCRURAL_PASSIVE_C));
+    world.angular_springs.push(AngularSpring::new(
+        shin_idx, talus_idx, tc_primary, TALOCRURAL_PASSIVE_K, 0.0));
+    let talocrural_pd_idx = world.angular_pd_controllers.len();
+    world.angular_pd_controllers.push(AngularPDController::new(
+        shin_idx, talus_idx, tc_primary,
+        TALOCRURAL_PRIMARY_KP, TALOCRURAL_PRIMARY_KD));
+
+    // Off-axes (Y, Z) locked: strong passive + soft-limit at narrow ROM.
+    for off_axis in [Vec3::y(), Vec3::z()] {
+        world.angular_soft_limits.push(AngularSoftLimit::new(
+            shin_idx, talus_idx, off_axis,
+            -TALOCRURAL_OFF_AXIS_LIM, TALOCRURAL_OFF_AXIS_LIM,
+            TALOCRURAL_OFF_AXIS_LIMIT_K, TALOCRURAL_LIMIT_EXP));
+        world.angular_dampers.push(AngularDamper::new(
+            shin_idx, talus_idx, off_axis, TALOCRURAL_PASSIVE_C));
+        world.angular_springs.push(AngularSpring::new(
+            shin_idx, talus_idx, off_axis, TALOCRURAL_OFF_AXIS_K, 0.0));
+    }
+
     // Stick (load): above shin, welded to shin top.
     let mut stick = RigidBody::new(STICK_MASS,
         capsule_inertia(STICK_MASS, STICK_RADIUS, STICK_HALF_H));
@@ -230,7 +264,6 @@ fn build_world() -> (XpbdWorld, AnkleHandles) {
     let stick_idx = world.add_body(stick);
 
     // PD indices: stub for now (filled in later tasks).
-    let talocrural_pd_idx = usize::MAX;
     let subtalar_pd_idx = usize::MAX;
     let mtp_pd_idx = usize::MAX;
 
