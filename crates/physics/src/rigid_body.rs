@@ -1,6 +1,22 @@
 use crate::math::{Vec3, Quat, Mat3};
 use nalgebra::UnitQuaternion;
 
+/// Collision geometry for a capsule body. The capsule's central segment
+/// runs along the body's local +Y axis with length `2 * half_h`, and each
+/// end is capped by a sphere of radius `radius`. Used by the world-level
+/// ground-contact system to detect penetration.
+#[derive(Clone, Copy, Debug)]
+pub struct CapsuleShape {
+    pub half_h: f64,
+    pub radius: f64,
+}
+
+impl CapsuleShape {
+    pub fn new(half_h: f64, radius: f64) -> Self {
+        Self { half_h, radius }
+    }
+}
+
 pub struct RigidBody {
     pub position: Vec3,
     pub orientation: Quat,
@@ -14,6 +30,12 @@ pub struct RigidBody {
     pub torque_accumulator: Vec3,
     pub restitution: f64,
     pub friction: f64,
+    /// Optional capsule collision shape. When present, the world's
+    /// ground-contact system applies penalty contact to this body.
+    /// `None` means the body is not collidable against the ground
+    /// (e.g., abstract bodies, pinned anchors, or geometry the user
+    /// hasn't characterized yet).
+    pub capsule_shape: Option<CapsuleShape>,
 }
 
 impl RigidBody {
@@ -33,7 +55,35 @@ impl RigidBody {
             torque_accumulator: Vec3::zeros(),
             restitution: 0.6,
             friction: 0.4,
+            capsule_shape: None,
         }
+    }
+
+    /// Construct a capsule rigid body. The capsule's central segment
+    /// runs along local +Y with length `2 * half_h`, capped by spheres
+    /// of `radius` on each end. The inertia tensor is the standard
+    /// solid-cylinder approximation (the rounded caps contribute a
+    /// small amount that is ignored — adequate for the body sizes used
+    /// in this project).
+    ///
+    ///   - i_axial   = (1/2) m r²              (about local Y)
+    ///   - i_trans   = (1/12) m (3 r² + h²)    (about local X and Z)
+    ///
+    /// The resulting body has `capsule_shape = Some(...)`, so the
+    /// world-level ground-contact system will collide it with the
+    /// ground automatically.
+    pub fn new_capsule(mass: f64, half_h: f64, radius: f64) -> Self {
+        let h = 2.0 * half_h;
+        let i_axial = 0.5 * mass * radius * radius;
+        let i_trans = (1.0 / 12.0) * mass * (3.0 * radius * radius + h * h);
+        let inertia = Mat3::new(
+            i_trans, 0.0, 0.0,
+            0.0, i_axial, 0.0,
+            0.0, 0.0, i_trans,
+        );
+        let mut body = Self::new(mass, inertia);
+        body.capsule_shape = Some(CapsuleShape::new(half_h, radius));
+        body
     }
 
     pub fn apply_force(&mut self, force: Vec3) {
@@ -58,5 +108,25 @@ impl RigidBody {
     pub fn clear_accumulators(&mut self) {
         self.force_accumulator = Vec3::zeros();
         self.torque_accumulator = Vec3::zeros();
+    }
+
+    /// World-frame positions of the two endpoints of the body's local
+    /// +Y axis at the given half-length. For a capsule whose axis is
+    /// the local Y axis (the project's convention), `half_length`
+    /// should be the capsule's half-height, and the returned points
+    /// are the centers of the two rounded caps.
+    ///
+    /// Returns `(positive_end, negative_end)`: positive_end is the
+    /// endpoint on the local +Y side, negative_end on the -Y side.
+    /// Whether one of these is "toe" or "heel" depends on the body's
+    /// orientation — for a foot at horizontal anatomical pose
+    /// (`foot_baseline = R_x(-π/2)`), local +Y maps to world -Z, so
+    /// `positive_end` is the heel and `negative_end` is the toe.
+    pub fn axis_endpoints_world(&self, half_length: f64) -> (Vec3, Vec3) {
+        let local_pos = Vec3::new(0.0, half_length, 0.0);
+        let local_neg = Vec3::new(0.0, -half_length, 0.0);
+        let world_pos = self.position + self.orientation * local_pos;
+        let world_neg = self.position + self.orientation * local_neg;
+        (world_pos, world_neg)
     }
 }
