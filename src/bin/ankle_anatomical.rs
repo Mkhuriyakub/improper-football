@@ -255,6 +255,61 @@ fn build_world() -> (XpbdWorld, AnkleHandles) {
             shin_idx, talus_idx, off_axis, TALOCRURAL_OFF_AXIS_K, 0.0));
     }
 
+    // ── Subtalar joint (talus ↔ foot) ───────────────────────────────
+    // The foot baseline R_x(-π/2) is applied at this joint: rel_rot in
+    // place_child was foot_baseline. The positional joint uses the
+    // anatomical anchor points.
+    add_elastic_joint(&mut world, talus_idx, foot_idx,
+        Vec3::new(0.0, -TALUS_HALF_H, 0.0),
+        Vec3::new(0.0, FOOT_HALF_H, 0.0),  // foot heel anchor in foot local
+        SUBTALAR_JOINT_K, SUBTALAR_JOINT_C);
+
+    // Primary axis: world +z at neutral (inversion/eversion).
+    // In talus local frame (talus is at identity), axis = (0, 0, 1).
+    let st_primary = Vec3::new(0.0, 0.0, 1.0);
+    world.angular_soft_limits.push(AngularSoftLimit::new(
+        talus_idx, foot_idx, st_primary,
+        SUBTALAR_ROM_MIN, SUBTALAR_ROM_MAX,
+        SUBTALAR_LIMIT_K, SUBTALAR_LIMIT_EXP)
+        .with_baseline(foot_baseline));
+    world.angular_dampers.push(AngularDamper::new(
+        talus_idx, foot_idx, st_primary, SUBTALAR_PASSIVE_C));
+    world.angular_springs.push(AngularSpring::new(
+        talus_idx, foot_idx, st_primary, SUBTALAR_PASSIVE_K, 0.0)
+        .with_baseline(foot_baseline));
+    let subtalar_pd_idx = world.angular_pd_controllers.len();
+    world.angular_pd_controllers.push(AngularPDController::new(
+        talus_idx, foot_idx, st_primary,
+        SUBTALAR_PRIMARY_KP, SUBTALAR_PRIMARY_KD)
+        .with_baseline(foot_baseline));
+
+    // Twist axis (Y in talus local): very limited passive ROM.
+    let st_twist = Vec3::new(0.0, 1.0, 0.0);
+    world.angular_soft_limits.push(AngularSoftLimit::new(
+        talus_idx, foot_idx, st_twist,
+        -SUBTALAR_TWIST_LIM, SUBTALAR_TWIST_LIM,
+        SUBTALAR_TWIST_LIMIT_K, SUBTALAR_LIMIT_EXP)
+        .with_baseline(foot_baseline));
+    world.angular_dampers.push(AngularDamper::new(
+        talus_idx, foot_idx, st_twist, SUBTALAR_TWIST_C));
+    world.angular_springs.push(AngularSpring::new(
+        talus_idx, foot_idx, st_twist, SUBTALAR_TWIST_K, 0.0)
+        .with_baseline(foot_baseline));
+
+    // Other off-axis (X in talus local): locked, prevents PF/DF leaking
+    // into the subtalar joint (that's the talocrural's job).
+    let st_locked = Vec3::new(1.0, 0.0, 0.0);
+    world.angular_soft_limits.push(AngularSoftLimit::new(
+        talus_idx, foot_idx, st_locked,
+        -SUBTALAR_OFF_AXIS_LIM, SUBTALAR_OFF_AXIS_LIM,
+        SUBTALAR_OFF_AXIS_LIMIT_K, SUBTALAR_LIMIT_EXP)
+        .with_baseline(foot_baseline));
+    world.angular_dampers.push(AngularDamper::new(
+        talus_idx, foot_idx, st_locked, SUBTALAR_PASSIVE_C));
+    world.angular_springs.push(AngularSpring::new(
+        talus_idx, foot_idx, st_locked, SUBTALAR_OFF_AXIS_K, 0.0)
+        .with_baseline(foot_baseline));
+
     // Stick (load): above shin, welded to shin top.
     let mut stick = RigidBody::new(STICK_MASS,
         capsule_inertia(STICK_MASS, STICK_RADIUS, STICK_HALF_H));
@@ -264,7 +319,6 @@ fn build_world() -> (XpbdWorld, AnkleHandles) {
     let stick_idx = world.add_body(stick);
 
     // PD indices: stub for now (filled in later tasks).
-    let subtalar_pd_idx = usize::MAX;
     let mtp_pd_idx = usize::MAX;
 
     (world, AnkleHandles {
