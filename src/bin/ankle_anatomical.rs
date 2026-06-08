@@ -371,6 +371,45 @@ fn build_world() -> (XpbdWorld, AnkleHandles) {
     })
 }
 
+struct TestResult {
+    name: &'static str,
+    passed: bool,
+    message: String,
+}
+
+impl TestResult {
+    fn pass(name: &'static str) -> Self {
+        Self { name, passed: true, message: String::from("PASS") }
+    }
+    fn fail(name: &'static str, message: String) -> Self {
+        Self { name, passed: false, message }
+    }
+}
+
+/// Run the simulation for `duration` seconds, optionally calling
+/// `per_frame` once per frame (after each `SOLVER_ITERATIONS` substeps).
+/// Returns the world afterward.
+fn simulate(
+    world: &mut XpbdWorld,
+    duration: f64,
+    mut per_frame: impl FnMut(&mut XpbdWorld, f64),
+) {
+    let mut t = 0.0;
+    while t < duration {
+        for _ in 0..SOLVER_ITERATIONS {
+            world.substep(SUB_DT);
+        }
+        t += DT;
+        per_frame(world, t);
+    }
+}
+
+/// Check that all body positions are finite (no NaN/inf).
+fn all_positions_finite(world: &XpbdWorld) -> bool {
+    world.bodies.iter().all(|b|
+        b.position.x.is_finite() && b.position.y.is_finite() && b.position.z.is_finite())
+}
+
 fn main() {
     let (world, h) = build_world();
     println!("Body positions at neutral:");
