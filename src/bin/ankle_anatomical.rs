@@ -410,12 +410,25 @@ fn all_positions_finite(world: &XpbdWorld) -> bool {
         b.position.x.is_finite() && b.position.y.is_finite() && b.position.z.is_finite())
 }
 
+fn test_sustained_stability() -> TestResult {
+    let (mut world, _h) = build_world();
+    let mut blew_up = false;
+    simulate(&mut world, 10.0, |w, _t| {
+        if !all_positions_finite(w) {
+            blew_up = true;
+        }
+    });
+    if blew_up {
+        return TestResult::fail("8: sustained stability",
+            "non-finite body position detected".into());
+    }
+    TestResult::pass("8: sustained stability")
+}
+
 fn main() {
-    let (world, h) = build_world();
-    println!("Body positions at neutral:");
-    println!("  foot     y={:.4}, z={:+.4}", world.bodies[h.foot_idx].position.y,    world.bodies[h.foot_idx].position.z);
-    println!("  forefoot y={:.4}, z={:+.4}", world.bodies[h.forefoot_idx].position.y, world.bodies[h.forefoot_idx].position.z);
-    println!("  talus    y={:.4}, z={:+.4}", world.bodies[h.talus_idx].position.y,   world.bodies[h.talus_idx].position.z);
-    println!("  shin     y={:.4}, z={:+.4}", world.bodies[h.shin_idx].position.y,    world.bodies[h.shin_idx].position.z);
-    println!("  stick    y={:.4}, z={:+.4}", world.bodies[h.stick_idx].position.y,   world.bodies[h.stick_idx].position.z);
+    let r = test_sustained_stability();
+    println!("{}: {}", r.name, r.message);
+    if !r.passed {
+        std::process::exit(1);
+    }
 }
