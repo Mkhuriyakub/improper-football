@@ -353,6 +353,18 @@ fn build_world() -> (XpbdWorld, AnkleHandles) {
     stick.orientation = id;
     let stick_idx = world.add_body(stick);
 
+    // ── Stick welded to shin top ────────────────────────────────────
+    weld_bodies(&mut world, shin_idx, stick_idx,
+        Vec3::new(0.0, SHIN_HALF_H, 0.0),
+        Vec3::new(0.0, -STICK_HALF_H, 0.0));
+
+    // ── Ground contact on foot only ─────────────────────────────────
+    // Foot uses single-capsule GroundContact (multi-region foot is
+    // Phase 2). Other bodies' contact (forefoot when toes are up,
+    // etc.) is intentionally not modeled in Phase 1.
+    world.ground_contacts.push(
+        GroundContact::new(foot_idx, FOOT_HALF_H, FOOT_RADIUS));
+
     (world, AnkleHandles {
         shin_idx, talus_idx, foot_idx, forefoot_idx, stick_idx,
         talocrural_pd_idx, subtalar_pd_idx, mtp_pd_idx,
