@@ -14,8 +14,7 @@ use physics::angular_soft_limit::AngularSoftLimit;
 use physics::angular_pd_controller::AngularPDController;
 use physics::positional_spring::PositionalSpring;
 use physics::positional_damper::PositionalDamper;
-use physics::ground_contact::GroundContact;
-use physics::math::{Vec3, Mat3, swing_twist_angle};
+use physics::math::{Vec3, swing_twist_angle};
 use nalgebra::UnitQuaternion;
 
 // ─── Simulation timing ────────────────────────────────────────────────
@@ -105,17 +104,6 @@ const WELD_ANG_C: f64 =       500.0;
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
-fn capsule_inertia(mass: f64, radius: f64, half_h: f64) -> Mat3 {
-    let h = 2.0 * half_h;
-    let i_axial = 0.5 * mass * radius * radius;
-    let i_trans = (1.0 / 12.0) * mass * (3.0 * radius * radius + h * h);
-    Mat3::new(
-        i_trans, 0.0, 0.0,
-        0.0, i_axial, 0.0,
-        0.0, 0.0, i_trans,
-    )
-}
-
 fn place_child(
     parent: &RigidBody, parent_distal: Vec3, child_proximal: Vec3,
     rel_rot: UnitQuaternion<f64>,
@@ -179,6 +167,7 @@ struct AnkleHandles {
 
 fn build_world() -> (XpbdWorld, AnkleHandles) {
     let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
     let id = UnitQuaternion::identity();
 
     // Foot baseline: R_x(-π/2). Local +Y maps to world -Z (heel direction),
@@ -187,16 +176,14 @@ fn build_world() -> (XpbdWorld, AnkleHandles) {
         Vec3::new(-std::f64::consts::FRAC_PI_2, 0.0, 0.0));
 
     // Foot: center at world (0, 0.032, +0.09); heel at world (0, 0.032, 0).
-    let mut foot = RigidBody::new(FOOT_MASS,
-        capsule_inertia(FOOT_MASS, FOOT_RADIUS, FOOT_HALF_H));
+    let mut foot = RigidBody::new_capsule(FOOT_MASS, FOOT_HALF_H, FOOT_RADIUS);
     foot.position = Vec3::new(0.0, FOOT_RADIUS, 0.09);
     foot.orientation = foot_baseline;
     let foot_idx = world.add_body(foot);
 
     // Forefoot: attached to foot's toe end (world (0,0.032,+0.18)) at its
     // own heel end (local +Y). Carries foot baseline.
-    let mut forefoot = RigidBody::new(FOREFOOT_MASS,
-        capsule_inertia(FOREFOOT_MASS, FOREFOOT_RADIUS, FOREFOOT_HALF_H));
+    let mut forefoot = RigidBody::new_capsule(FOREFOOT_MASS, FOREFOOT_HALF_H, FOREFOOT_RADIUS);
     let (pos, orient) = place_child(&world.bodies[foot_idx],
         Vec3::new(0.0, -FOOT_HALF_H, 0.0),         // foot toe end (foot local)
         Vec3::new(0.0, FOREFOOT_HALF_H, 0.0),      // forefoot heel end (forefoot local)
@@ -207,15 +194,13 @@ fn build_world() -> (XpbdWorld, AnkleHandles) {
 
     // Talus: above foot's heel (subtalar joint at world (0,0.032,0)).
     // Talus is at identity orientation.
-    let mut talus = RigidBody::new(TALUS_MASS,
-        capsule_inertia(TALUS_MASS, TALUS_RADIUS, TALUS_HALF_H));
+    let mut talus = RigidBody::new_capsule(TALUS_MASS, TALUS_HALF_H, TALUS_RADIUS);
     talus.position = Vec3::new(0.0, FOOT_RADIUS + TALUS_HALF_H, 0.0);  // (0, 0.057, 0)
     talus.orientation = id;
     let talus_idx = world.add_body(talus);
 
     // Shin: above talus (talocrural joint at world (0, 0.082, 0)).
-    let mut shin = RigidBody::new(SHIN_MASS,
-        capsule_inertia(SHIN_MASS, SHIN_RADIUS, SHIN_HALF_H));
+    let mut shin = RigidBody::new_capsule(SHIN_MASS, SHIN_HALF_H, SHIN_RADIUS);
     let talocrural_world_y = FOOT_RADIUS + 2.0 * TALUS_HALF_H;  // 0.082
     shin.position = Vec3::new(0.0, talocrural_world_y + SHIN_HALF_H, 0.0);  // (0, 0.292, 0)
     shin.orientation = id;
@@ -346,8 +331,7 @@ fn build_world() -> (XpbdWorld, AnkleHandles) {
     }
 
     // Stick (load): above shin, welded to shin top.
-    let mut stick = RigidBody::new(STICK_MASS,
-        capsule_inertia(STICK_MASS, STICK_RADIUS, STICK_HALF_H));
+    let mut stick = RigidBody::new_capsule(STICK_MASS, STICK_HALF_H, STICK_RADIUS);
     let shin_top_y = talocrural_world_y + 2.0 * SHIN_HALF_H;  // 0.502
     stick.position = Vec3::new(0.0, shin_top_y + STICK_HALF_H, 0.0);  // (0, 0.902, 0)
     stick.orientation = id;
@@ -358,13 +342,10 @@ fn build_world() -> (XpbdWorld, AnkleHandles) {
         Vec3::new(0.0, SHIN_HALF_H, 0.0),
         Vec3::new(0.0, -STICK_HALF_H, 0.0));
 
-    // ── Ground contact on foot only ─────────────────────────────────
-    // Foot uses single-capsule GroundContact (multi-region foot is
-    // Phase 2). Other bodies' contact (forefoot when toes are up,
-    // etc.) is intentionally not modeled in Phase 1.
-    world.ground_contacts.push(
-        GroundContact::new(foot_idx, FOOT_HALF_H, FOOT_RADIUS));
-
+    // ── Ground contact via the world ────────────────────────────────
+    // Every body with capsule_shape collides with the ground at y=0
+    // (the foot in normal stance; the forefoot/talus/shin/stick if the
+    // chain tips far enough).
     (world, AnkleHandles {
         shin_idx, talus_idx, foot_idx, forefoot_idx, stick_idx,
         talocrural_pd_idx, subtalar_pd_idx, mtp_pd_idx,
@@ -425,10 +406,32 @@ fn test_sustained_stability() -> TestResult {
     TestResult::pass("8: sustained stability")
 }
 
+fn test_static_balance() -> TestResult {
+    let (mut world, h) = build_world();
+    // PD targets are 0 (default). Just let the chain settle.
+    let mut max_stick_tilt = 0.0_f64;
+    simulate(&mut world, 5.0, |w, _t| {
+        // Stick tilt = scaled-axis magnitude (small-angle approx).
+        let tilt = w.bodies[h.stick_idx].orientation.scaled_axis().norm();
+        if tilt > max_stick_tilt { max_stick_tilt = tilt; }
+    });
+    let tilt_deg = max_stick_tilt.to_degrees();
+    if tilt_deg < 5.0 && all_positions_finite(&world) {
+        TestResult::pass("1: static balance")
+    } else {
+        TestResult::fail("1: static balance",
+            format!("max stick tilt = {:.2}° (limit 5°)", tilt_deg))
+    }
+}
+
 fn main() {
-    let r = test_sustained_stability();
-    println!("{}: {}", r.name, r.message);
-    if !r.passed {
+    let mut results = vec![];
+    results.push(test_sustained_stability());
+    results.push(test_static_balance());
+    for r in &results {
+        println!("{}: {}", r.name, r.message);
+    }
+    if results.iter().any(|r| !r.passed) {
         std::process::exit(1);
     }
 }

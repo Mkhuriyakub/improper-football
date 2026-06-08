@@ -19,8 +19,7 @@
 
 use physics::xpbd::XpbdWorld;
 use physics::rigid_body::RigidBody;
-use physics::ground_contact::GroundContact;
-use physics::math::{Vec3, Mat3};
+use physics::math::Vec3;
 use nalgebra::UnitQuaternion;
 
 const DT: f64 = 1.0 / 120.0;
@@ -34,21 +33,12 @@ const HALF_H:  f64 = 0.05;
 const RADIUS:  f64 = 0.05;
 const INITIAL_VX:  f64 = 1.0;
 
-fn capsule_inertia(mass: f64, radius: f64, half_h: f64) -> Mat3 {
-    let h = 2.0 * half_h;
-    let i_axial = 0.5 * mass * radius * radius;
-    let i_trans = (1.0 / 12.0) * mass * (3.0 * radius * radius + h * h);
-    Mat3::new(
-        i_trans, 0.0,     0.0,
-        0.0,     i_axial, 0.0,
-        0.0,     0.0,     i_trans,
-    )
-}
-
 fn run_case(label: &str, friction: f64) {
     let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
+    world.ground.friction_coefficient = friction;
 
-    let mut body = RigidBody::new(MASS, capsule_inertia(MASS, RADIUS, HALF_H));
+    let mut body = RigidBody::new_capsule(MASS, HALF_H, RADIUS);
     // Start AT the resting height (y = radius) with no vertical velocity —
     // skip the drop so we measure pure sliding behavior.
     body.position = Vec3::new(0.0, RADIUS, 0.0);
@@ -57,9 +47,6 @@ fn run_case(label: &str, friction: f64) {
         Vec3::new(0.0, 0.0, std::f64::consts::FRAC_PI_2));
     body.linear_velocity = Vec3::new(INITIAL_VX, 0.0, 0.0);
     let body_idx = world.add_body(body);
-
-    world.ground_contacts.push(
-        GroundContact::new(body_idx, HALF_H, RADIUS).with_friction(friction));
 
     let analytical_slide = if friction > 0.0 {
         INITIAL_VX * INITIAL_VX / (2.0 * friction * 9.81)

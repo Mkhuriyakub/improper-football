@@ -37,8 +37,7 @@ use physics::angular_spring::AngularSpring;
 use physics::angular_soft_limit::AngularSoftLimit;
 use physics::positional_spring::PositionalSpring;
 use physics::positional_damper::PositionalDamper;
-use physics::ground_contact::GroundContact;
-use physics::math::{Vec3, Mat3, swing_twist_angle};
+use physics::math::{Vec3, swing_twist_angle};
 use nalgebra::UnitQuaternion;
 
 const DT: f64 = 1.0 / 120.0;
@@ -110,17 +109,6 @@ const ANKLE_LIMIT_EXP: f64 = 2.0;
 // Pelvis CG at x = HIP_ANCHOR_PELVIS_X = 0.10 (directly over the foot).
 const PELVIS_INITIAL_POS: Vec3 = Vec3::new(0.10, 0.952, 0.0);
 
-fn capsule_inertia(mass: f64, radius: f64, half_h: f64) -> Mat3 {
-    let h = 2.0 * half_h;
-    let i_axial = 0.5 * mass * radius * radius;
-    let i_trans = (1.0 / 12.0) * mass * (3.0 * radius * radius + h * h);
-    Mat3::new(
-        i_trans, 0.0,     0.0,
-        0.0,     i_axial, 0.0,
-        0.0,     0.0,     i_trans,
-    )
-}
-
 fn place_child(
     parent: &RigidBody, parent_distal: Vec3, child_proximal: Vec3,
     rel_rot: UnitQuaternion<f64>,
@@ -160,18 +148,17 @@ fn add_axis(
 
 fn main() {
     let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
 
     // Pelvis (UNPINNED).
-    let mut pelvis = RigidBody::new(PELVIS_MASS,
-        capsule_inertia(PELVIS_MASS, PELVIS_RADIUS, PELVIS_HALF_H));
+    let mut pelvis = RigidBody::new_capsule(PELVIS_MASS, PELVIS_HALF_H, PELVIS_RADIUS);
     pelvis.position = PELVIS_INITIAL_POS;
     pelvis.orientation = UnitQuaternion::identity();
     let pelvis_idx = world.add_body(pelvis);
 
     // Thigh.
     let hip_anchor_pelvis = Vec3::new(HIP_ANCHOR_PELVIS_X, HIP_ANCHOR_PELVIS_Y, 0.0);
-    let mut thigh = RigidBody::new(THIGH_MASS,
-        capsule_inertia(THIGH_MASS, THIGH_RADIUS, THIGH_HALF_H));
+    let mut thigh = RigidBody::new_capsule(THIGH_MASS, THIGH_HALF_H, THIGH_RADIUS);
     let (pos, orient) = place_child(&world.bodies[pelvis_idx],
         hip_anchor_pelvis, Vec3::new(0.0, THIGH_HALF_H, 0.0),
         UnitQuaternion::identity());
@@ -193,8 +180,7 @@ fn main() {
         HIP_LIMIT_K, HIP_LIMIT_EXP, id);
 
     // Shin.
-    let mut shin = RigidBody::new(SHIN_MASS,
-        capsule_inertia(SHIN_MASS, SHIN_RADIUS, SHIN_HALF_H));
+    let mut shin = RigidBody::new_capsule(SHIN_MASS, SHIN_HALF_H, SHIN_RADIUS);
     let (pos, orient) = place_child(&world.bodies[thigh_idx],
         Vec3::new(0.0, -THIGH_HALF_H, 0.0),
         Vec3::new(0.0,  SHIN_HALF_H, 0.0),
@@ -221,8 +207,7 @@ fn main() {
     // Foot at horizontal anatomical pose: baseline R_x(-π/2).
     let foot_baseline = UnitQuaternion::from_scaled_axis(
         Vec3::new(-std::f64::consts::FRAC_PI_2, 0.0, 0.0));
-    let mut foot = RigidBody::new(FOOT_MASS,
-        capsule_inertia(FOOT_MASS, FOOT_RADIUS, FOOT_HALF_H));
+    let mut foot = RigidBody::new_capsule(FOOT_MASS, FOOT_HALF_H, FOOT_RADIUS);
     let (pos, orient) = place_child(&world.bodies[shin_idx],
         Vec3::new(0.0, -SHIN_HALF_H, 0.0),
         FOOT_ANCHOR_LOCAL,
@@ -243,27 +228,13 @@ fn main() {
         -TWIST_LIM, TWIST_LIM, TWIST_K, TWIST_C, 0.0,
         TWIST_LIMIT_K, ANKLE_LIMIT_EXP, foot_baseline);
 
-    // Ground contacts on every body. The foot uses the default plane_y=0
-    // (its capsule shape — heel and toe end-spheres at ankle height —
-    // matches anatomy reasonably). Non-foot bodies use plane_y = -radius
-    // so contact engages when the body's axis endpoint crosses the
-    // ground, not when the unmodeled rounded capsule end below the axis
-    // does. Without this offset the shin's lower rounded end would
-    // already be 1.8 cm below ground at rest, jolting the leg upward
-    // at t=0. With this offset, every body sits cleanly above ground at
-    // start and contact engages as the leg buckles and parts approach
-    // ground level.
-    world.ground_contacts.push(
-        GroundContact::new(foot_idx, FOOT_HALF_H, FOOT_RADIUS));
-    world.ground_contacts.push(
-        GroundContact::new(shin_idx, SHIN_HALF_H, SHIN_RADIUS)
-            .with_plane_y(-SHIN_RADIUS));
-    world.ground_contacts.push(
-        GroundContact::new(thigh_idx, THIGH_HALF_H, THIGH_RADIUS)
-            .with_plane_y(-THIGH_RADIUS));
-    world.ground_contacts.push(
-        GroundContact::new(pelvis_idx, PELVIS_HALF_H, PELVIS_RADIUS)
-            .with_plane_y(-PELVIS_RADIUS));
+    // Ground contact via the world: every body with capsule_shape collides
+    // with the ground at y=0. Pre-migration this binary offset shin/thigh/
+    // pelvis contact planes by -radius (so the unmodeled rounded ends below
+    // the axis didn't pre-penetrate at rest). Under the world-level model
+    // every body respects the same plane; segments near the ground may
+    // pre-penetrate by up to one radius at rest (the chain settles into
+    // that one substep).
 
     println!("UNPINNED SINGLE LEG (Phase 2 step 4)");
     println!("Pelvis (8 kg, unpinned) + thigh (7 kg) + shin (3.5 kg) + foot (1 kg)");

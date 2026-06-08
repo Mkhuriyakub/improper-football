@@ -35,8 +35,7 @@ use physics::angular_spring::AngularSpring;
 use physics::angular_soft_limit::AngularSoftLimit;
 use physics::positional_spring::PositionalSpring;
 use physics::positional_damper::PositionalDamper;
-use physics::ground_contact::GroundContact;
-use physics::math::{Vec3, Mat3, swing_twist_angle};
+use physics::math::{Vec3, swing_twist_angle};
 use nalgebra::UnitQuaternion;
 
 const DT: f64 = 1.0 / 120.0;
@@ -78,17 +77,6 @@ const ANKLE_LIMIT_EXP: f64 = 2.0;
 // above the ground after its gravitational droop and never contacted.
 const SHIN_REST_POS: Vec3 = Vec3::new(0.0, 0.21 + FOOT_RADIUS, 0.0);
 
-fn capsule_inertia(mass: f64, radius: f64, half_h: f64) -> Mat3 {
-    let h = 2.0 * half_h;
-    let i_axial = 0.5 * mass * radius * radius;
-    let i_trans = (1.0 / 12.0) * mass * (3.0 * radius * radius + h * h);
-    Mat3::new(
-        i_trans, 0.0,     0.0,
-        0.0,     i_axial, 0.0,
-        0.0,     0.0,     i_trans,
-    )
-}
-
 fn place_child(
     parent: &RigidBody, parent_distal: Vec3, child_proximal: Vec3,
     rel_rot: UnitQuaternion<f64>,
@@ -113,9 +101,10 @@ fn add_elastic_joint(
 
 fn main() {
     let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
 
     // Pinned shin.
-    let mut shin = RigidBody::new(0.0, capsule_inertia(3.5, SHIN_RADIUS, SHIN_HALF_H));
+    let mut shin = RigidBody::new_capsule(0.0, SHIN_HALF_H, SHIN_RADIUS);
     shin.position = SHIN_REST_POS;
     shin.orientation = UnitQuaternion::identity();
     let shin_idx = world.add_body(shin);
@@ -124,8 +113,7 @@ fn main() {
     let baseline = UnitQuaternion::from_scaled_axis(
         Vec3::new(-std::f64::consts::FRAC_PI_2, 0.0, 0.0));
 
-    let mut foot = RigidBody::new(FOOT_MASS,
-        capsule_inertia(FOOT_MASS, FOOT_RADIUS, FOOT_HALF_H));
+    let mut foot = RigidBody::new_capsule(FOOT_MASS, FOOT_HALF_H, FOOT_RADIUS);
     let (pos, orient) = place_child(
         &world.bodies[shin_idx],
         Vec3::new(0.0, -SHIN_HALF_H, 0.0),
@@ -166,9 +154,8 @@ fn main() {
     world.angular_springs.push(
         AngularSpring::new(shin_idx, foot_idx, twist_axis, TWIST_K, 0.0).with_baseline(baseline));
 
-    // Ground contact on the foot only. Default friction (μ=0.6).
-    world.ground_contacts.push(GroundContact::new(foot_idx, FOOT_HALF_H, FOOT_RADIUS));
-
+    // Ground contact applies to all bodies with capsule_shape (default μ=0.6).
+    // Shin is pinned so it's skipped automatically; foot collides with the floor.
     let initial_foot_bottom = world.bodies[foot_idx].position.y - FOOT_RADIUS;
     println!("FOOT ON GROUND (post-refactor)");
     println!("Pinned shin at y={:.2}; foot starts horizontal, bottom at y={:.4}",

@@ -29,8 +29,7 @@ use physics::angular_spring::AngularSpring;
 use physics::angular_soft_limit::AngularSoftLimit;
 use physics::positional_spring::PositionalSpring;
 use physics::positional_damper::PositionalDamper;
-use physics::ground_contact::GroundContact;
-use physics::math::{Vec3, Mat3};
+use physics::math::Vec3;
 use nalgebra::UnitQuaternion;
 
 const DT: f64 = 1.0 / 120.0;
@@ -154,17 +153,6 @@ const WRIST_LIMIT_K: f64 = 200.0;  const WRIST_TWIST_LIMIT_K: f64 = 20.0;
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
-fn capsule_inertia(mass: f64, radius: f64, half_h: f64) -> Mat3 {
-    let h = 2.0 * half_h;
-    let i_axial = 0.5 * mass * radius * radius;
-    let i_trans = (1.0 / 12.0) * mass * (3.0 * radius * radius + h * h);
-    Mat3::new(
-        i_trans, 0.0,     0.0,
-        0.0,     i_axial, 0.0,
-        0.0,     0.0,     i_trans,
-    )
-}
-
 fn place_child(
     parent: &RigidBody, parent_distal: Vec3, child_proximal: Vec3,
     rel_rot: UnitQuaternion<f64>,
@@ -210,7 +198,9 @@ impl Side {
 
 // ─── Builders ─────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct LegHandles { thigh_idx: usize, shin_idx: usize, foot_idx: usize }
+#[allow(dead_code)]
 struct ArmHandles { upper_idx: usize, forearm_idx: usize, palm_idx: usize }
 
 fn add_leg(world: &mut XpbdWorld, pelvis_idx: usize, side: Side) -> LegHandles {
@@ -221,7 +211,7 @@ fn add_leg(world: &mut XpbdWorld, pelvis_idx: usize, side: Side) -> LegHandles {
 
     // Thigh.
     let hip_anchor = Vec3::new(HIP_ANCHOR_PELVIS_X * s, HIP_ANCHOR_PELVIS_Y, 0.0);
-    let mut thigh = RigidBody::new(THIGH_MASS, capsule_inertia(THIGH_MASS, THIGH_RADIUS, THIGH_HALF_H));
+    let mut thigh = RigidBody::new_capsule(THIGH_MASS, THIGH_HALF_H, THIGH_RADIUS);
     let (pos, orient) = place_child(&world.bodies[pelvis_idx],
         hip_anchor, Vec3::new(0.0, THIGH_HALF_H, 0.0), id);
     thigh.position = pos; thigh.orientation = orient;
@@ -241,7 +231,7 @@ fn add_leg(world: &mut XpbdWorld, pelvis_idx: usize, side: Side) -> LegHandles {
         HIP_LIMIT_K, HIP_LIMIT_EXP, id);
 
     // Shin.
-    let mut shin = RigidBody::new(SHIN_MASS, capsule_inertia(SHIN_MASS, SHIN_RADIUS, SHIN_HALF_H));
+    let mut shin = RigidBody::new_capsule(SHIN_MASS, SHIN_HALF_H, SHIN_RADIUS);
     let (pos, orient) = place_child(&world.bodies[thigh_idx],
         Vec3::new(0.0, -THIGH_HALF_H, 0.0),
         Vec3::new(0.0,  SHIN_HALF_H, 0.0), id);
@@ -265,7 +255,7 @@ fn add_leg(world: &mut XpbdWorld, pelvis_idx: usize, side: Side) -> LegHandles {
         KNEE_OFF_AXIS_LIMIT_K, KNEE_LIMIT_EXP, id);
 
     // Foot.
-    let mut foot = RigidBody::new(FOOT_MASS, capsule_inertia(FOOT_MASS, FOOT_RADIUS, FOOT_HALF_H));
+    let mut foot = RigidBody::new_capsule(FOOT_MASS, FOOT_HALF_H, FOOT_RADIUS);
     let (pos, orient) = place_child(&world.bodies[shin_idx],
         Vec3::new(0.0, -SHIN_HALF_H, 0.0),
         FOOT_ANCHOR_LOCAL, foot_baseline);
@@ -294,7 +284,7 @@ fn add_arm(world: &mut XpbdWorld, thoracic_idx: usize, side: Side) -> ArmHandles
     let shoulder_anchor = Vec3::new(s * SHOULDER_ANCHOR_THORACIC_X, THORACIC_HALF_H, 0.0);
 
     // Upper arm.
-    let mut upper = RigidBody::new(UPPER_ARM_MASS, capsule_inertia(UPPER_ARM_MASS, UPPER_ARM_RADIUS, UPPER_ARM_HALF_H));
+    let mut upper = RigidBody::new_capsule(UPPER_ARM_MASS, UPPER_ARM_HALF_H, UPPER_ARM_RADIUS);
     let (pos, orient) = place_child(&world.bodies[thoracic_idx],
         shoulder_anchor, Vec3::new(0.0, UPPER_ARM_HALF_H, 0.0), id);
     upper.position = pos; upper.orientation = orient;
@@ -313,7 +303,7 @@ fn add_arm(world: &mut XpbdWorld, thoracic_idx: usize, side: Side) -> ArmHandles
         rot_min, rot_max, ROT_K, ROT_C, 0.0, SHOULDER_LIMIT_K, SHOULDER_LIMIT_EXP, id);
 
     // Forearm.
-    let mut forearm = RigidBody::new(FOREARM_MASS, capsule_inertia(FOREARM_MASS, FOREARM_RADIUS, FOREARM_HALF_H));
+    let mut forearm = RigidBody::new_capsule(FOREARM_MASS, FOREARM_HALF_H, FOREARM_RADIUS);
     let (pos, orient) = place_child(&world.bodies[upper_idx],
         Vec3::new(0.0, -UPPER_ARM_HALF_H, 0.0),
         Vec3::new(0.0, FOREARM_HALF_H, 0.0), id);
@@ -337,7 +327,7 @@ fn add_arm(world: &mut XpbdWorld, thoracic_idx: usize, side: Side) -> ArmHandles
         ELBOW_OFF_AXIS_LIMIT_K, 2.0, id);
 
     // Palm (no fingers in this validation).
-    let mut palm = RigidBody::new(PALM_MASS, capsule_inertia(PALM_MASS, PALM_RADIUS, PALM_HALF_H));
+    let mut palm = RigidBody::new_capsule(PALM_MASS, PALM_HALF_H, PALM_RADIUS);
     let (pos, orient) = place_child(&world.bodies[forearm_idx],
         Vec3::new(0.0, -FOREARM_HALF_H, 0.0),
         Vec3::new(0.0, PALM_HALF_H, 0.0), id);
@@ -366,6 +356,7 @@ fn add_arm(world: &mut XpbdWorld, thoracic_idx: usize, side: Side) -> ArmHandles
 
 fn main() {
     let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
 
     // Pelvis position chosen so feet sit exactly on ground at rest:
     //   foot center y = FOOT_RADIUS = 0.032 (foot horizontal, on ground)
@@ -375,8 +366,7 @@ fn main() {
     //   thigh center y = 0.677
     //   hip y = 0.902
     //   pelvis center y = 0.902 + 0.05 = 0.952  (HIP_ANCHOR_PELVIS_Y = -0.05)
-    let mut pelvis = RigidBody::new(PELVIS_MASS,
-        capsule_inertia(PELVIS_MASS, PELVIS_RADIUS, PELVIS_HALF_H));
+    let mut pelvis = RigidBody::new_capsule(PELVIS_MASS, PELVIS_HALF_H, PELVIS_RADIUS);
     pelvis.position = Vec3::new(0.0, 0.952, 0.0);
     pelvis.orientation = UnitQuaternion::identity();
     let pelvis_idx = world.add_body(pelvis);
@@ -384,8 +374,7 @@ fn main() {
     // Spine: thoracic above pelvis (lumbar joint), head above thoracic (cervical joint).
     let id = UnitQuaternion::identity();
     let lumbar_anchor_pelvis = Vec3::new(0.0, PELVIS_HALF_H, 0.0);
-    let mut thoracic = RigidBody::new(THORACIC_MASS,
-        capsule_inertia(THORACIC_MASS, THORACIC_RADIUS, THORACIC_HALF_H));
+    let mut thoracic = RigidBody::new_capsule(THORACIC_MASS, THORACIC_HALF_H, THORACIC_RADIUS);
     let (pos, orient) = place_child(&world.bodies[pelvis_idx],
         lumbar_anchor_pelvis, Vec3::new(0.0, -THORACIC_HALF_H, 0.0), id);
     thoracic.position = pos; thoracic.orientation = orient;
@@ -405,8 +394,7 @@ fn main() {
         LUMBAR_LIMIT_K, LUMBAR_LIMIT_EXP, id);
 
     let cerv_anchor_thoracic = Vec3::new(0.0, THORACIC_HALF_H, 0.0);
-    let mut head = RigidBody::new(HEAD_MASS,
-        capsule_inertia(HEAD_MASS, HEAD_RADIUS, HEAD_HALF_H));
+    let mut head = RigidBody::new_capsule(HEAD_MASS, HEAD_HALF_H, HEAD_RADIUS);
     let (pos, orient) = place_child(&world.bodies[thoracic_idx],
         cerv_anchor_thoracic, Vec3::new(0.0, -HEAD_HALF_H, 0.0), id);
     head.position = pos; head.orientation = orient;
@@ -427,26 +415,13 @@ fn main() {
 
     let leg_r = add_leg(&mut world, pelvis_idx, Side::Right);
     let leg_l = add_leg(&mut world, pelvis_idx, Side::Left);
-    let arm_r = add_arm(&mut world, thoracic_idx, Side::Right);
-    let arm_l = add_arm(&mut world, thoracic_idx, Side::Left);
+    let _arm_r = add_arm(&mut world, thoracic_idx, Side::Right);
+    let _arm_l = add_arm(&mut world, thoracic_idx, Side::Left);
 
-    // Ground contacts on all 17 bodies.
-    // - Feet: default plane_y = 0 (capsule shape matches anatomy).
-    // - All other bodies: plane_y = -radius (anatomical bottom = body axis
-    //   endpoint, capsule rounded end below is unmodeled artifact).
-    world.ground_contacts.push(GroundContact::new(pelvis_idx, PELVIS_HALF_H, PELVIS_RADIUS).with_plane_y(-PELVIS_RADIUS));
-    world.ground_contacts.push(GroundContact::new(thoracic_idx, THORACIC_HALF_H, THORACIC_RADIUS).with_plane_y(-THORACIC_RADIUS));
-    world.ground_contacts.push(GroundContact::new(head_idx, HEAD_HALF_H, HEAD_RADIUS).with_plane_y(-HEAD_RADIUS));
-    for leg in [&leg_r, &leg_l] {
-        world.ground_contacts.push(GroundContact::new(leg.thigh_idx, THIGH_HALF_H, THIGH_RADIUS).with_plane_y(-THIGH_RADIUS));
-        world.ground_contacts.push(GroundContact::new(leg.shin_idx, SHIN_HALF_H, SHIN_RADIUS).with_plane_y(-SHIN_RADIUS));
-        world.ground_contacts.push(GroundContact::new(leg.foot_idx, FOOT_HALF_H, FOOT_RADIUS));
-    }
-    for arm in [&arm_r, &arm_l] {
-        world.ground_contacts.push(GroundContact::new(arm.upper_idx, UPPER_ARM_HALF_H, UPPER_ARM_RADIUS).with_plane_y(-UPPER_ARM_RADIUS));
-        world.ground_contacts.push(GroundContact::new(arm.forearm_idx, FOREARM_HALF_H, FOREARM_RADIUS).with_plane_y(-FOREARM_RADIUS));
-        world.ground_contacts.push(GroundContact::new(arm.palm_idx, PALM_HALF_H, PALM_RADIUS).with_plane_y(-PALM_RADIUS));
-    }
+    // Ground contact via the world: every body with capsule_shape collides
+    // with the ground at y=0. Feet touch at neutral pose; other segments
+    // collide when the skeleton falls. Pre-migration this binary disabled
+    // contact for non-feet via plane_y = -radius hacks.
 
     let head_y_init = world.bodies[head_idx].position.y;
 

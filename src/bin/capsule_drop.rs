@@ -20,8 +20,7 @@
 
 use physics::xpbd::XpbdWorld;
 use physics::rigid_body::RigidBody;
-use physics::ground_contact::GroundContact;
-use physics::math::{Vec3, Mat3};
+use physics::math::Vec3;
 use nalgebra::UnitQuaternion;
 
 const DT: f64 = 1.0 / 120.0;
@@ -35,26 +34,14 @@ const HALF_H:  f64 = 0.05;
 const RADIUS:  f64 = 0.05;
 const DROP_HEIGHT: f64 = 1.0;
 
-fn capsule_inertia(mass: f64, radius: f64, half_h: f64) -> Mat3 {
-    let h = 2.0 * half_h;
-    let i_axial = 0.5 * mass * radius * radius;
-    let i_trans = (1.0 / 12.0) * mass * (3.0 * radius * radius + h * h);
-    Mat3::new(
-        i_trans, 0.0,     0.0,
-        0.0,     i_axial, 0.0,
-        0.0,     0.0,     i_trans,
-    )
-}
-
 fn run_case(label: &str, initial_orient: UnitQuaternion<f64>, expected_y: f64) {
     let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
 
-    let mut body = RigidBody::new(MASS, capsule_inertia(MASS, RADIUS, HALF_H));
+    let mut body = RigidBody::new_capsule(MASS, HALF_H, RADIUS);
     body.position = Vec3::new(0.0, DROP_HEIGHT, 0.0);
     body.orientation = initial_orient;
     let body_idx = world.add_body(body);
-
-    world.ground_contacts.push(GroundContact::new(body_idx, HALF_H, RADIUS));
 
     println!("=== {} ===", label);
     println!("Drop height = {:.2}, expected resting y = {:.4}", DROP_HEIGHT, expected_y);
