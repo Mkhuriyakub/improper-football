@@ -310,6 +310,41 @@ fn build_world() -> (XpbdWorld, AnkleHandles) {
         talus_idx, foot_idx, st_locked, SUBTALAR_OFF_AXIS_K, 0.0)
         .with_baseline(foot_baseline));
 
+    // ── MTP joint (foot ↔ forefoot) ─────────────────────────────────
+    add_elastic_joint(&mut world, foot_idx, forefoot_idx,
+        Vec3::new(0.0, -FOOT_HALF_H, 0.0),
+        Vec3::new(0.0, FOREFOOT_HALF_H, 0.0),
+        MTP_JOINT_K, MTP_JOINT_C);
+
+    // Primary axis: world +x at neutral. In foot local (after baseline),
+    // axis (1, 0, 0) still maps to world +x. The MTP PD's baseline is
+    // identity (no offset between foot and forefoot at rest).
+    let mtp_primary = Vec3::new(1.0, 0.0, 0.0);
+    world.angular_soft_limits.push(AngularSoftLimit::new(
+        foot_idx, forefoot_idx, mtp_primary,
+        MTP_ROM_MIN, MTP_ROM_MAX,
+        MTP_LIMIT_K, MTP_LIMIT_EXP));
+    world.angular_dampers.push(AngularDamper::new(
+        foot_idx, forefoot_idx, mtp_primary, MTP_PASSIVE_C));
+    world.angular_springs.push(AngularSpring::new(
+        foot_idx, forefoot_idx, mtp_primary, MTP_PASSIVE_K, 0.0));
+    let mtp_pd_idx = world.angular_pd_controllers.len();
+    world.angular_pd_controllers.push(AngularPDController::new(
+        foot_idx, forefoot_idx, mtp_primary,
+        MTP_PRIMARY_KP, MTP_PRIMARY_KD));
+
+    // Off-axes (Y, Z) locked.
+    for off_axis in [Vec3::y(), Vec3::z()] {
+        world.angular_soft_limits.push(AngularSoftLimit::new(
+            foot_idx, forefoot_idx, off_axis,
+            -MTP_OFF_AXIS_LIM, MTP_OFF_AXIS_LIM,
+            MTP_OFF_AXIS_LIMIT_K, MTP_LIMIT_EXP));
+        world.angular_dampers.push(AngularDamper::new(
+            foot_idx, forefoot_idx, off_axis, MTP_PASSIVE_C));
+        world.angular_springs.push(AngularSpring::new(
+            foot_idx, forefoot_idx, off_axis, MTP_OFF_AXIS_K, 0.0));
+    }
+
     // Stick (load): above shin, welded to shin top.
     let mut stick = RigidBody::new(STICK_MASS,
         capsule_inertia(STICK_MASS, STICK_RADIUS, STICK_HALF_H));
@@ -317,9 +352,6 @@ fn build_world() -> (XpbdWorld, AnkleHandles) {
     stick.position = Vec3::new(0.0, shin_top_y + STICK_HALF_H, 0.0);  // (0, 0.902, 0)
     stick.orientation = id;
     let stick_idx = world.add_body(stick);
-
-    // PD indices: stub for now (filled in later tasks).
-    let mtp_pd_idx = usize::MAX;
 
     (world, AnkleHandles {
         shin_idx, talus_idx, foot_idx, forefoot_idx, stick_idx,
