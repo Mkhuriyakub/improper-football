@@ -282,7 +282,9 @@ fn add_articulated(
     world.angular_pd_controllers.push(
         AngularPDController::new(parent, child, primary, kp, kd).with_baseline(baseline));
 
-    // Two off-axes orthogonal to the primary, locked.
+    // Two off-axes orthogonal to the primary, locked. Pick a helper axis
+    // not near-parallel to the primary (|x| < 0.9) so the first cross
+    // product is well-conditioned and doesn't degenerate toward zero.
     let helper = if primary.x.abs() < 0.9 { Vec3::x() } else { Vec3::y() };
     let off1 = primary.cross(&helper).normalize();
     let off2 = primary.cross(&off1).normalize();
