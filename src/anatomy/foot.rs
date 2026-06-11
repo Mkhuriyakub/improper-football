@@ -404,8 +404,12 @@ mod tests {
         let attach = Vec3::new(0.0, 0.30, 0.0); // talus 30 cm up
         let h = build_foot(&mut world, attach);
         assert_eq!(world.bodies.len(), BONE_COUNT);
-        // Every bone's lowest point should be at or above the ground (y=0),
-        // allowing 5 mm penetration tolerance for the starting layout.
+        // Layout sanity check: with the talus held 30 cm up, no bone should
+        // sit below the world ground at all. The 5 cm bound is a loose guard
+        // against a grossly misplaced REST_POS entry (a real bone dips at most
+        // ~3 cm below the foot origin, far above the world ground here).
+        // True ground-clearance at the standing pose is tested in the settle
+        // and static-balance tests (Tasks 6-7).
         for i in 0..BONE_COUNT {
             let b = &world.bodies[h.bodies[i]];
             let lowest = b.position.y - BONES[i].radius - BONES[i].half_h;
