@@ -339,6 +339,16 @@ fn bone_baseline() -> Quat {
     Quat::from_scaled_axis(Vec3::new(-std::f64::consts::FRAC_PI_2, 0.0, 0.0))
 }
 
+/// Local-frame anchor on `bone` pointing toward `toward` (a world point).
+/// Converts the world direction into the bone's local frame and scales
+/// to roughly the bone's half-length so the anchor sits on its surface.
+fn anchor_toward(world: &XpbdWorld, bone_idx: usize, bone: Bone, toward: Vec3) -> Vec3 {
+    let b = &world.bodies[bone_idx];
+    let dir_world = (toward - b.position).normalize();
+    let dir_local = b.orientation.inverse() * dir_world;
+    dir_local * BONES[bone as usize].half_h
+}
+
 /// Build the 26-bone foot into `world`. `attach` is the world position
 /// of the talus center (the host places it at the shin's distal end).
 /// The talocrural joint (shin↔talus) is created by the HOST, not here.
@@ -360,7 +370,40 @@ pub fn build_foot(world: &mut XpbdWorld, attach: Vec3) -> FootHandles {
         bodies[i] = world.add_body(body);
     }
 
-    FootHandles { bodies, pd_by_child: [usize::MAX; BONE_COUNT] }
+    let mut pd_by_child = [usize::MAX; BONE_COUNT];
+
+    for spec in JOINTS.iter() {
+        let parent_idx = bodies[spec.parent as usize];
+        let child_idx = bodies[spec.child as usize];
+        let parent_pos = world.bodies[parent_idx].position;
+        let child_pos = world.bodies[child_idx].position;
+        let anchor_p = anchor_toward(world, parent_idx, spec.parent, child_pos);
+        let anchor_c = anchor_toward(world, child_idx, spec.child, parent_pos);
+
+        match spec.kind {
+            JointKind::Weld => {
+                weld(world, parent_idx, child_idx, anchor_p, anchor_c);
+            }
+            JointKind::Articulated { axis_anat, rom_min, rom_max, kp, kd } => {
+                // Subtalar uses the special oblique axis.
+                let axis_a = if spec.parent == Bone::Talus && spec.child == Bone::Calcaneus {
+                    subtalar_axis_anat()
+                } else {
+                    axis_anat
+                };
+                let axis_world = anat_to_world(axis_a);
+                // Both bones share bone_baseline(), so child-relative-to-parent
+                // rest orientation is identity.
+                let pd = add_articulated(
+                    world, parent_idx, child_idx, anchor_p, anchor_c,
+                    axis_world, rom_min, rom_max, kp, kd,
+                    Quat::identity());
+                pd_by_child[spec.child as usize] = pd;
+            }
+        }
+    }
+
+    FootHandles { bodies, pd_by_child }
 }
 
 #[cfg(test)]
@@ -418,5 +461,16 @@ mod tests {
         // Talus should be at the attach point.
         let talus = &world.bodies[h.body(Bone::Talus)];
         assert!((talus.position - attach).norm() < 1e-9);
+    }
+
+    #[test]
+    fn build_foot_creates_expected_joint_counts() {
+        let mut world = XpbdWorld::new();
+        let h = build_foot(&mut world, Vec3::new(0.0, 0.30, 0.0));
+        // 21 articulated joints in the foot module → 21 PD controllers.
+        // (The 22nd articulated joint, talocrural, is host-created.)
+        let pd_count = h.pd_by_child.iter().filter(|&&x| x != usize::MAX).count();
+        assert_eq!(pd_count, 21, "expected 21 articulated PDs in the foot module");
+        assert_eq!(world.angular_pd_controllers.len(), 21);
     }
 }
