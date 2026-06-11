@@ -342,6 +342,9 @@ fn bone_baseline() -> Quat {
 /// Local-frame anchor on `bone` pointing toward `toward` (a world point).
 /// Converts the world direction into the bone's local frame and scales
 /// to roughly the bone's half-length so the anchor sits on its surface.
+/// Approximate: for tightly-packed tarsals whose centers are closer than
+/// `half_h`, the anchor may project beyond the neighbor's center — the
+/// positional spring still resolves correctly (it targets anchor-to-anchor).
 fn anchor_toward(world: &XpbdWorld, bone_idx: usize, bone: Bone, toward: Vec3) -> Vec3 {
     let b = &world.bodies[bone_idx];
     let dir_world = (toward - b.position).normalize();
@@ -352,8 +355,8 @@ fn anchor_toward(world: &XpbdWorld, bone_idx: usize, bone: Bone, toward: Vec3) -
 /// Build the 26-bone foot into `world`. `attach` is the world position
 /// of the talus center (the host places it at the shin's distal end).
 /// The talocrural joint (shin↔talus) is created by the HOST, not here.
-/// Returns FootHandles with all body indices; PD indices are filled in
-/// Task 5 (joints).
+/// Returns FootHandles with all 26 body indices and the per-child PD
+/// indices for the 21 articulated joints (welded children stay usize::MAX).
 pub fn build_foot(world: &mut XpbdWorld, attach: Vec3) -> FootHandles {
     let baseline = bone_baseline();
     // Foot origin = ground point below the talus. talus REST_POS.y is its
@@ -385,7 +388,9 @@ pub fn build_foot(world: &mut XpbdWorld, attach: Vec3) -> FootHandles {
                 weld(world, parent_idx, child_idx, anchor_p, anchor_c);
             }
             JointKind::Articulated { axis_anat, rom_min, rom_max, kp, kd } => {
-                // Subtalar uses the special oblique axis.
+                // Subtalar is the one joint whose axis isn't a table literal:
+                // its oblique Manter/Inman axis (42° incl, 23° dev — the
+                // sprain-mechanism axis) is computed in subtalar_axis_anat().
                 let axis_a = if spec.parent == Bone::Talus && spec.child == Bone::Calcaneus {
                     subtalar_axis_anat()
                 } else {
