@@ -299,6 +299,70 @@ fn add_articulated(
     pd_idx
 }
 
+/// Rest position of each bone's CENTER relative to the foot origin
+/// (ground point below the talus), in world meters (x lat, y up, z ant).
+/// Starting layout per spec §2 column structure; refined by stage tests.
+const REST_POS: [Vec3; BONE_COUNT] = [
+    Vec3::new( 0.005, 0.030, -0.045), // calcaneus (heel: behind, low)
+    Vec3::new( 0.000, 0.057,  0.000), // talus (on top, at ankle)
+    Vec3::new(-0.008, 0.045,  0.030), // navicular (medial midfoot, arch apex)
+    Vec3::new( 0.022, 0.030,  0.020), // cuboid (lateral midfoot)
+    Vec3::new(-0.015, 0.038,  0.052), // medial cuneiform
+    Vec3::new(-0.002, 0.040,  0.050), // intermediate cuneiform
+    Vec3::new( 0.012, 0.038,  0.050), // lateral cuneiform
+    Vec3::new(-0.018, 0.028,  0.095), // mt1
+    Vec3::new(-0.006, 0.026,  0.100), // mt2
+    Vec3::new( 0.006, 0.026,  0.098), // mt3
+    Vec3::new( 0.018, 0.026,  0.092), // mt4
+    Vec3::new( 0.028, 0.026,  0.085), // mt5
+    Vec3::new(-0.020, 0.020,  0.135), // hallux_pp
+    Vec3::new(-0.021, 0.018,  0.158), // hallux_dp
+    Vec3::new(-0.008, 0.020,  0.140), // toe2_pp
+    Vec3::new(-0.008, 0.018,  0.156), // toe2_mp
+    Vec3::new(-0.008, 0.017,  0.166), // toe2_dp
+    Vec3::new( 0.004, 0.020,  0.138), // toe3_pp
+    Vec3::new( 0.004, 0.018,  0.153), // toe3_mp
+    Vec3::new( 0.004, 0.017,  0.162), // toe3_dp
+    Vec3::new( 0.016, 0.020,  0.132), // toe4_pp
+    Vec3::new( 0.016, 0.018,  0.146), // toe4_mp
+    Vec3::new( 0.016, 0.017,  0.154), // toe4_dp
+    Vec3::new( 0.027, 0.020,  0.122), // toe5_pp
+    Vec3::new( 0.027, 0.018,  0.134), // toe5_mp
+    Vec3::new( 0.027, 0.017,  0.143), // toe5_dp
+];
+
+/// Rest orientation of each bone. Most bones lie with their long axis
+/// (local +y) pointing anterior (world +z) → rotate local +y to +z via
+/// R_x(-π/2). For Phase 1 ALL bones use this anterior-pointing baseline —
+/// the capsule shape is approximate for blocky tarsals anyway (spec §6).
+fn bone_baseline() -> Quat {
+    Quat::from_scaled_axis(Vec3::new(-std::f64::consts::FRAC_PI_2, 0.0, 0.0))
+}
+
+/// Build the 26-bone foot into `world`. `attach` is the world position
+/// of the talus center (the host places it at the shin's distal end).
+/// The talocrural joint (shin↔talus) is created by the HOST, not here.
+/// Returns FootHandles with all body indices; PD indices are filled in
+/// Task 5 (joints).
+pub fn build_foot(world: &mut XpbdWorld, attach: Vec3) -> FootHandles {
+    let baseline = bone_baseline();
+    // Foot origin = ground point below the talus. talus REST_POS.y is its
+    // height above origin, so origin = attach - (0, talus.y, 0).
+    let talus_rest = REST_POS[Bone::Talus as usize];
+    let origin = attach - Vec3::new(0.0, talus_rest.y, 0.0);
+
+    let mut bodies = [usize::MAX; BONE_COUNT];
+    for i in 0..BONE_COUNT {
+        let p = &BONES[i];
+        let mut body = RigidBody::new_capsule(p.mass, p.half_h, p.radius);
+        body.position = origin + REST_POS[i];
+        body.orientation = baseline;
+        bodies[i] = world.add_body(body);
+    }
+
+    FootHandles { bodies, pd_by_child: [usize::MAX; BONE_COUNT] }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +396,23 @@ mod tests {
         let dev_deg = (-a.y).atan2(a.x).to_degrees();
         assert!((dev_deg - 23.0).abs() < 1.0, "subtalar deviation {dev_deg}, expected 23");
         assert!((a.norm() - 1.0).abs() < 1e-9, "axis must be unit");
+    }
+
+    #[test]
+    fn build_foot_places_26_bodies_above_ground() {
+        let mut world = XpbdWorld::new();
+        let attach = Vec3::new(0.0, 0.30, 0.0); // talus 30 cm up
+        let h = build_foot(&mut world, attach);
+        assert_eq!(world.bodies.len(), BONE_COUNT);
+        // Every bone's lowest point should be at or above the ground (y=0),
+        // allowing 5 mm penetration tolerance for the starting layout.
+        for i in 0..BONE_COUNT {
+            let b = &world.bodies[h.bodies[i]];
+            let lowest = b.position.y - BONES[i].radius - BONES[i].half_h;
+            assert!(lowest > -0.05, "bone {} starts {lowest} below ground", BONES[i].name);
+        }
+        // Talus should be at the attach point.
+        let talus = &world.bodies[h.body(Bone::Talus)];
+        assert!((talus.position - attach).norm() < 1e-9);
     }
 }
