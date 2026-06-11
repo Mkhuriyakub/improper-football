@@ -206,8 +206,8 @@ pub const JOINTS: [JointSpec; 29] = [
 pub fn subtalar_axis_anat() -> Vec3 {
     let incl = 42.0_f64.to_radians();
     let dev = 23.0_f64.to_radians();
-    // Start along +X (anterior), tilt up by incl about +Y, deviate
-    // medially (toward -Y) by dev about +Z.
+    // Spherical components directly: anterior (+X) = cos(incl)cos(dev),
+    // medial (-Y) = cos(incl)sin(dev), superior (+Z) = sin(incl).
     let x = incl.cos() * dev.cos();
     let y = -incl.cos() * dev.sin(); // medial = -Y
     let z = incl.sin();
@@ -243,6 +243,9 @@ mod tests {
         let incl_deg = a.z.asin().to_degrees();
         assert!((incl_deg - 42.0).abs() < 1.0, "subtalar incl {incl_deg}, expected 42");
         assert!(a.y < 0.0, "subtalar axis should deviate medially (-Y)");
+        // medial deviation from the foot long axis, in the transverse plane.
+        let dev_deg = (-a.y).atan2(a.x).to_degrees();
+        assert!((dev_deg - 23.0).abs() < 1.0, "subtalar deviation {dev_deg}, expected 23");
         assert!((a.norm() - 1.0).abs() < 1e-9, "axis must be unit");
     }
 }
