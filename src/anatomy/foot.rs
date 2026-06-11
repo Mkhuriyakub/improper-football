@@ -7,6 +7,14 @@
 //! the foot segment totals ~1.0 kg; dimensions are osteometric.
 
 use physics::math::{Vec3, Quat};
+use physics::xpbd::XpbdWorld;
+use physics::rigid_body::RigidBody;
+use physics::angular_spring::AngularSpring;
+use physics::angular_damper::AngularDamper;
+use physics::angular_soft_limit::AngularSoftLimit;
+use physics::angular_pd_controller::AngularPDController;
+use physics::positional_spring::PositionalSpring;
+use physics::positional_damper::PositionalDamper;
 
 /// One bone's physical parameters (SI units: kg, m).
 #[derive(Clone, Copy, Debug)]
@@ -212,6 +220,81 @@ pub fn subtalar_axis_anat() -> Vec3 {
     let y = -incl.cos() * dev.sin(); // medial = -Y
     let z = incl.sin();
     Vec3::new(x, y, z).normalize()
+}
+
+/// Body indices and PD-controller indices for the assembled foot.
+pub struct FootHandles {
+    /// World body index for each Bone (index by `bone as usize`).
+    pub bodies: [usize; BONE_COUNT],
+    /// PD controller index for each articulated joint, keyed by child Bone.
+    /// `usize::MAX` for welded children (no PD).
+    pub pd_by_child: [usize; BONE_COUNT],
+}
+
+impl FootHandles {
+    pub fn body(&self, b: Bone) -> usize { self.bodies[b as usize] }
+}
+
+fn add_elastic_joint(
+    world: &mut XpbdWorld, parent: usize, child: usize,
+    anchor_parent: Vec3, anchor_child: Vec3, k: f64, c: f64,
+) {
+    let mut s = PositionalSpring::new(parent, child, k);
+    s.local_anchor_a = anchor_parent; s.local_anchor_b = anchor_child;
+    world.positional_springs.push(s);
+    let mut d = PositionalDamper::new(parent, child, c);
+    d.local_anchor_a = anchor_parent; d.local_anchor_b = anchor_child;
+    world.positional_dampers.push(d);
+}
+
+fn weld(
+    world: &mut XpbdWorld, a: usize, b: usize,
+    anchor_a: Vec3, anchor_b: Vec3,
+) {
+    add_elastic_joint(world, a, b, anchor_a, anchor_b, WELD_POS_K, WELD_POS_C);
+    for axis in [Vec3::x(), Vec3::y(), Vec3::z()] {
+        world.angular_springs.push(AngularSpring::new(a, b, axis, WELD_ANG_K, 0.0));
+        world.angular_dampers.push(AngularDamper::new(a, b, axis, WELD_ANG_C));
+    }
+}
+
+/// Adds an articulated joint: positional anchor, primary-axis ROM
+/// soft-limit + passive spring/damper + PD controller, and two locked
+/// off-axes. `axis_world` is the primary axis already mapped to world.
+/// `baseline` is the child's rest orientation relative to the parent
+/// (identity if both share orientation). Returns the PD index.
+fn add_articulated(
+    world: &mut XpbdWorld, parent: usize, child: usize,
+    anchor_parent: Vec3, anchor_child: Vec3,
+    axis_world: Vec3, rom_min: f64, rom_max: f64, kp: f64, kd: f64,
+    baseline: Quat,
+) -> usize {
+    add_elastic_joint(world, parent, child, anchor_parent, anchor_child, JOINT_POS_K, JOINT_POS_C);
+
+    let primary = axis_world.normalize();
+    world.angular_soft_limits.push(
+        AngularSoftLimit::new(parent, child, primary, rom_min, rom_max, ARTIC_LIMIT_K, ARTIC_LIMIT_EXP)
+            .with_baseline(baseline));
+    world.angular_dampers.push(AngularDamper::new(parent, child, primary, ARTIC_PASSIVE_C));
+    world.angular_springs.push(
+        AngularSpring::new(parent, child, primary, ARTIC_PASSIVE_K, 0.0).with_baseline(baseline));
+    let pd_idx = world.angular_pd_controllers.len();
+    world.angular_pd_controllers.push(
+        AngularPDController::new(parent, child, primary, kp, kd).with_baseline(baseline));
+
+    // Two off-axes orthogonal to the primary, locked.
+    let helper = if primary.x.abs() < 0.9 { Vec3::x() } else { Vec3::y() };
+    let off1 = primary.cross(&helper).normalize();
+    let off2 = primary.cross(&off1).normalize();
+    for off in [off1, off2] {
+        world.angular_soft_limits.push(
+            AngularSoftLimit::new(parent, child, off, -OFF_AXIS_LIM, OFF_AXIS_LIM, OFF_AXIS_LIMIT_K, ARTIC_LIMIT_EXP)
+                .with_baseline(baseline));
+        world.angular_dampers.push(AngularDamper::new(parent, child, off, ARTIC_PASSIVE_C));
+        world.angular_springs.push(
+            AngularSpring::new(parent, child, off, OFF_AXIS_K, 0.0).with_baseline(baseline));
+    }
+    pd_idx
 }
 
 #[cfg(test)]
