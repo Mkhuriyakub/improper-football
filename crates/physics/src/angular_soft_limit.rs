@@ -1,5 +1,5 @@
 use nalgebra::UnitQuaternion;
-use crate::math::{Vec3, swing_twist_angle};
+use crate::math::{Mat3, Vec3, swing_twist_angle};
 use crate::rigid_body::RigidBody;
 
 /// Nonlinear soft range limit between two bodies along an axis fixed in body_a's
@@ -100,12 +100,26 @@ impl AngularSoftLimit {
         }
     }
 
-    pub fn apply(&mut self, bodies: &mut Vec<RigidBody>) {
-        let n = bodies[self.body_a].orientation * self.axis_local_a;
-        let angle = self.angle(bodies);
+    /// Local slope `ds/dθ` of the restoring scalar torque at `angle`
+    /// (≤ 0 in the engaged region, 0 inside the range). Used by the implicit
+    /// integrator to linearize the nonlinear limit about its operating point.
+    fn scalar_torque_slope(&self, angle: f64) -> f64 {
+        let k = self.effective_stiffness();
+        if angle > self.max_angle {
+            let ex = angle - self.max_angle;
+            -k * self.exponent * ex.powf(self.exponent - 1.0)
+        } else if angle < self.min_angle {
+            let ex = self.min_angle - angle;
+            -k * self.exponent * ex.powf(self.exponent - 1.0)
+        } else {
+            0.0
+        }
+    }
 
-        // Check for tearing before computing torque, so the post-tear stiffness
-        // applies on the same substep the threshold is crossed.
+    /// Latch the torn state if the current excess exceeds the tear threshold.
+    /// Pulled out of `apply` so the implicit integrator can keep the same
+    /// failure-mode behaviour.
+    fn update_torn(&mut self, angle: f64) {
         let excess_abs = if angle > self.max_angle {
             angle - self.max_angle
         } else if angle < self.min_angle {
@@ -116,14 +130,52 @@ impl AngularSoftLimit {
         if !self.torn && excess_abs > self.tear_threshold {
             self.torn = true;
         }
+    }
 
-        let scalar = self.scalar_torque(angle);
-        if scalar == 0.0 {
+    /// Implicit (semi-implicit) limit update: directly modifies angular
+    /// velocities instead of routing an explicit torque through the
+    /// accumulator. Must be called once per substep, after
+    /// `integrate_velocities` (alongside the implicit springs/dampers).
+    ///
+    /// Linearizes the nonlinear restoring torque `s(θ)` about the current
+    /// angle and solves backward-Euler along the axis:
+    ///   ω_rel_new = (ω_rel + dt·w·s(θ)) / (1 − dt²·w·s'(θ)),   J = (ω_rel_new − ω_rel)/w,
+    /// with `w = n·I_inv_a·n + n·I_inv_b·n`. Since `s'(θ) ≤ 0` in the engaged
+    /// region the denominator is ≥ 1, so this is unconditionally stable for
+    /// any limit stiffness — the explicit penalty (k up to 10⁴) otherwise
+    /// blows up the foot's ~2 g distal phalanges.
+    pub fn apply_implicit(&mut self, bodies: &mut Vec<RigidBody>, dt: f64) {
+        let n = bodies[self.body_a].orientation * self.axis_local_a;
+        let angle = self.angle(bodies);
+
+        // Tearing is evaluated on the same substep the threshold is crossed.
+        self.update_torn(angle);
+
+        let s = self.scalar_torque(angle);
+        if s == 0.0 {
             return;
         }
-        let torque = n * scalar;
-        bodies[self.body_b].apply_torque(torque);
-        bodies[self.body_a].apply_torque(-torque);
+        let s_prime = self.scalar_torque_slope(angle);
+
+        let zero = Mat3::zeros();
+        let i_inv_a = if bodies[self.body_a].inv_mass == 0.0 { zero }
+                      else { bodies[self.body_a].world_inv_inertia() };
+        let i_inv_b = if bodies[self.body_b].inv_mass == 0.0 { zero }
+                      else { bodies[self.body_b].world_inv_inertia() };
+        let w = n.dot(&(i_inv_a * n)) + n.dot(&(i_inv_b * n));
+        if w < 1e-15 {
+            return;
+        }
+
+        let omega_rel = bodies[self.body_b].angular_velocity
+            - bodies[self.body_a].angular_velocity;
+        let omega_rel_n = omega_rel.dot(&n);
+
+        let omega_new = (omega_rel_n + dt * w * s) / (1.0 - dt * dt * w * s_prime);
+        let j = (omega_new - omega_rel_n) / w;
+
+        bodies[self.body_a].angular_velocity -= i_inv_a * n * j;
+        bodies[self.body_b].angular_velocity += i_inv_b * n * j;
     }
 
     /// Elastic potential energy stored in the limit when out of range.

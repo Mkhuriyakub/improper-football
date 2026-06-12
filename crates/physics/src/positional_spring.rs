@@ -1,9 +1,17 @@
-use crate::math::Vec3;
+use crate::math::{Mat3, Vec3, skew_symmetric};
 use crate::rigid_body::RigidBody;
 
 /// Linear elastic spring between two body anchor points. Models the elastic
 /// resistance of a joint capsule + cartilage + ligament system that resists
 /// separation of the two bones forming a joint.
+///
+/// For zero `rest_length` (every joint/weld in the project), prefer
+/// `apply_implicit` (called after `integrate_velocities`): it integrates the
+/// spring — including the lever-arm torque it exerts at the anchors —
+/// implicitly, and is unconditionally stable. The explicit `apply` path feeds
+/// `r × F` straight into the angular dynamics, whose stability bound
+/// (`dt < 2·√(I_red/(k·r²))`) the stiff welds (k = 10⁶ N/m) violate on the
+/// foot's small tarsals/phalanges, exploding the assembly within a few frames.
 ///
 /// Force on body B at its anchor: `F = -stiffness * (offset - rest_length * n_hat)`
 /// where `offset = pb - pa` is the world-space vector from anchor A to anchor B.
@@ -83,5 +91,66 @@ impl PositionalSpring {
         bodies[self.body_b].apply_force(force_on_b);
         bodies[self.body_a].apply_torque(r_a.cross(&force_on_a));
         bodies[self.body_b].apply_torque(r_b.cross(&force_on_b));
+    }
+
+    /// Implicit (backward-Euler) spring update for the zero-rest-length case:
+    /// directly modifies linear/angular velocities instead of routing an
+    /// explicit force through the accumulator. Must be called once per substep,
+    /// after `integrate_velocities`. For non-zero `rest_length` it falls back
+    /// to the explicit `apply` (no project code uses non-zero rest_length on a
+    /// PositionalSpring; tendons are a separate primitive).
+    ///
+    /// With anchor offsets `r_a, r_b`, current anchor separation `d = pb − pa`,
+    /// relative anchor velocity `v_rel`, and the effective inverse-mass operator
+    ///   K = (1/m_a + 1/m_b)·I − skew(r_a)·I_inv_a·skew(r_a) − skew(r_b)·I_inv_b·skew(r_b),
+    /// the spring impulse on body B is `J = −k·dt·(d + dt·v_rel_new)`. Solving
+    ///   (I + k·dt²·K)·v_rel_new = v_rel − k·dt·K·d
+    /// then `J = −k·dt·(d + dt·v_rel_new)`. Unconditionally stable for any k/dt,
+    /// because it integrates the lever-arm torque (via K's inertia terms)
+    /// implicitly rather than as an explicit penalty.
+    pub fn apply_implicit(&self, bodies: &mut Vec<RigidBody>, dt: f64) {
+        if self.rest_length != 0.0 {
+            self.apply(bodies);
+            return;
+        }
+
+        let r_a = bodies[self.body_a].orientation * self.local_anchor_a;
+        let r_b = bodies[self.body_b].orientation * self.local_anchor_b;
+        let pa = bodies[self.body_a].position + r_a;
+        let pb = bodies[self.body_b].position + r_b;
+        let d = pb - pa;
+
+        let v_a_anchor = bodies[self.body_a].linear_velocity
+            + bodies[self.body_a].angular_velocity.cross(&r_a);
+        let v_b_anchor = bodies[self.body_b].linear_velocity
+            + bodies[self.body_b].angular_velocity.cross(&r_b);
+        let v_rel = v_b_anchor - v_a_anchor;
+
+        let zero = Mat3::zeros();
+        let inv_m_a = bodies[self.body_a].inv_mass;
+        let inv_m_b = bodies[self.body_b].inv_mass;
+        let i_inv_a = if inv_m_a == 0.0 { zero }
+                      else { bodies[self.body_a].world_inv_inertia() };
+        let i_inv_b = if inv_m_b == 0.0 { zero }
+                      else { bodies[self.body_b].world_inv_inertia() };
+
+        let sa = skew_symmetric(r_a);
+        let sb = skew_symmetric(r_b);
+        let k_op = (inv_m_a + inv_m_b) * Mat3::identity()
+            - sa * i_inv_a * sa - sb * i_inv_b * sb;
+
+        let k = self.stiffness;
+        let sys = Mat3::identity() + k * dt * dt * k_op;
+        let rhs = v_rel - k * dt * (k_op * d);
+        let v_new = match sys.try_inverse() {
+            Some(inv) => inv * rhs,
+            None => return,
+        };
+        let j = -k * dt * (d + dt * v_new);
+
+        bodies[self.body_a].linear_velocity -= inv_m_a * j;
+        bodies[self.body_b].linear_velocity += inv_m_b * j;
+        bodies[self.body_a].angular_velocity -= i_inv_a * r_a.cross(&j);
+        bodies[self.body_b].angular_velocity += i_inv_b * r_b.cross(&j);
     }
 }

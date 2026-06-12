@@ -1,5 +1,5 @@
 use nalgebra::UnitQuaternion;
-use crate::math::{Vec3, swing_twist_angle};
+use crate::math::{Mat3, Vec3, swing_twist_angle};
 use crate::rigid_body::RigidBody;
 
 /// Passive elastic spring between two bodies along an axis fixed in body_a's
@@ -59,12 +59,41 @@ impl AngularSpring {
         swing_twist_angle(q_from_rest, self.axis_local_a)
     }
 
-    pub fn apply(&self, bodies: &mut Vec<RigidBody>) {
-        let n_world = bodies[self.body_a].orientation * self.axis_local_a;
-        let angle = self.angle(bodies);
-        let torque = n_world * (-self.stiffness * (angle - self.target_angle));
-        bodies[self.body_b].apply_torque(torque);
-        bodies[self.body_a].apply_torque(-torque);
+    /// Implicit (semi-implicit) spring update: directly modifies angular
+    /// velocities instead of routing an explicit torque through the
+    /// accumulator. Must be called once per substep, after
+    /// `integrate_velocities` (alongside the implicit dampers).
+    ///
+    /// Backward-Euler on the angle along the axis: with reduced inertia
+    /// `w = n·I_inv_a·n + n·I_inv_b·n` and angle error `e = θ − θ_target`,
+    ///   ω_rel_new = (ω_rel − k·dt·w·e) / (1 + k·dt²·w),   J = (ω_rel_new − ω_rel)/w.
+    /// This is unconditionally stable for any stiffness and dt — an explicit
+    /// penalty torque is only stable for `dt < 2·√(I_red/k)`, which the stiff
+    /// weld springs (k≈5·10⁴) violate on the foot's few-gram bones.
+    pub fn apply_implicit(&self, bodies: &mut Vec<RigidBody>, dt: f64) {
+        let n = bodies[self.body_a].orientation * self.axis_local_a;
+        let e = self.angle(bodies) - self.target_angle;
+
+        let zero = Mat3::zeros();
+        let i_inv_a = if bodies[self.body_a].inv_mass == 0.0 { zero }
+                      else { bodies[self.body_a].world_inv_inertia() };
+        let i_inv_b = if bodies[self.body_b].inv_mass == 0.0 { zero }
+                      else { bodies[self.body_b].world_inv_inertia() };
+        let w = n.dot(&(i_inv_a * n)) + n.dot(&(i_inv_b * n)); // 1/I_red
+        if w < 1e-15 {
+            return; // both bodies pinned
+        }
+
+        let omega_rel = bodies[self.body_b].angular_velocity
+            - bodies[self.body_a].angular_velocity;
+        let omega_rel_n = omega_rel.dot(&n);
+
+        let k = self.stiffness;
+        let omega_new = (omega_rel_n - k * dt * w * e) / (1.0 + k * dt * dt * w);
+        let j = (omega_new - omega_rel_n) / w;
+
+        bodies[self.body_a].angular_velocity -= i_inv_a * n * j;
+        bodies[self.body_b].angular_velocity += i_inv_b * n * j;
     }
 
     /// Elastic potential energy stored in the spring.

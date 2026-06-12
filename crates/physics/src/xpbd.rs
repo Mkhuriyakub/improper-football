@@ -246,23 +246,32 @@ impl XpbdWorld {
     /// must be re-applied each call since accumulators clear at the end of
     /// every substep (same as before the rewrite).
     pub fn substep(&mut self, sub_dt: f64) {
-        self.apply_springs();
-        self.apply_soft_limits();
         self.apply_pd_controllers();
         self.apply_torque_dispatchers();
-        self.apply_positional_springs();
-        self.apply_positional_dampers();
         self.apply_tendons();
-        self.apply_ground_contact_all();
         self.apply_foot_contacts();
         self.integrate_velocities(sub_dt);
-        // Damping applied implicitly AFTER explicit velocity update — this is
-        // unconditionally stable for any damping coefficient, fixing the
-        // explicit-Euler instability that affected small-inertia bodies.
-        // Both passive AngularDampers and the KD-term of PD controllers
-        // are integrated implicitly here.
+        // Ground contact is integrated implicitly (after the explicit velocity
+        // update) for the same reason as the springs/dampers above: the penalty
+        // damping coefficient (600 N·s/m) violates the explicit bound
+        // `dt < 2·m/c` for the foot's few-gram phalanges (m ≈ 2 g → bound
+        // ≈ 7·10⁻⁶ s ≪ sub_dt). An implicit normal-velocity solve is stable for
+        // any contact mass.
+        self.apply_ground_contact_all(sub_dt);
+        // Springs, soft-limits, and dampers applied implicitly AFTER the
+        // explicit velocity update — unconditionally stable for any
+        // stiffness/damping coefficient, fixing the explicit-Euler instability
+        // that affected small-inertia bodies. Passive AngularSprings,
+        // AngularSoftLimits, AngularDampers, the KD-term of PD controllers, and
+        // the linear PositionalSprings/PositionalDampers are all integrated
+        // here. The PositionalSpring lever-arm torque in particular is the one
+        // that exploded the foot's small bones when applied explicitly.
+        self.apply_positional_springs_implicit(sub_dt);
+        self.apply_springs_implicit(sub_dt);
+        self.apply_soft_limits_implicit(sub_dt);
         self.apply_dampers_implicit(sub_dt);
         self.apply_pd_dampers_implicit(sub_dt);
+        self.apply_positional_dampers_implicit(sub_dt);
         // Reset contact impulses BEFORE the SI loop. Each substep
         // re-solves contacts from scratch; the SI iterations
         // accumulate impulse for warm-start within this substep but
@@ -277,6 +286,18 @@ impl XpbdWorld {
         self.clear_accumulators();
     }
 
+    fn apply_springs_implicit(&mut self, sub_dt: f64) {
+        for spring in &self.angular_springs {
+            spring.apply_implicit(&mut self.bodies, sub_dt);
+        }
+    }
+
+    fn apply_soft_limits_implicit(&mut self, sub_dt: f64) {
+        for limit in &mut self.angular_soft_limits {
+            limit.apply_implicit(&mut self.bodies, sub_dt);
+        }
+    }
+
     fn apply_dampers_implicit(&mut self, sub_dt: f64) {
         for damper in &self.angular_dampers {
             damper.apply_implicit(&mut self.bodies, sub_dt);
@@ -286,18 +307,6 @@ impl XpbdWorld {
     fn apply_pd_dampers_implicit(&mut self, sub_dt: f64) {
         for ctrl in &self.angular_pd_controllers {
             ctrl.apply_implicit_damping(&mut self.bodies, sub_dt);
-        }
-    }
-
-    fn apply_springs(&mut self) {
-        for spring in &self.angular_springs {
-            spring.apply(&mut self.bodies);
-        }
-    }
-
-    fn apply_soft_limits(&mut self) {
-        for limit in &mut self.angular_soft_limits {
-            limit.apply(&mut self.bodies);
         }
     }
 
@@ -319,15 +328,15 @@ impl XpbdWorld {
         }
     }
 
-    fn apply_positional_springs(&mut self) {
+    fn apply_positional_springs_implicit(&mut self, sub_dt: f64) {
         for s in &self.positional_springs {
-            s.apply(&mut self.bodies);
+            s.apply_implicit(&mut self.bodies, sub_dt);
         }
     }
 
-    fn apply_positional_dampers(&mut self) {
+    fn apply_positional_dampers_implicit(&mut self, sub_dt: f64) {
         for d in &self.positional_dampers {
-            d.apply(&mut self.bodies);
+            d.apply_implicit(&mut self.bodies, sub_dt);
         }
     }
 
@@ -346,7 +355,7 @@ impl XpbdWorld {
     /// that this method replaces; see git history for the derivation
     /// notes (penalty spring + bilateral damping rationale, regularized
     /// Coulomb saturation at μ·|F_n|, etc.).
-    fn apply_ground_contact_all(&mut self) {
+    fn apply_ground_contact_all(&mut self, sub_dt: f64) {
         let Some(plane_y) = self.ground.plane_y else {
             return;
         };
@@ -392,34 +401,48 @@ impl XpbdWorld {
                 let v_contact = self.bodies[body_idx].linear_velocity
                     + self.bodies[body_idx].angular_velocity.cross(&contact_offset);
 
-                // Normal force: spring + bilateral damping, clamped non-negative
-                // (ground can push, not pull — without the clamp, on a high-
-                // velocity rebound the damper could pull the body into the
-                // ground, which is unphysical).
-                let f_spring = stiffness * penetration;
-                let f_damp = -damping * v_contact.y;
-                let f_n = (f_spring + f_damp).max(0.0);
-                let normal_force = Vec3::new(0.0, f_n, 0.0);
-                self.bodies[body_idx].apply_force(normal_force);
-                self.bodies[body_idx].apply_torque(contact_offset.cross(&normal_force));
+                // Effective inverse mass at the contact point along a unit
+                // direction d: m_inv(d) = inv_mass + (I_inv·(c×d))·(c×d) where
+                // c = contact_offset. This is the standard contact effective
+                // mass; we use it to integrate the penalty force implicitly so
+                // the bilateral damper is stable on light bodies.
+                let i_inv = self.bodies[body_idx].world_inv_inertia();
+                let inv_m = self.bodies[body_idx].inv_mass;
+                let eff_inv_mass = |d: Vec3| {
+                    let cd = contact_offset.cross(&d);
+                    inv_m + (i_inv * cd).dot(&cd)
+                };
+
+                // Implicit normal: solve for the post-impulse normal velocity
+                //   v_y_new = v_y + m_inv_y·dt·(k·pen − c·v_y_new)
+                // ⇒ v_y_new = (v_y + m_inv_y·dt·k·pen) / (1 + m_inv_y·dt·c).
+                // Then f_n = k·pen − c·v_y_new, clamped ≥ 0 (ground only pushes).
+                let m_inv_y = eff_inv_mass(Vec3::new(0.0, 1.0, 0.0)).max(1e-12);
+                let v_y_new = (v_contact.y + m_inv_y * sub_dt * stiffness * penetration)
+                    / (1.0 + m_inv_y * sub_dt * damping);
+                let f_n = (stiffness * penetration - damping * v_y_new).max(0.0);
+                let contact_world = self.bodies[body_idx].position + contact_offset;
+                let normal_impulse = Vec3::new(0.0, f_n * sub_dt, 0.0);
+                self.bodies[body_idx].apply_impulse(normal_impulse, contact_world);
 
                 // Friction in the tangent plane (xz). Only meaningful if the
-                // ground is actually pushing back (f_n > 0).
+                // ground is actually pushing back (f_n > 0). Integrated
+                // implicitly along the slip direction for the same stability
+                // reason, then saturated at the Coulomb cone μ·f_n.
                 if f_n > 0.0 && mu > 0.0 {
                     let v_t = Vec3::new(v_contact.x, 0.0, v_contact.z);
                     let v_t_speed = v_t.norm();
                     if v_t_speed > 1e-9 {
-                        let f_drag = -friction_damping * v_t;
-                        let f_drag_mag = f_drag.norm();
+                        let t_hat = v_t / v_t_speed;
+                        let m_inv_t = eff_inv_mass(t_hat).max(1e-12);
+                        // Implicit drag along t: v_t_new = v_t / (1 + m_inv_t·dt·c_f),
+                        // drag force magnitude f_drag = c_f·v_t_new.
+                        let v_t_new = v_t_speed / (1.0 + m_inv_t * sub_dt * friction_damping);
+                        let f_drag_mag = friction_damping * v_t_new;
                         let f_friction_max = mu * f_n;
-                        let friction_force = if f_drag_mag > f_friction_max {
-                            f_drag * (f_friction_max / f_drag_mag)
-                        } else {
-                            f_drag
-                        };
-                        self.bodies[body_idx].apply_force(friction_force);
-                        self.bodies[body_idx]
-                            .apply_torque(contact_offset.cross(&friction_force));
+                        let f_fric_mag = f_drag_mag.min(f_friction_max);
+                        let friction_impulse = -t_hat * (f_fric_mag * sub_dt);
+                        self.bodies[body_idx].apply_impulse(friction_impulse, contact_world);
                     }
                 }
             }

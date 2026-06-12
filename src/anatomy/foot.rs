@@ -13,8 +13,8 @@ use physics::angular_spring::AngularSpring;
 use physics::angular_damper::AngularDamper;
 use physics::angular_soft_limit::AngularSoftLimit;
 use physics::angular_pd_controller::AngularPDController;
-use physics::positional_spring::PositionalSpring;
-use physics::positional_damper::PositionalDamper;
+use physics::constraints::PositionalConstraint;
+use physics::angular_constraint::AngularLimitConstraint;
 
 /// One bone's physical parameters (SI units: kg, m).
 #[derive(Clone, Copy, Debug)]
@@ -111,20 +111,19 @@ pub struct JointSpec {
 }
 
 // Shared passive/limit constants (spec §3; analogy-derived where noted).
-const ARTIC_PASSIVE_K: f64 = 4.0;     // N·m/rad passive centering
+const ARTIC_PASSIVE_K: f64 = 4.0;     // N·m/rad passive centering (primary axis)
 const ARTIC_PASSIVE_C: f64 = 1.0;     // N·m·s/rad
-const ARTIC_LIMIT_K: f64 = 8000.0;    // soft-limit stiffness
+const ARTIC_LIMIT_K: f64 = 8000.0;    // primary-axis ROM soft-limit stiffness
 const ARTIC_LIMIT_EXP: f64 = 2.0;
-const OFF_AXIS_K: f64 = 200.0;        // locked off-axis centering
-const OFF_AXIS_LIM: f64 = 0.05;       // rad
-const OFF_AXIS_LIMIT_K: f64 = 10_000.0;
+const OFF_AXIS_LIM: f64 = 0.05;       // off-axis lock half-range (rad)
 
-const JOINT_POS_K: f64 = 60_000.0;    // positional joint stiffness
+// Positional coupling stiffness, mapped to XPBD constraint compliance (1/k).
+// The damping constants are retained for the call signature but the XPBD
+// constraint supplies its own (energy-stable) damping via velocity solve.
+const JOINT_POS_K: f64 = 60_000.0;    // articulated-joint positional stiffness
 const JOINT_POS_C: f64 = 150.0;
-const WELD_POS_K: f64 = 1_000_000.0;
+const WELD_POS_K: f64 = 1_000_000.0;  // weld positional stiffness (near-rigid)
 const WELD_POS_C: f64 = 2_000.0;
-const WELD_ANG_K: f64 = 50_000.0;
-const WELD_ANG_C: f64 = 500.0;
 
 /// All joints in the foot, spec §3. Axis directions in anatomical frame.
 /// ROM in radians. Articulated joints listed first, welds after.
@@ -235,16 +234,23 @@ impl FootHandles {
     pub fn body(&self, b: Bone) -> usize { self.bodies[b as usize] }
 }
 
+/// Adds the positional coupling that holds two bones together at a joint.
+///
+/// Uses the engine's XPBD `PositionalConstraint` (3-DOF ball-and-socket,
+/// solved in the SI loop) rather than a penalty spring+damper. A penalty
+/// spring with anchor lever arms injects energy on stiff multibody systems
+/// (the anchor offset `d` goes stale as the body rotates within the substep),
+/// which exploded the 26-bone assembly. The XPBD constraint is symplectic and
+/// energy-stable by construction; `compliance = 1/k` reproduces the intended
+/// joint stiffness (compliance 0 = perfectly rigid).
 fn add_elastic_joint(
     world: &mut XpbdWorld, parent: usize, child: usize,
-    anchor_parent: Vec3, anchor_child: Vec3, k: f64, c: f64,
+    anchor_parent: Vec3, anchor_child: Vec3, k: f64, _c: f64,
 ) {
-    let mut s = PositionalSpring::new(parent, child, k);
-    s.local_anchor_a = anchor_parent; s.local_anchor_b = anchor_child;
-    world.positional_springs.push(s);
-    let mut d = PositionalDamper::new(parent, child, c);
-    d.local_anchor_a = anchor_parent; d.local_anchor_b = anchor_child;
-    world.positional_dampers.push(d);
+    let mut c = PositionalConstraint::new(parent, child, 0.0, 1.0 / k);
+    c.local_anchor_a = anchor_parent;
+    c.local_anchor_b = anchor_child;
+    world.constraints.push(c);
 }
 
 fn weld(
@@ -252,9 +258,17 @@ fn weld(
     anchor_a: Vec3, anchor_b: Vec3,
 ) {
     add_elastic_joint(world, a, b, anchor_a, anchor_b, WELD_POS_K, WELD_POS_C);
+    // Rigid orientation lock on all three axes via the engine's SI angular
+    // constraint with a degenerate range [0, 0]: every deviation is "out of
+    // range" and is pulled back to zero, so the pair acts as a bilateral
+    // angular weld. This replaces three stiff penalty AngularSprings, which —
+    // applied as independent Gauss-Seidel passes about x/y/z on a few-gram
+    // tarsal — fought each other and injected energy that exploded the
+    // assembly. The SI constraint is iterated together with all others and is
+    // energy-stable.
     for axis in [Vec3::x(), Vec3::y(), Vec3::z()] {
-        world.angular_springs.push(AngularSpring::new(a, b, axis, WELD_ANG_K, 0.0));
-        world.angular_dampers.push(AngularDamper::new(a, b, axis, WELD_ANG_C));
+        world.angular_constraints.push(
+            AngularLimitConstraint::new(a, b, axis, 0.0, 0.0));
     }
 }
 
@@ -289,12 +303,14 @@ fn add_articulated(
     let off1 = primary.cross(&helper).normalize();
     let off2 = primary.cross(&off1).normalize();
     for off in [off1, off2] {
-        world.angular_soft_limits.push(
-            AngularSoftLimit::new(parent, child, off, -OFF_AXIS_LIM, OFF_AXIS_LIM, OFF_AXIS_LIMIT_K, ARTIC_LIMIT_EXP)
-                .with_baseline(baseline));
+        // Off-axis lock as an SI angular constraint with a small ±OFF_AXIS_LIM
+        // range (a near-rigid hinge with a few degrees of physiological slop).
+        // Penalty springs/soft-limits here are two orthogonal stiff stacks that
+        // fight each other in Gauss-Seidel on the few-gram phalanges and slowly
+        // pump energy; the iterated SI constraint is energy-stable.
+        world.angular_constraints.push(
+            AngularLimitConstraint::new(parent, child, off, -OFF_AXIS_LIM, OFF_AXIS_LIM));
         world.angular_dampers.push(AngularDamper::new(parent, child, off, ARTIC_PASSIVE_C));
-        world.angular_springs.push(
-            AngularSpring::new(parent, child, off, OFF_AXIS_K, 0.0).with_baseline(baseline));
     }
     pd_idx
 }
@@ -339,17 +355,20 @@ fn bone_baseline() -> Quat {
     Quat::from_scaled_axis(Vec3::new(-std::f64::consts::FRAC_PI_2, 0.0, 0.0))
 }
 
-/// Local-frame anchor on `bone` pointing toward `toward` (a world point).
-/// Converts the world direction into the bone's local frame and scales
-/// to roughly the bone's half-length so the anchor sits on its surface.
-/// Approximate: for tightly-packed tarsals whose centers are closer than
-/// `half_h`, the anchor may project beyond the neighbor's center — the
-/// positional spring still resolves correctly (it targets anchor-to-anchor).
-fn anchor_toward(world: &XpbdWorld, bone_idx: usize, bone: Bone, toward: Vec3) -> Vec3 {
+/// Local-frame anchor on the body at `bone_idx` for a joint whose world
+/// location is `joint_world`. Expresses that single world point in the
+/// body's local frame: `R⁻¹ · (joint_world − center)`.
+///
+/// Both bodies of a joint pass the SAME `joint_world` (the midpoint of their
+/// centers), so at rest both anchors map back to the same world point and the
+/// positional spring sees zero offset → zero preload. The earlier
+/// "point toward the neighbor, scaled to half_h" scheme placed the two
+/// anchors up to ~2 cm apart for tightly-packed tarsals, which a 10⁶ N/m weld
+/// spring turned into multi-kN build-time forces that exploded the small
+/// bones on substep 0.
+fn anchor_at(world: &XpbdWorld, bone_idx: usize, joint_world: Vec3) -> Vec3 {
     let b = &world.bodies[bone_idx];
-    let dir_world = (toward - b.position).normalize();
-    let dir_local = b.orientation.inverse() * dir_world;
-    dir_local * BONES[bone as usize].half_h
+    b.orientation.inverse() * (joint_world - b.position)
 }
 
 /// Build the 26-bone foot into `world`. `attach` is the world position
@@ -380,8 +399,11 @@ pub fn build_foot(world: &mut XpbdWorld, attach: Vec3) -> FootHandles {
         let child_idx = bodies[spec.child as usize];
         let parent_pos = world.bodies[parent_idx].position;
         let child_pos = world.bodies[child_idx].position;
-        let anchor_p = anchor_toward(world, parent_idx, spec.parent, child_pos);
-        let anchor_c = anchor_toward(world, child_idx, spec.child, parent_pos);
+        // Joint sits at the midpoint of the two bone centers; both anchors
+        // resolve to this same world point, so the rest preload is zero.
+        let joint_world = (parent_pos + child_pos) * 0.5;
+        let anchor_p = anchor_at(world, parent_idx, joint_world);
+        let anchor_c = anchor_at(world, child_idx, joint_world);
 
         match spec.kind {
             JointKind::Weld => {
@@ -466,6 +488,29 @@ mod tests {
         // Talus should be at the attach point.
         let talus = &world.bodies[h.body(Bone::Talus)];
         assert!((talus.position - attach).norm() < 1e-9);
+    }
+
+    #[test]
+    fn foot_settles_on_ground_without_exploding() {
+        let mut world = XpbdWorld::new();
+        world.set_ground(0.0);
+        // Drop the foot from a low height; talus 6 cm up.
+        let h = build_foot(&mut world, Vec3::new(0.0, 0.06, 0.0));
+        let dt = 1.0 / 120.0;
+        let iters = 60;
+        let sub_dt = dt / iters as f64;
+        for _ in 0..240 { // 2 seconds
+            for _ in 0..iters { world.substep(sub_dt); }
+        }
+        // No NaN anywhere.
+        for i in 0..BONE_COUNT {
+            let p = world.bodies[h.bodies[i]].position;
+            assert!(p.x.is_finite() && p.y.is_finite() && p.z.is_finite(),
+                "bone {} went non-finite", BONES[i].name);
+        }
+        // Calcaneus (heel) should be resting near the ground, not flown away.
+        let heel = world.bodies[h.body(Bone::Calcaneus)].position;
+        assert!(heel.y < 0.10 && heel.y > -0.02, "heel y={} after settle", heel.y);
     }
 
     #[test]
