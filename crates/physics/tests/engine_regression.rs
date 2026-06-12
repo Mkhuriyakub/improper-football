@@ -9,6 +9,7 @@
 //! `src/anatomy/foot.rs::foot_settles_on_ground_without_exploding`.
 
 use physics::angular_constraint::AngularLimitConstraint;
+use physics::angular_damper::AngularDamper;
 use physics::angular_pd_controller::AngularPDController;
 use physics::angular_soft_limit::AngularSoftLimit;
 use physics::constraints::PositionalConstraint;
@@ -187,40 +188,100 @@ fn add_weld(world: &mut XpbdWorld, a: usize, b: usize, joint_world: Vec3) {
     }
 }
 
-/// The exact failure mode the rewrite was made to fix: a ~2 g distal-phalanx-
-/// mass body tied by a stiff constraint to a heavy fixed anchor, under gravity.
-/// Explicit integration of a stiff coupling exploded such tiny bodies; the
-/// implicit scheme must keep it finite and pinned near rest.
+/// The exact failure mode the explicit→implicit rewrite was made to fix:
+/// passive angular damping on a few-gram body. The foot module attaches an
+/// `AngularDamper` with coefficient `ARTIC_PASSIVE_C = 1.0` N·m·s/rad to every
+/// inter-bone joint, including the ~2 g distal phalanges. Applied with explicit
+/// Euler, a damper of coefficient `c` on a body of reduced inertia `I_red`
+/// requires `sub_dt < 2·I_red/c` for stability. For a 2 g distal-phalanx
+/// capsule the transverse inertia is I ≈ 6e-9 kg·m², so the explicit bound is
+/// `sub_dt < 2·6e-9/1.0 ≈ 1.2e-8 s` — about a *million* times smaller than the
+/// `sub_dt = 1/7200 s ≈ 1.4e-4 s` used here. Explicit integration therefore
+/// over-corrects each step, the relative angular velocity flips sign and grows
+/// without bound, and the body explodes (non-finite). The implicit damper
+/// (`ω_new = ω/(1 + c·dt·w)`) is unconditionally stable: it can only *remove*
+/// angular kinetic energy, never amplify it, for any `c` and `dt`.
+///
+/// Stressor under test: the ANGULAR DAMPER on the 2 g body. The positional
+/// constraint is present only to keep the body located near the anchor (it is
+/// NOT the stressor — a bare positional constraint was always stable, which is
+/// why the previous version of this test gave false confidence). We seed a
+/// non-zero initial angular velocity so the damper has something to act on.
 #[test]
-fn tiny_mass_body_with_stiff_constraint_is_stable() {
+fn tiny_mass_body_angular_damper_is_stable() {
+    const ARTIC_PASSIVE_C: f64 = 1.0; // N·m·s/rad — the foot's passive joint value.
+
     let mut world = XpbdWorld::new();
     world.no_ground();
 
-    // Heavy fixed anchor (inv_mass = 0 ⇒ never moves).
+    // Heavy fixed anchor (inv_mass = 0 ⇒ never moves, treated as infinite inertia).
     let anchor = RigidBody::new(0.0, Mat3::identity());
     let anchor_idx = world.add_body(anchor);
 
-    // 2 g distal-phalanx-scale body, 1 cm below the anchor.
+    // 2 g distal-phalanx-scale capsule, 1 cm below the anchor.
     let mut tiny = RigidBody::new_capsule(0.002, 0.0035, 0.0028);
     let rest = Vec3::new(0.0, -0.01, 0.0);
     tiny.position = rest;
+    // Seed an initial spin about world X so the angular damper has a non-zero
+    // relative angular velocity to dissipate. This is the quantity the explicit
+    // scheme blows up.
+    let initial_omega = Vec3::new(1.0, 0.0, 0.0);
+    tiny.angular_velocity = initial_omega;
     let tiny_idx = world.add_body(tiny);
 
-    // Stiff ball-and-socket joining the anchor origin to the tiny body's
+    // Stiff ball-and-socket keeping the tiny body located at the anchor's
     // origin (zero-length, near-rigid). Anchors coincide at rest ⇒ no preload.
+    // This only positions the body; the angular damper below is the stressor.
     let mut c = PositionalConstraint::new(anchor_idx, tiny_idx, 0.0, 1.0 / 1_000_000.0);
-    c.local_anchor_a = rest; // anchor's local point that coincides with tiny center
+    c.local_anchor_a = rest; // anchor's local point coinciding with tiny center
     c.local_anchor_b = Vec3::zeros();
     world.constraints.push(c);
 
+    // THE STRESSOR: passive angular damper about world X, foot-strength coeff.
+    // On a 2 g body this is ~10⁶× past the explicit-Euler stability bound.
+    world.angular_dampers.push(AngularDamper::new(
+        anchor_idx,
+        tiny_idx,
+        Vec3::x(),
+        ARTIC_PASSIVE_C,
+    ));
+    // A passive angular spring on the same axis (also foot-scale) — another
+    // implicit-only lever-arm stressor sharing the tiny inertia.
+    world.angular_springs.push(physics::angular_spring::AngularSpring::new(
+        anchor_idx,
+        tiny_idx,
+        Vec3::x(),
+        50.0,
+        0.0,
+    ));
+
+    let initial_spin = initial_omega.norm();
     run_for(&mut world, 3.0);
 
     let b = &world.bodies[tiny_idx];
-    assert!(finite(b.position) && finite(b.linear_velocity), "tiny body exploded (non-finite)");
-    // Must stay within a few cm of rest — no blow-up, no runaway drift.
+    assert!(
+        finite(b.position) && finite(b.linear_velocity) && finite(b.angular_velocity),
+        "tiny body exploded (non-finite) — explicit angular-damper instability"
+    );
+    // The damper must REMOVE angular energy: final spin strictly below initial,
+    // and in fact nearly fully damped over 3 s.
+    let final_spin = b.angular_velocity.norm();
+    assert!(
+        final_spin < initial_spin,
+        "angular velocity grew: {final_spin} rad/s ≥ initial {initial_spin} (damper added energy)"
+    );
+    assert!(
+        final_spin < 0.1,
+        "angular velocity did not decay: {final_spin} rad/s after 3 s (expected ≈0)"
+    );
+    // The positional constraint must keep it near rest the whole time.
     let off = (b.position - rest).norm();
     assert!(off < 0.03, "tiny body drifted {off} m from rest (instability)");
-    assert!(b.linear_velocity.norm() < 0.5, "tiny body velocity {} m/s (instability)", b.linear_velocity.norm());
+    assert!(
+        b.linear_velocity.norm() < 0.5,
+        "tiny body linear velocity {} m/s (instability)",
+        b.linear_velocity.norm()
+    );
 }
 
 /// Two equal bodies welded together must hold their relative pose under
@@ -284,11 +345,15 @@ fn positional_constraint_holds_distance() {
     b.position = Vec3::new(0.05, 0.0, 0.0); // 5 cm apart — anchors start separated
     let b_idx = world.add_body(b);
 
-    // Zero-rest-length constraint between the two centers. Stiff (compliance
-    // small) so it converges to coincident anchors.
+    // Zero-rest-length constraint between OFF-CENTER local anchors (each 1 cm
+    // along the bodies' local +Y), so the constraint must drive two offset
+    // anchors — not the bare centers — to coincide. This exercises the lever-arm
+    // (rotational) path of the positional constraint, not just the trivial
+    // center-to-center case. Stiff (small compliance) so it converges.
+    let local_anchor = Vec3::new(0.0, 0.01, 0.0);
     let mut c = PositionalConstraint::new(a_idx, b_idx, 0.0, 1.0 / 100_000.0);
-    c.local_anchor_a = Vec3::zeros();
-    c.local_anchor_b = Vec3::zeros();
+    c.local_anchor_a = local_anchor;
+    c.local_anchor_b = local_anchor;
     world.constraints.push(c);
 
     // Gravity still acts (no_ground only removes the floor), so the pair
@@ -296,8 +361,11 @@ fn positional_constraint_holds_distance() {
     // which is unaffected by the common free-fall.
     run_for(&mut world, 2.0);
 
-    let pa = world.bodies[a_idx].position + world.bodies[a_idx].orientation * Vec3::zeros();
-    let pb = world.bodies[b_idx].position + world.bodies[b_idx].orientation * Vec3::zeros();
+    // World positions of the two off-center anchors. The orientation*offset
+    // term is now load-bearing (the offset is non-zero), so this genuinely
+    // exercises the rotated-anchor mapping.
+    let pa = world.bodies[a_idx].position + world.bodies[a_idx].orientation * local_anchor;
+    let pb = world.bodies[b_idx].position + world.bodies[b_idx].orientation * local_anchor;
     let sep = (pb - pa).norm();
     assert!(finite(pa) && finite(pb), "constraint pair went non-finite");
     assert!(sep < 0.002, "anchors did not coincide: separation {sep} m (> 2 mm)");
