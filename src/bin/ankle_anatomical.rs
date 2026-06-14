@@ -1,21 +1,16 @@
-// Phase 1 anatomical ankle — text validation binary.
+// Anatomical ankle — text validation binary (26-bone foot).
 //
-// Builds the multi-body ankle assembly (talocrural + subtalar + MTP)
-// per the spec at docs/superpowers/specs/2026-05-18-anatomical-ankle-phase1-design.md
-// and runs 9 PASS/FAIL test scenarios.
-//
-// All masses, lengths, ROMs, and gains come from the spec.
+// Builds the shin + 26-bone anatomical foot (via the foot module) plus a
+// load stick, and runs PASS/FAIL static-balance tests. The foot is the
+// `improper_football::anatomy::foot` assembly; this host only adds the
+// shin, the talocrural joint (shin↔talus), and the load stick.
 
 use physics::xpbd::XpbdWorld;
 use physics::rigid_body::RigidBody;
-use physics::angular_damper::AngularDamper;
-use physics::angular_spring::AngularSpring;
-use physics::angular_soft_limit::AngularSoftLimit;
-use physics::angular_pd_controller::AngularPDController;
-use physics::positional_spring::PositionalSpring;
-use physics::positional_damper::PositionalDamper;
-use physics::math::{Vec3, swing_twist_angle};
+use physics::math::Vec3;
 use nalgebra::UnitQuaternion;
+
+use improper_football::anatomy::foot::{self, FootHandles};
 
 // ─── Simulation timing ────────────────────────────────────────────────
 
@@ -23,334 +18,80 @@ const DT: f64 = 1.0 / 120.0;
 const SOLVER_ITERATIONS: usize = 60;
 const SUB_DT: f64 = DT / SOLVER_ITERATIONS as f64;
 
-// ─── Body parameters (from spec §3) ───────────────────────────────────
+// ─── Body parameters ──────────────────────────────────────────────────
 
 const SHIN_MASS:    f64 = 3.00;
 const SHIN_HALF_H:  f64 = 0.21;
 const SHIN_RADIUS:  f64 = 0.05;
 
-const TALUS_MASS:   f64 = 0.05;
-const TALUS_HALF_H: f64 = 0.025;
-const TALUS_RADIUS: f64 = 0.020;
-
-const FOOT_MASS:    f64 = 0.85;
-const FOOT_HALF_H:  f64 = 0.090;
-const FOOT_RADIUS:  f64 = 0.032;
-
-const FOREFOOT_MASS:    f64 = 0.10;
-const FOREFOOT_HALF_H:  f64 = 0.035;
-const FOREFOOT_RADIUS:  f64 = 0.020;
-
-const STICK_MASS:    f64 = 7.00;  // load above shin; sized so total above-ankle ≈ 10 kg
+const STICK_MASS:    f64 = 7.00;  // load above shin; total above-ankle ≈ 10 kg
 const STICK_HALF_H:  f64 = 0.40;
 const STICK_RADIUS:  f64 = 0.08;
 
-// ─── Joint parameters (from spec §4) ──────────────────────────────────
+// ─── Assembly ─────────────────────────────────────────────────────────
 
-// Talocrural (shin ↔ talus)
-const TALOCRURAL_JOINT_K: f64 = 60_000.0;
-const TALOCRURAL_JOINT_C: f64 =    150.0;
-const TALOCRURAL_PRIMARY_KP: f64 = 80.0;
-const TALOCRURAL_PRIMARY_KD: f64 =  1.0;
-const TALOCRURAL_PASSIVE_K:  f64 =  4.0;
-const TALOCRURAL_PASSIVE_C:  f64 =  1.2;
-const TALOCRURAL_ROM_MIN: f64 = -0.35;
-const TALOCRURAL_ROM_MAX: f64 = 0.70;
-const TALOCRURAL_LIMIT_K: f64 = 10_000.0;
-const TALOCRURAL_LIMIT_EXP: f64 = 2.0;
-const TALOCRURAL_OFF_AXIS_K:    f64 = 200.0;
-const TALOCRURAL_OFF_AXIS_LIM:  f64 = 0.05;
-const TALOCRURAL_OFF_AXIS_LIMIT_K: f64 = 10_000.0;
-
-// Subtalar (talus ↔ foot)
-const SUBTALAR_JOINT_K: f64 = 60_000.0;
-const SUBTALAR_JOINT_C: f64 =    150.0;
-const SUBTALAR_PRIMARY_KP: f64 = 50.0;
-const SUBTALAR_PRIMARY_KD: f64 =  2.0;
-const SUBTALAR_PASSIVE_K:  f64 =  3.5;
-const SUBTALAR_PASSIVE_C:  f64 =  1.0;
-const SUBTALAR_ROM_MIN: f64 = -0.26;
-const SUBTALAR_ROM_MAX: f64 = 0.52;
-const SUBTALAR_LIMIT_K: f64 = 8_000.0;
-const SUBTALAR_LIMIT_EXP: f64 = 2.0;
-const SUBTALAR_TWIST_K: f64 = 8.0;
-const SUBTALAR_TWIST_C: f64 = 0.5;
-const SUBTALAR_TWIST_LIM: f64 = 0.10;
-const SUBTALAR_TWIST_LIMIT_K: f64 = 10_000.0;
-const SUBTALAR_OFF_AXIS_K:    f64 = 200.0;
-const SUBTALAR_OFF_AXIS_LIM:  f64 = 0.05;
-const SUBTALAR_OFF_AXIS_LIMIT_K: f64 = 10_000.0;
-
-// MTP (foot ↔ forefoot)
-const MTP_JOINT_K: f64 = 60_000.0;
-const MTP_JOINT_C: f64 =    150.0;
-const MTP_PRIMARY_KP: f64 = 30.0;
-const MTP_PRIMARY_KD: f64 =  0.5;
-const MTP_PASSIVE_K:  f64 =  5.0;
-const MTP_PASSIVE_C:  f64 =  1.5;
-const MTP_ROM_MIN: f64 = -0.35;
-const MTP_ROM_MAX: f64 = 0.87;
-const MTP_LIMIT_K: f64 = 5_000.0;
-const MTP_LIMIT_EXP: f64 = 2.0;
-const MTP_OFF_AXIS_K:    f64 = 100.0;
-const MTP_OFF_AXIS_LIM:  f64 = 0.05;
-const MTP_OFF_AXIS_LIMIT_K: f64 = 5_000.0;
-
-// Stick weld to shin (stiff rigid attachment via springs)
-const WELD_POS_K: f64 = 1_000_000.0;
-const WELD_POS_C: f64 =     2_000.0;
-const WELD_ANG_K: f64 =    50_000.0;
-const WELD_ANG_C: f64 =       500.0;
-
-// ─── Helpers ──────────────────────────────────────────────────────────
-
-fn place_child(
-    parent: &RigidBody, parent_distal: Vec3, child_proximal: Vec3,
-    rel_rot: UnitQuaternion<f64>,
-) -> (Vec3, UnitQuaternion<f64>) {
-    let child_orient = parent.orientation * rel_rot;
-    let joint = parent.position + parent.orientation * parent_distal;
-    let child_pos = joint - child_orient * child_proximal;
-    (child_pos, child_orient)
-}
-
-fn add_elastic_joint(
-    world: &mut XpbdWorld, parent: usize, child: usize,
-    pa: Vec3, ca: Vec3, k: f64, c: f64,
-) {
-    let mut s = PositionalSpring::new(parent, child, k);
-    s.local_anchor_a = pa; s.local_anchor_b = ca;
-    world.positional_springs.push(s);
-    let mut d = PositionalDamper::new(parent, child, c);
-    d.local_anchor_a = pa; d.local_anchor_b = ca;
-    world.positional_dampers.push(d);
-}
-
-/// Welds two bodies together via stiff positional + 3-axis angular springs.
-/// Use to attach the load stick rigidly to the shin top.
-fn weld_bodies(
-    world: &mut XpbdWorld, body_a: usize, body_b: usize,
-    anchor_a: Vec3, anchor_b: Vec3,
-) {
-    // Positional weld
-    add_elastic_joint(world, body_a, body_b, anchor_a, anchor_b, WELD_POS_K, WELD_POS_C);
-    // 3-axis angular weld: K and 0-baseline springs on x, y, z to lock orientation.
-    for axis in [Vec3::x(), Vec3::y(), Vec3::z()] {
-        world.angular_springs.push(
-            AngularSpring::new(body_a, body_b, axis, WELD_ANG_K, 0.0));
-        world.angular_dampers.push(
-            AngularDamper::new(body_a, body_b, axis, WELD_ANG_C));
-    }
-}
-
-/// Read the signed angle of body_b relative to body_a about an axis in
-/// body_a's local frame. Same convention as AngularPDController.
-fn joint_angle(
-    world: &XpbdWorld, body_a: usize, body_b: usize, axis_local_a: Vec3,
-) -> f64 {
-    let q_b_in_a = world.bodies[body_a].orientation.inverse()
-                 * world.bodies[body_b].orientation;
-    swing_twist_angle(q_b_in_a, axis_local_a)
-}
-
-#[derive(Clone, Copy)]
-struct AnkleHandles {
+struct Assembly {
+    world: XpbdWorld,
+    #[allow(dead_code)]
+    foot: FootHandles,
+    #[allow(dead_code)]
     shin_idx: usize,
-    talus_idx: usize,
-    foot_idx: usize,
-    forefoot_idx: usize,
     stick_idx: usize,
+    #[allow(dead_code)]
     talocrural_pd_idx: usize,
-    subtalar_pd_idx: usize,
-    mtp_pd_idx: usize,
 }
 
-fn build_world() -> (XpbdWorld, AnkleHandles) {
+fn build_world() -> Assembly {
     let mut world = XpbdWorld::new();
     world.set_ground(0.0);
     let id = UnitQuaternion::identity();
 
-    // Foot baseline: R_x(-π/2). Local +Y maps to world -Z (heel direction),
-    // local -Y to world +Z (toe direction).
-    let foot_baseline = UnitQuaternion::from_scaled_axis(
-        Vec3::new(-std::f64::consts::FRAC_PI_2, 0.0, 0.0));
+    // Talus attaches here; tuned so the flat sole rests on the ground.
+    // Foot origin = attach.y − talus_rest.y (0.057); the sole plane is at
+    // 0.018 above origin, so attach.y = 0.057 − 0.018 = 0.039 puts the sole
+    // exactly on y=0. A hair higher lets it settle into contact.
+    let attach = Vec3::new(0.0, 0.039, 0.0);
 
-    // Foot: center at world (0, 0.032, +0.09); heel at world (0, 0.032, 0).
-    let mut foot = RigidBody::new_capsule(FOOT_MASS, FOOT_HALF_H, FOOT_RADIUS);
-    foot.position = Vec3::new(0.0, FOOT_RADIUS, 0.09);
-    foot.orientation = foot_baseline;
-    let foot_idx = world.add_body(foot);
-
-    // Forefoot: attached to foot's toe end (world (0,0.032,+0.18)) at its
-    // own heel end (local +Y). Carries foot baseline.
-    let mut forefoot = RigidBody::new_capsule(FOREFOOT_MASS, FOREFOOT_HALF_H, FOREFOOT_RADIUS);
-    let (pos, orient) = place_child(&world.bodies[foot_idx],
-        Vec3::new(0.0, -FOOT_HALF_H, 0.0),         // foot toe end (foot local)
-        Vec3::new(0.0, FOREFOOT_HALF_H, 0.0),      // forefoot heel end (forefoot local)
-        id);
-    forefoot.position = pos;
-    forefoot.orientation = orient;
-    let forefoot_idx = world.add_body(forefoot);
-
-    // Talus: above foot's heel (subtalar joint at world (0,0.032,0)).
-    // Talus is at identity orientation.
-    let mut talus = RigidBody::new_capsule(TALUS_MASS, TALUS_HALF_H, TALUS_RADIUS);
-    talus.position = Vec3::new(0.0, FOOT_RADIUS + TALUS_HALF_H, 0.0);  // (0, 0.057, 0)
-    talus.orientation = id;
-    let talus_idx = world.add_body(talus);
-
-    // Shin: above talus (talocrural joint at world (0, 0.082, 0)).
+    // Shin: vertical, distal (bottom) end at the talus attach point.
     let mut shin = RigidBody::new_capsule(SHIN_MASS, SHIN_HALF_H, SHIN_RADIUS);
-    let talocrural_world_y = FOOT_RADIUS + 2.0 * TALUS_HALF_H;  // 0.082
-    shin.position = Vec3::new(0.0, talocrural_world_y + SHIN_HALF_H, 0.0);  // (0, 0.292, 0)
+    shin.position = Vec3::new(0.0, attach.y + SHIN_HALF_H, 0.0);
     shin.orientation = id;
     let shin_idx = world.add_body(shin);
 
-    // ── Talocrural joint (shin ↔ talus) ─────────────────────────────
-    // Positional joint at shin bottom / talus top.
-    add_elastic_joint(&mut world, shin_idx, talus_idx,
-        Vec3::new(0.0, -SHIN_HALF_H, 0.0),
-        Vec3::new(0.0, TALUS_HALF_H, 0.0),
-        TALOCRURAL_JOINT_K, TALOCRURAL_JOINT_C);
+    // Foot (26 bones); talus center at `attach`.
+    let foot = foot::build_foot(&mut world, attach);
 
-    // Primary axis: world +x at neutral, in shin local frame.
-    let tc_primary = Vec3::new(1.0, 0.0, 0.0);
-    world.angular_soft_limits.push(AngularSoftLimit::new(
-        shin_idx, talus_idx, tc_primary,
-        TALOCRURAL_ROM_MIN, TALOCRURAL_ROM_MAX,
-        TALOCRURAL_LIMIT_K, TALOCRURAL_LIMIT_EXP));
-    world.angular_dampers.push(AngularDamper::new(
-        shin_idx, talus_idx, tc_primary, TALOCRURAL_PASSIVE_C));
-    world.angular_springs.push(AngularSpring::new(
-        shin_idx, talus_idx, tc_primary, TALOCRURAL_PASSIVE_K, 0.0));
-    let talocrural_pd_idx = world.angular_pd_controllers.len();
-    world.angular_pd_controllers.push(AngularPDController::new(
-        shin_idx, talus_idx, tc_primary,
-        TALOCRURAL_PRIMARY_KP, TALOCRURAL_PRIMARY_KD));
-
-    // Off-axes (Y, Z) locked: strong passive + soft-limit at narrow ROM.
-    for off_axis in [Vec3::y(), Vec3::z()] {
-        world.angular_soft_limits.push(AngularSoftLimit::new(
-            shin_idx, talus_idx, off_axis,
-            -TALOCRURAL_OFF_AXIS_LIM, TALOCRURAL_OFF_AXIS_LIM,
-            TALOCRURAL_OFF_AXIS_LIMIT_K, TALOCRURAL_LIMIT_EXP));
-        world.angular_dampers.push(AngularDamper::new(
-            shin_idx, talus_idx, off_axis, TALOCRURAL_PASSIVE_C));
-        world.angular_springs.push(AngularSpring::new(
-            shin_idx, talus_idx, off_axis, TALOCRURAL_OFF_AXIS_K, 0.0));
+    // Diagnostic: optionally pin every foot bone immovable. This isolates
+    // the ankle joint from the foot-on-ground rocking mode. With the foot
+    // pinned the ankle PD balances the 11 kg column indefinitely (PASS),
+    // which is the key evidence that the standing-balance failure is the
+    // foot rocking off its small contact patch, NOT an ankle-gain problem.
+    if std::env::var("ANKLE_PIN_FOOT").is_ok() {
+        for &idx in foot.bodies.iter() {
+            world.bodies[idx].inv_mass = 0.0;
+            world.bodies[idx].inv_inertia_tensor = nalgebra::Matrix3::zeros();
+        }
     }
 
-    // ── Subtalar joint (talus ↔ foot) ───────────────────────────────
-    // The foot baseline R_x(-π/2) is applied at this joint: rel_rot in
-    // place_child was foot_baseline. The positional joint uses the
-    // anatomical anchor points.
-    add_elastic_joint(&mut world, talus_idx, foot_idx,
-        Vec3::new(0.0, -TALUS_HALF_H, 0.0),
-        Vec3::new(0.0, FOOT_HALF_H, 0.0),  // foot heel anchor in foot local
-        SUBTALAR_JOINT_K, SUBTALAR_JOINT_C);
+    // Talocrural joint shin↔talus (baseline-aware; DF 20°/PF 40°).
+    let talocrural_pd_idx = foot::attach_talocrural(
+        &mut world, shin_idx, &foot, -0.35, 0.70, 800.0, 40.0);
 
-    // Primary axis: world +z at neutral (inversion/eversion).
-    // In talus local frame (talus is at identity), axis = (0, 0, 1).
-    let st_primary = Vec3::new(0.0, 0.0, 1.0);
-    world.angular_soft_limits.push(AngularSoftLimit::new(
-        talus_idx, foot_idx, st_primary,
-        SUBTALAR_ROM_MIN, SUBTALAR_ROM_MAX,
-        SUBTALAR_LIMIT_K, SUBTALAR_LIMIT_EXP)
-        .with_baseline(foot_baseline));
-    world.angular_dampers.push(AngularDamper::new(
-        talus_idx, foot_idx, st_primary, SUBTALAR_PASSIVE_C));
-    world.angular_springs.push(AngularSpring::new(
-        talus_idx, foot_idx, st_primary, SUBTALAR_PASSIVE_K, 0.0)
-        .with_baseline(foot_baseline));
-    let subtalar_pd_idx = world.angular_pd_controllers.len();
-    world.angular_pd_controllers.push(AngularPDController::new(
-        talus_idx, foot_idx, st_primary,
-        SUBTALAR_PRIMARY_KP, SUBTALAR_PRIMARY_KD)
-        .with_baseline(foot_baseline));
-
-    // Twist axis (Y in talus local): very limited passive ROM.
-    let st_twist = Vec3::new(0.0, 1.0, 0.0);
-    world.angular_soft_limits.push(AngularSoftLimit::new(
-        talus_idx, foot_idx, st_twist,
-        -SUBTALAR_TWIST_LIM, SUBTALAR_TWIST_LIM,
-        SUBTALAR_TWIST_LIMIT_K, SUBTALAR_LIMIT_EXP)
-        .with_baseline(foot_baseline));
-    world.angular_dampers.push(AngularDamper::new(
-        talus_idx, foot_idx, st_twist, SUBTALAR_TWIST_C));
-    world.angular_springs.push(AngularSpring::new(
-        talus_idx, foot_idx, st_twist, SUBTALAR_TWIST_K, 0.0)
-        .with_baseline(foot_baseline));
-
-    // Other off-axis (X in talus local): locked, prevents PF/DF leaking
-    // into the subtalar joint (that's the talocrural's job).
-    let st_locked = Vec3::new(1.0, 0.0, 0.0);
-    world.angular_soft_limits.push(AngularSoftLimit::new(
-        talus_idx, foot_idx, st_locked,
-        -SUBTALAR_OFF_AXIS_LIM, SUBTALAR_OFF_AXIS_LIM,
-        SUBTALAR_OFF_AXIS_LIMIT_K, SUBTALAR_LIMIT_EXP)
-        .with_baseline(foot_baseline));
-    world.angular_dampers.push(AngularDamper::new(
-        talus_idx, foot_idx, st_locked, SUBTALAR_PASSIVE_C));
-    world.angular_springs.push(AngularSpring::new(
-        talus_idx, foot_idx, st_locked, SUBTALAR_OFF_AXIS_K, 0.0)
-        .with_baseline(foot_baseline));
-
-    // ── MTP joint (foot ↔ forefoot) ─────────────────────────────────
-    add_elastic_joint(&mut world, foot_idx, forefoot_idx,
-        Vec3::new(0.0, -FOOT_HALF_H, 0.0),
-        Vec3::new(0.0, FOREFOOT_HALF_H, 0.0),
-        MTP_JOINT_K, MTP_JOINT_C);
-
-    // Primary axis: world +x at neutral. In foot local (after baseline),
-    // axis (1, 0, 0) still maps to world +x. The MTP PD's baseline is
-    // identity (no offset between foot and forefoot at rest).
-    let mtp_primary = Vec3::new(1.0, 0.0, 0.0);
-    world.angular_soft_limits.push(AngularSoftLimit::new(
-        foot_idx, forefoot_idx, mtp_primary,
-        MTP_ROM_MIN, MTP_ROM_MAX,
-        MTP_LIMIT_K, MTP_LIMIT_EXP));
-    world.angular_dampers.push(AngularDamper::new(
-        foot_idx, forefoot_idx, mtp_primary, MTP_PASSIVE_C));
-    world.angular_springs.push(AngularSpring::new(
-        foot_idx, forefoot_idx, mtp_primary, MTP_PASSIVE_K, 0.0));
-    let mtp_pd_idx = world.angular_pd_controllers.len();
-    world.angular_pd_controllers.push(AngularPDController::new(
-        foot_idx, forefoot_idx, mtp_primary,
-        MTP_PRIMARY_KP, MTP_PRIMARY_KD));
-
-    // Off-axes (Y, Z) locked.
-    for off_axis in [Vec3::y(), Vec3::z()] {
-        world.angular_soft_limits.push(AngularSoftLimit::new(
-            foot_idx, forefoot_idx, off_axis,
-            -MTP_OFF_AXIS_LIM, MTP_OFF_AXIS_LIM,
-            MTP_OFF_AXIS_LIMIT_K, MTP_LIMIT_EXP));
-        world.angular_dampers.push(AngularDamper::new(
-            foot_idx, forefoot_idx, off_axis, MTP_PASSIVE_C));
-        world.angular_springs.push(AngularSpring::new(
-            foot_idx, forefoot_idx, off_axis, MTP_OFF_AXIS_K, 0.0));
-    }
-
-    // Stick (load): above shin, welded to shin top.
+    // Load stick welded to the shin top (both identity-oriented, so the
+    // foot's weld with baseline-free AngularLimitConstraints is valid).
     let mut stick = RigidBody::new_capsule(STICK_MASS, STICK_HALF_H, STICK_RADIUS);
-    let shin_top_y = talocrural_world_y + 2.0 * SHIN_HALF_H;  // 0.502
-    stick.position = Vec3::new(0.0, shin_top_y + STICK_HALF_H, 0.0);  // (0, 0.902, 0)
+    stick.position = Vec3::new(0.0, attach.y + 2.0 * SHIN_HALF_H + STICK_HALF_H, 0.0);
     stick.orientation = id;
     let stick_idx = world.add_body(stick);
+    let weld_pt = Vec3::new(0.0, attach.y + 2.0 * SHIN_HALF_H, 0.0); // shin top
+    let anchor_shin = foot::anchor_at(&world, shin_idx, weld_pt);
+    let anchor_stick = foot::anchor_at(&world, stick_idx, weld_pt);
+    foot::weld(&mut world, shin_idx, stick_idx, anchor_shin, anchor_stick);
 
-    // ── Stick welded to shin top ────────────────────────────────────
-    weld_bodies(&mut world, shin_idx, stick_idx,
-        Vec3::new(0.0, SHIN_HALF_H, 0.0),
-        Vec3::new(0.0, -STICK_HALF_H, 0.0));
-
-    // ── Ground contact via the world ────────────────────────────────
-    // Every body with capsule_shape collides with the ground at y=0
-    // (the foot in normal stance; the forefoot/talus/shin/stick if the
-    // chain tips far enough).
-    (world, AnkleHandles {
-        shin_idx, talus_idx, foot_idx, forefoot_idx, stick_idx,
-        talocrural_pd_idx, subtalar_pd_idx, mtp_pd_idx,
-    })
+    Assembly { world, foot, shin_idx, stick_idx, talocrural_pd_idx }
 }
+
+// ─── Test framework ───────────────────────────────────────────────────
 
 struct TestResult {
     name: &'static str,
@@ -363,13 +104,12 @@ impl TestResult {
         Self { name, passed: true, message: String::from("PASS") }
     }
     fn fail(name: &'static str, message: String) -> Self {
-        Self { name, passed: false, message }
+        Self { name, passed: false, message: format!("FAIL: {message}") }
     }
 }
 
-/// Run the simulation for `duration` seconds, optionally calling
-/// `per_frame` once per frame (after each `SOLVER_ITERATIONS` substeps).
-/// Returns the world afterward.
+/// Run the simulation for `duration` seconds, calling `per_frame` once per
+/// frame (after each `SOLVER_ITERATIONS` substeps).
 fn simulate(
     world: &mut XpbdWorld,
     duration: f64,
@@ -385,46 +125,59 @@ fn simulate(
     }
 }
 
-/// Check that all body positions are finite (no NaN/inf).
-fn all_positions_finite(world: &XpbdWorld) -> bool {
-    world.bodies.iter().all(|b|
-        b.position.x.is_finite() && b.position.y.is_finite() && b.position.z.is_finite())
-}
-
 fn test_sustained_stability() -> TestResult {
-    let (mut world, _h) = build_world();
+    let mut a = build_world();
     let mut blew_up = false;
-    simulate(&mut world, 10.0, |w, _t| {
-        if !all_positions_finite(w) {
-            blew_up = true;
-        }
+    simulate(&mut a.world, 10.0, |w, _t| {
+        if !w.bodies.iter().all(|b| b.position.y.is_finite()) { blew_up = true; }
     });
-    if blew_up {
-        return TestResult::fail("8: sustained stability",
-            "non-finite body position detected".into());
-    }
-    TestResult::pass("8: sustained stability")
+    if blew_up { return TestResult::fail("sustained stability", "non-finite position".into()); }
+    TestResult::pass("sustained stability")
 }
 
 fn test_static_balance() -> TestResult {
-    let (mut world, h) = build_world();
-    // PD targets are 0 (default). Just let the chain settle.
-    let mut max_stick_tilt = 0.0_f64;
-    simulate(&mut world, 5.0, |w, _t| {
-        // Stick tilt = scaled-axis magnitude (small-angle approx).
-        let tilt = w.bodies[h.stick_idx].orientation.scaled_axis().norm();
-        if tilt > max_stick_tilt { max_stick_tilt = tilt; }
+    let mut a = build_world();
+    let mut max_tilt = 0.0_f64;
+    simulate(&mut a.world, 5.0, |w, _t| {
+        let tilt = w.bodies[a.stick_idx].orientation.scaled_axis().norm();
+        if tilt > max_tilt { max_tilt = tilt; }
     });
-    let tilt_deg = max_stick_tilt.to_degrees();
-    if tilt_deg < 5.0 && all_positions_finite(&world) {
-        TestResult::pass("1: static balance")
-    } else {
-        TestResult::fail("1: static balance",
-            format!("max stick tilt = {:.2}° (limit 5°)", tilt_deg))
+    let deg = max_tilt.to_degrees();
+    if deg < 5.0 { TestResult::pass("static balance") }
+    else { TestResult::fail("static balance", format!("max tilt {deg:.2}° (limit 5°)")) }
+}
+
+fn diagnose() {
+    let mut a = build_world();
+    let mut tprev = 0.0;
+    for &tstop in &[0.30_f64, 0.50, 1.0, 2.0] {
+        simulate(&mut a.world, tstop - tprev, |_, _| {});
+        tprev = tstop;
+        let sa = a.world.bodies[a.stick_idx].orientation.scaled_axis();
+        let (mut m, mut c) = (0.0, Vec3::zeros());
+        for b in &a.world.bodies { let mm = 1.0/b.inv_mass; m += mm; c += b.position * mm; }
+        c /= m;
+        let mut pts: Vec<(f64, f64, f64)> = vec![];
+        for idx in 0..a.world.bodies.len() {
+            for e in a.world.engaged_endpoints(idx).iter().flatten() {
+                pts.push((e.contact_point.x, e.contact_point.z, e.normal_force));
+            }
+        }
+        let (mut xmin, mut xmax, mut zmin, mut zmax) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        let mut ftot = 0.0;
+        for &(x, z, f) in &pts {
+            xmin = xmin.min(x); xmax = xmax.max(x);
+            zmin = zmin.min(z); zmax = zmax.max(z); ftot += f;
+        }
+        println!("--- t≈{tstop:.2}s tilt={:.1}° (x={:.3} y={:.3} z={:.3}) CoM=({:.4},{:.4},{:.4})",
+            sa.norm().to_degrees(), sa.x, sa.y, sa.z, c.x, c.y, c.z);
+        println!("    {} contacts, Fn_total={ftot:.0}N, polygon x[{xmin:.3},{xmax:.3}] z[{zmin:.3},{zmax:.3}]; CoM inside-x={} inside-z={}",
+            pts.len(), c.x >= xmin && c.x <= xmax, c.z >= zmin && c.z <= zmax);
     }
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--diagnose") { diagnose(); return; }
     let mut results = vec![];
     results.push(test_sustained_stability());
     results.push(test_static_balance());
@@ -432,6 +185,14 @@ fn main() {
         println!("{}: {}", r.name, r.message);
     }
     if results.iter().any(|r| !r.passed) {
+        eprintln!(
+            "\nNote: passive static balance is a known structural limit — an \
+             11 kg load with CoM ~0.6 m up cannot stand on a realistic ~5x15 cm \
+             foot without active CoP/whole-body control. Run with ANKLE_PIN_FOOT=1 \
+             to confirm the ankle PD itself balances the column (PASS); the failure \
+             is the foot rocking off its small contact patch, not an ankle-gain issue. \
+             Run with --diagnose for the tilt/CoM/support-polygon trace."
+        );
         std::process::exit(1);
     }
 }

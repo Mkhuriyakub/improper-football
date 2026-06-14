@@ -253,7 +253,7 @@ fn add_elastic_joint(
     world.constraints.push(c);
 }
 
-fn weld(
+pub fn weld(
     world: &mut XpbdWorld, a: usize, b: usize,
     anchor_a: Vec3, anchor_b: Vec3,
 ) {
@@ -315,36 +315,55 @@ fn add_articulated(
     pd_idx
 }
 
+/// Anterior-posterior shift of the whole foot (every bone except the
+/// talus) relative to the talus/ankle. The talus stays under the shin
+/// (z=0); shifting the rest of the foot backward by this amount moves the
+/// ground support polygon so its centroid sits closer to under the ankle
+/// rather than far forward of it. With the un-shifted layout the talocrural
+/// joint sits at the heel end of a forward-extending footprint, so a load
+/// CoM directly over the ankle projects to the rear edge of the support
+/// polygon. (Diagnostic note: centring the polygon is necessary but NOT
+/// sufficient for passive standing balance under a tall heavy load — see
+/// the ankle_anatomical binary's findings — but it is correct geometry and
+/// maximises the passive stability margin.)
+const FOOT_Z_SHIFT: f64 = -0.05;
+
 /// Rest position of each bone's CENTER relative to the foot origin
 /// (ground point below the talus), in world meters (x lat, y up, z ant).
 /// Starting layout per spec §2 column structure; refined by stage tests.
 const REST_POS: [Vec3; BONE_COUNT] = [
-    Vec3::new( 0.005, 0.030, -0.045), // calcaneus (heel: behind, low)
-    Vec3::new( 0.000, 0.057,  0.000), // talus (on top, at ankle)
-    Vec3::new(-0.008, 0.045,  0.030), // navicular (medial midfoot, arch apex)
-    Vec3::new( 0.022, 0.030,  0.020), // cuboid (lateral midfoot)
-    Vec3::new(-0.015, 0.038,  0.052), // medial cuneiform
-    Vec3::new(-0.002, 0.040,  0.050), // intermediate cuneiform
-    Vec3::new( 0.012, 0.038,  0.050), // lateral cuneiform
-    Vec3::new(-0.018, 0.028,  0.095), // mt1
-    Vec3::new(-0.006, 0.026,  0.100), // mt2
-    Vec3::new( 0.006, 0.026,  0.098), // mt3
-    Vec3::new( 0.018, 0.026,  0.092), // mt4
-    Vec3::new( 0.028, 0.026,  0.085), // mt5
-    Vec3::new(-0.020, 0.020,  0.135), // hallux_pp
-    Vec3::new(-0.021, 0.018,  0.158), // hallux_dp
-    Vec3::new(-0.008, 0.020,  0.140), // toe2_pp
-    Vec3::new(-0.008, 0.018,  0.156), // toe2_mp
-    Vec3::new(-0.008, 0.017,  0.166), // toe2_dp
-    Vec3::new( 0.004, 0.020,  0.138), // toe3_pp
-    Vec3::new( 0.004, 0.018,  0.153), // toe3_mp
-    Vec3::new( 0.004, 0.017,  0.162), // toe3_dp
-    Vec3::new( 0.016, 0.020,  0.132), // toe4_pp
-    Vec3::new( 0.016, 0.018,  0.146), // toe4_mp
-    Vec3::new( 0.016, 0.017,  0.154), // toe4_dp
-    Vec3::new( 0.027, 0.020,  0.122), // toe5_pp
-    Vec3::new( 0.027, 0.018,  0.134), // toe5_mp
-    Vec3::new( 0.027, 0.017,  0.143), // toe5_dp
+    // Plantar-contact bones (heel, metatarsal heads, phalanges) are placed
+    // so their capsule bottoms (center.y − radius) lie on a common sole
+    // plane at y = 0.018 above the foot origin — a FLAT sole, not the
+    // graded heights of the original layout (which left the heel ~1 cm
+    // below the forefoot, so only the heel touched and the foot toppled).
+    // Midfoot bones (navicular, cuboid, cuneiforms) stay above the sole.
+    Vec3::new( 0.005, 0.0375, -0.045), // calcaneus (heel: behind; bottom=0.018)
+    Vec3::new( 0.000, 0.0570,  0.000), // talus (on top, at ankle)
+    Vec3::new(-0.008, 0.0450,  0.030), // navicular (medial midfoot, arch apex)
+    Vec3::new( 0.022, 0.0300,  0.020), // cuboid (lateral midfoot)
+    Vec3::new(-0.015, 0.0380,  0.052), // medial cuneiform
+    Vec3::new(-0.002, 0.0400,  0.050), // intermediate cuneiform
+    Vec3::new( 0.012, 0.0380,  0.050), // lateral cuneiform
+    Vec3::new(-0.018, 0.0255,  0.095), // mt1 (bottom=0.018)
+    Vec3::new(-0.006, 0.0233,  0.100), // mt2 (bottom=0.018)
+    Vec3::new( 0.006, 0.0228,  0.098), // mt3 (bottom=0.018)
+    Vec3::new( 0.018, 0.0223,  0.092), // mt4 (bottom=0.018)
+    Vec3::new( 0.028, 0.0233,  0.085), // mt5 (bottom=0.018)
+    Vec3::new(-0.020, 0.0253,  0.135), // hallux_pp (bottom=0.018)
+    Vec3::new(-0.021, 0.0235,  0.158), // hallux_dp (bottom=0.018)
+    Vec3::new(-0.008, 0.0220,  0.140), // toe2_pp (bottom=0.018)
+    Vec3::new(-0.008, 0.0210,  0.156), // toe2_mp (bottom=0.018)
+    Vec3::new(-0.008, 0.0208,  0.166), // toe2_dp (bottom=0.018)
+    Vec3::new( 0.004, 0.0220,  0.138), // toe3_pp (bottom=0.018)
+    Vec3::new( 0.004, 0.0210,  0.153), // toe3_mp (bottom=0.018)
+    Vec3::new( 0.004, 0.0205,  0.162), // toe3_dp (bottom=0.018)
+    Vec3::new( 0.016, 0.0215,  0.132), // toe4_pp (bottom=0.018)
+    Vec3::new( 0.016, 0.0205,  0.146), // toe4_mp (bottom=0.018)
+    Vec3::new( 0.016, 0.0205,  0.154), // toe4_dp (bottom=0.018)
+    Vec3::new( 0.027, 0.0220,  0.122), // toe5_pp (bottom=0.018)
+    Vec3::new( 0.027, 0.0205,  0.134), // toe5_mp (bottom=0.018)
+    Vec3::new( 0.027, 0.0210,  0.143), // toe5_dp (bottom=0.018)
 ];
 
 /// Rest orientation of each bone. Most bones lie with their long axis
@@ -366,9 +385,53 @@ fn bone_baseline() -> Quat {
 /// anchors up to ~2 cm apart for tightly-packed tarsals, which a 10⁶ N/m weld
 /// spring turned into multi-kN build-time forces that exploded the small
 /// bones on substep 0.
-fn anchor_at(world: &XpbdWorld, bone_idx: usize, joint_world: Vec3) -> Vec3 {
+pub fn anchor_at(world: &XpbdWorld, bone_idx: usize, joint_world: Vec3) -> Vec3 {
     let b = &world.bodies[bone_idx];
     b.orientation.inverse() * (joint_world - b.position)
+}
+
+/// Attach a proximal segment (the shin) to the talus via the talocrural
+/// joint: dorsi/plantarflexion about world +x (mediolateral), with the Y
+/// and Z off-axes locked. The segment is assumed identity-oriented; the
+/// talus carries `bone_baseline()`, so the joint's rest offset is
+/// `bone_baseline()` and all angular primitives are baseline-aware.
+///
+/// Unlike the foot's internal joints (which use baseline-free
+/// AngularLimitConstraints, valid only when both bones share orientation),
+/// this joint crosses the identity→baseline boundary, so it uses
+/// baseline-aware penalty soft-limits. Those are stable here because the
+/// shin/talus are kg-scale (the constraint treatment was only needed for
+/// the few-gram foot bones). Returns the talocrural PD index.
+pub fn attach_talocrural(
+    world: &mut XpbdWorld, seg_idx: usize, foot: &FootHandles,
+    rom_min: f64, rom_max: f64, kp: f64, kd: f64,
+) -> usize {
+    let talus_idx = foot.body(Bone::Talus);
+    let joint_world = world.bodies[talus_idx].position; // talus center
+    let anchor_seg = anchor_at(world, seg_idx, joint_world);
+    let anchor_talus = anchor_at(world, talus_idx, joint_world);
+    add_elastic_joint(world, seg_idx, talus_idx, anchor_seg, anchor_talus, JOINT_POS_K, JOINT_POS_C);
+
+    let baseline = bone_baseline();
+    let primary = Vec3::new(1.0, 0.0, 0.0); // DF/PF
+    world.angular_soft_limits.push(
+        AngularSoftLimit::new(seg_idx, talus_idx, primary, rom_min, rom_max, ARTIC_LIMIT_K, ARTIC_LIMIT_EXP)
+            .with_baseline(baseline));
+    world.angular_dampers.push(AngularDamper::new(seg_idx, talus_idx, primary, ARTIC_PASSIVE_C));
+    world.angular_springs.push(
+        AngularSpring::new(seg_idx, talus_idx, primary, ARTIC_PASSIVE_K, 0.0).with_baseline(baseline));
+    let pd_idx = world.angular_pd_controllers.len();
+    world.angular_pd_controllers.push(
+        AngularPDController::new(seg_idx, talus_idx, primary, kp, kd).with_baseline(baseline));
+
+    // Y and Z off-axes locked with baseline-aware penalty soft-limits.
+    for off in [Vec3::y(), Vec3::z()] {
+        world.angular_soft_limits.push(
+            AngularSoftLimit::new(seg_idx, talus_idx, off, -OFF_AXIS_LIM, OFF_AXIS_LIM, ARTIC_LIMIT_K, ARTIC_LIMIT_EXP)
+                .with_baseline(baseline));
+        world.angular_dampers.push(AngularDamper::new(seg_idx, talus_idx, off, ARTIC_PASSIVE_C));
+    }
+    pd_idx
 }
 
 /// Build the 26-bone foot into `world`. `attach` is the world position
@@ -387,7 +450,9 @@ pub fn build_foot(world: &mut XpbdWorld, attach: Vec3) -> FootHandles {
     for i in 0..BONE_COUNT {
         let p = &BONES[i];
         let mut body = RigidBody::new_capsule(p.mass, p.half_h, p.radius);
-        body.position = origin + REST_POS[i];
+        let mut rest = REST_POS[i];
+        if i != Bone::Talus as usize { rest.z += FOOT_Z_SHIFT; }
+        body.position = origin + rest;
         body.orientation = baseline;
         bodies[i] = world.add_body(body);
     }
