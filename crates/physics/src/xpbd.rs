@@ -38,10 +38,12 @@ pub struct EndpointContact {
 /// (via `Ground::disabled`) is the canonical way to run the world without
 /// gravity-stop — no body collides with the ground, regardless of shape.
 ///
-/// The penalty-spring + bilateral-damping + regularized-Coulomb-friction
-/// math (and all its default parameter choices) is identical to the old
-/// per-body `GroundContact` it replaces; see the body of
-/// `XpbdWorld::apply_ground_contact_all` for the full model.
+/// Contact itself is resolved by the multi-point SI non-penetration
+/// manifold (`XpbdWorld::generate_ground_manifold` + `ContactConstraint`),
+/// which is rigid and needs no stiffness/damping tuning. `friction_coefficient`
+/// is the Coulomb μ handed to each manifold constraint. The `stiffness`,
+/// `damping`, and `friction_damping` fields are legacy penalty-model
+/// parameters retained for API compatibility; the manifold ignores them.
 pub struct Ground {
     pub plane_y: Option<f64>,
     pub stiffness: f64,
@@ -86,11 +88,23 @@ pub struct XpbdWorld {
     pub torque_dispatchers: Vec<TorqueDispatcher>,
     pub foot_contacts: Vec<FootContact>,
     pub contact_constraints: Vec<ContactConstraint>,
+    /// Per-substep ground contact manifold: one `ContactConstraint` per
+    /// capsule endpoint penetrating (or about to penetrate) the ground
+    /// plane. Regenerated fresh every substep by `generate_ground_manifold`
+    /// and solved together in the SI loop, so a resting body settles onto
+    /// multiple simultaneous load-sharing contacts (a stable manifold)
+    /// instead of micro-bouncing on its single deepest point. Kept
+    /// separate from the user-facing `contact_constraints`.
+    pub ground_manifold: Vec<ContactConstraint>,
     /// World-level ground. Every body with `capsule_shape: Some(...)`
     /// collides against this plane each substep.
     pub ground: Ground,
     /// Number of Gauss-Seidel sequential-impulse iterations per substep.
     pub solver_iterations: usize,
+    /// Substep dt of the most recent `substep` call. Lets the read-only
+    /// `engaged_endpoints` convert a converged manifold impulse
+    /// (`lambda_normal`) into a normal force (`lambda_normal / last_sub_dt`).
+    last_sub_dt: f64,
 }
 
 impl XpbdWorld {
@@ -109,8 +123,10 @@ impl XpbdWorld {
             torque_dispatchers: Vec::new(),
             foot_contacts: Vec::new(),
             contact_constraints: Vec::new(),
+            ground_manifold: Vec::new(),
             ground: Ground::at_y(0.0),
             solver_iterations: DEFAULT_SI_ITERATIONS,
+            last_sub_dt: 0.0,
         }
     }
 
@@ -246,18 +262,24 @@ impl XpbdWorld {
     /// must be re-applied each call since accumulators clear at the end of
     /// every substep (same as before the rewrite).
     pub fn substep(&mut self, sub_dt: f64) {
+        self.last_sub_dt = sub_dt;
         self.apply_pd_controllers();
         self.apply_torque_dispatchers();
         self.apply_tendons();
         self.apply_foot_contacts();
         self.integrate_velocities(sub_dt);
-        // Ground contact is integrated implicitly (after the explicit velocity
-        // update) for the same reason as the springs/dampers above: the penalty
-        // damping coefficient (600 N·s/m) violates the explicit bound
-        // `dt < 2·m/c` for the foot's few-gram phalanges (m ≈ 2 g → bound
-        // ≈ 7·10⁻⁶ s ≪ sub_dt). An implicit normal-velocity solve is stable for
-        // any contact mass.
-        self.apply_ground_contact_all(sub_dt);
+        // Ground contact is now a multi-point manifold of unilateral SI
+        // non-penetration constraints (one per penetrating capsule endpoint),
+        // solved together in the SI loop below. This replaces the old
+        // per-endpoint penalty impulse, which collapsed a body's geometric
+        // footprint to an intermittent single deepest contact and let bodies
+        // tip even with the CoM over the base. SI Gauss-Seidel iterations
+        // converge to a consistent load-sharing solution across all contacts,
+        // so the body settles onto a stable manifold (no penalty bounce, and
+        // unconditionally stable for any contact mass). Generated here, BEFORE
+        // the SI loop, with zero accumulated impulse — no separate reset
+        // needed since it is rebuilt fresh every substep.
+        self.generate_ground_manifold();
         // Springs, soft-limits, and dampers applied implicitly AFTER the
         // explicit velocity update — unconditionally stable for any
         // stiffness/damping coefficient, fixing the explicit-Euler instability
@@ -340,29 +362,34 @@ impl XpbdWorld {
         }
     }
 
-    /// World-level ground-contact pass.
+    /// Margin (m) within which an endpoint is included in the manifold even
+    /// before it actually penetrates. The constraint stays inactive
+    /// (`lambda_normal == 0`) until the endpoint truly penetrates, but
+    /// pre-generating it lets the SI solver catch fast-approaching contacts
+    /// within the substep rather than one substep late.
+    const MANIFOLD_MARGIN: f64 = 1.0e-3;
+
+    /// Regenerate the per-substep ground contact manifold.
     ///
     /// For every body whose `capsule_shape` is `Some(...)` and whose
-    /// `inv_mass` is non-zero (pinned bodies pass through unchanged —
-    /// the contact would have no effect anyway), check both endpoints
-    /// of the capsule against the ground plane. Apply penalty-spring
-    /// normal force, bilateral damping, and regularized-Coulomb friction
-    /// in the xz tangent plane. Both normal and friction forces are
-    /// applied at the actual ground-contact point (one radius below the
-    /// end-sphere center) so the friction lever arm is correct.
+    /// `inv_mass` is non-zero (pinned bodies pass through — contact would
+    /// have no effect), check both capsule endpoints against the ground
+    /// plane. For each endpoint within `MANIFOLD_MARGIN` of (or below) the
+    /// plane, push a fresh rigid `ContactConstraint` anchored at the
+    /// end-sphere bottom (expressed in body-local coordinates). These are
+    /// then solved together in the SI loop, yielding a consistent
+    /// multi-point load-sharing solution instead of the old independent
+    /// per-endpoint penalty impulses.
     ///
-    /// The math here is identical to the old per-body `GroundContact::apply`
-    /// that this method replaces; see git history for the derivation
-    /// notes (penalty spring + bilateral damping rationale, regularized
-    /// Coulomb saturation at μ·|F_n|, etc.).
-    fn apply_ground_contact_all(&mut self, sub_dt: f64) {
+    /// Because the manifold is rebuilt every substep, the fixed
+    /// material-point (local_point) approximation only needs to hold for a
+    /// single substep — acceptable for the small per-substep rotation.
+    fn generate_ground_manifold(&mut self) {
+        self.ground_manifold.clear();
         let Some(plane_y) = self.ground.plane_y else {
             return;
         };
-        let stiffness = self.ground.stiffness;
-        let damping = self.ground.damping;
         let mu = self.ground.friction_coefficient;
-        let friction_damping = self.ground.friction_damping;
 
         for body_idx in 0..self.bodies.len() {
             let shape = match self.bodies[body_idx].capsule_shape {
@@ -370,12 +397,12 @@ impl XpbdWorld {
                 None => continue,
             };
             if self.bodies[body_idx].inv_mass == 0.0 {
-                // Pinned body — contact would have no effect.
                 continue;
             }
 
-            let axis_world = self.bodies[body_idx].orientation
-                * Vec3::new(0.0, 1.0, 0.0);
+            let position = self.bodies[body_idx].position;
+            let orientation = self.bodies[body_idx].orientation;
+            let axis_world = orientation * Vec3::new(0.0, 1.0, 0.0);
             let half = shape.half_h;
             let r = shape.radius;
 
@@ -383,88 +410,64 @@ impl XpbdWorld {
             let endpoints = [axis_world * half, -axis_world * half];
 
             for endpoint_offset in endpoints {
-                let endpoint_world = self.bodies[body_idx].position + endpoint_offset;
+                let endcenter_world = position + endpoint_offset;
                 // Bottom of the end-sphere = endpoint center - radius (along +y).
-                let bottom = endpoint_world.y - r;
-                let penetration = plane_y - bottom;
-                if penetration <= 0.0 {
+                let bottom_y = endcenter_world.y - r;
+                let penetration = plane_y - bottom_y;
+                if penetration <= -Self::MANIFOLD_MARGIN {
                     continue;
                 }
 
-                // Actual ground-contact point is one radius below the end-sphere
-                // center, on the plane. Use this offset (not the end-sphere
-                // offset) for both normal and friction force application so
-                // that the friction lever arm is correct.
-                let contact_offset = endpoint_offset + Vec3::new(0.0, -r, 0.0);
+                // Contact point in world = end-sphere bottom. Express it in
+                // body-local so the constraint tracks the material point as
+                // the body rotates within this substep.
+                let contact_world = endcenter_world - Vec3::new(0.0, r, 0.0);
+                let local_point = orientation.inverse() * (contact_world - position);
 
-                // Velocity at the contact point (includes rotation contribution).
-                let v_contact = self.bodies[body_idx].linear_velocity
-                    + self.bodies[body_idx].angular_velocity.cross(&contact_offset);
-
-                // Effective inverse mass at the contact point along a unit
-                // direction d: m_inv(d) = inv_mass + (I_inv·(c×d))·(c×d) where
-                // c = contact_offset. This is the standard contact effective
-                // mass; we use it to integrate the penalty force implicitly so
-                // the bilateral damper is stable on light bodies.
-                let i_inv = self.bodies[body_idx].world_inv_inertia();
-                let inv_m = self.bodies[body_idx].inv_mass;
-                let eff_inv_mass = |d: Vec3| {
-                    let cd = contact_offset.cross(&d);
-                    inv_m + (i_inv * cd).dot(&cd)
-                };
-
-                // Implicit normal: solve for the post-impulse normal velocity
-                //   v_y_new = v_y + m_inv_y·dt·(k·pen − c·v_y_new)
-                // ⇒ v_y_new = (v_y + m_inv_y·dt·k·pen) / (1 + m_inv_y·dt·c).
-                // Then f_n = k·pen − c·v_y_new, clamped ≥ 0 (ground only pushes).
-                let m_inv_y = eff_inv_mass(Vec3::new(0.0, 1.0, 0.0)).max(1e-12);
-                let v_y_new = (v_contact.y + m_inv_y * sub_dt * stiffness * penetration)
-                    / (1.0 + m_inv_y * sub_dt * damping);
-                let f_n = (stiffness * penetration - damping * v_y_new).max(0.0);
-                let contact_world = self.bodies[body_idx].position + contact_offset;
-                let normal_impulse = Vec3::new(0.0, f_n * sub_dt, 0.0);
-                self.bodies[body_idx].apply_impulse(normal_impulse, contact_world);
-
-                // Friction in the tangent plane (xz). Only meaningful if the
-                // ground is actually pushing back (f_n > 0). Integrated
-                // implicitly along the slip direction for the same stability
-                // reason, then saturated at the Coulomb cone μ·f_n.
-                if f_n > 0.0 && mu > 0.0 {
-                    let v_t = Vec3::new(v_contact.x, 0.0, v_contact.z);
-                    let v_t_speed = v_t.norm();
-                    if v_t_speed > 1e-9 {
-                        let t_hat = v_t / v_t_speed;
-                        let m_inv_t = eff_inv_mass(t_hat).max(1e-12);
-                        // Implicit drag along t: v_t_new = v_t / (1 + m_inv_t·dt·c_f),
-                        // drag force magnitude f_drag = c_f·v_t_new.
-                        let v_t_new = v_t_speed / (1.0 + m_inv_t * sub_dt * friction_damping);
-                        let f_drag_mag = friction_damping * v_t_new;
-                        let f_friction_max = mu * f_n;
-                        let f_fric_mag = f_drag_mag.min(f_friction_max);
-                        let friction_impulse = -t_hat * (f_fric_mag * sub_dt);
-                        self.bodies[body_idx].apply_impulse(friction_impulse, contact_world);
-                    }
-                }
+                // Baumgarte = 0 (no separating-velocity bias). The default
+                // Baumgarte term targets a positive (upward) normal velocity
+                // proportional to penetration at each contact. For a SINGLE
+                // body that just gently pushes out penetration, but for a
+                // RIGID MULTI-CONTACT manifold (the whole point here) the
+                // contacts sit at slightly different, non-coplanar penetration
+                // depths; forcing each one's upward bias simultaneously through
+                // the rigid-body coupling levitates the assembly and pumps in
+                // real kinetic energy every substep (measured: a 108 N rigid
+                // foot gained ~0.16 m/s upward per substep and floated off the
+                // ground, then tipped). With bias = 0 the normal constraint is
+                // purely a non-penetration velocity floor (v_n ≥ 0) — energy
+                // dissipative, never injecting. Penetration never accumulates
+                // because the floor stops downward velocity before it deepens.
+                self.ground_manifold.push(
+                    ContactConstraint::new(body_idx, local_point)
+                        .with_plane_y(plane_y)
+                        .with_friction(mu)
+                        .with_baumgarte(0.0),
+                );
             }
         }
     }
 
-    /// Read-only computation of which capsule endpoints of `body_idx`
-    /// are currently pressing the ground, with the contact point and
+    /// Read-only report of which capsule endpoints of `body_idx` are
+    /// currently load-bearing on the ground, with the contact point and
     /// normal-force magnitude for each. The `[Option; 2]` slot order is
     /// (positive_Y_endpoint, negative_Y_endpoint) — same convention as
-    /// `RigidBody::axis_endpoints_world`. An entry is `None` if that
-    /// endpoint isn't penetrating, or if the bilateral damping clamped
-    /// the normal force to zero (rebound). Returns `[None, None]` if
-    /// the ground is disabled, the body has no capsule shape, or the
-    /// body is pinned.
+    /// `RigidBody::axis_endpoints_world`.
+    ///
+    /// This reads the converged ground-contact manifold from the most
+    /// recent substep: an endpoint reports `Some` only if it has an active
+    /// manifold constraint (`lambda_normal > 0`, i.e. the ground is
+    /// actually pushing there). `normal_force` is the converged impulse
+    /// divided by the last substep dt (`lambda_normal / last_sub_dt`).
+    /// Returns `[None, None]` if the ground is disabled, the body has no
+    /// capsule shape, the body is pinned, or no substep has run yet.
     pub fn engaged_endpoints(
         &self,
         body_idx: usize,
     ) -> [Option<EndpointContact>; 2] {
-        let Some(plane_y) = self.ground.plane_y else {
+        if self.ground.plane_y.is_none() || self.last_sub_dt <= 0.0 {
             return [None, None];
-        };
+        }
         let body = &self.bodies[body_idx];
         let shape = match body.capsule_shape {
             Some(s) => s,
@@ -474,35 +477,35 @@ impl XpbdWorld {
             return [None, None];
         }
 
-        let stiffness = self.ground.stiffness;
-        let damping = self.ground.damping;
-        let axis_world = body.orientation * Vec3::new(0.0, 1.0, 0.0);
-        let half = shape.half_h;
-        let r = shape.radius;
-        let endpoint_offsets = [axis_world * half, -axis_world * half];
+        // Match each active manifold constraint to an endpoint by which
+        // endpoint center its world contact point is closest to (slot order
+        // positive_Y, negative_Y — same as the manifold generation order).
+        let axis_local = Vec3::new(0.0, shape.half_h, 0.0);
+        let endpoint_centers_world = [
+            body.position + body.orientation * axis_local,
+            body.position - body.orientation * axis_local,
+        ];
 
-        let mut out = [None, None];
-        for (i, endpoint_offset) in endpoint_offsets.iter().enumerate() {
-            let endpoint_world = body.position + endpoint_offset;
-            let bottom = endpoint_world.y - r;
-            let penetration = plane_y - bottom;
-            if penetration <= 0.0 {
+        let mut out: [Option<EndpointContact>; 2] = [None, None];
+        for c in &self.ground_manifold {
+            if c.body != body_idx || c.lambda_normal <= 0.0 {
                 continue;
             }
-            let contact_offset = endpoint_offset + Vec3::new(0.0, -r, 0.0);
-            let v_contact = body.linear_velocity
-                + body.angular_velocity.cross(&contact_offset);
-            let f_spring = stiffness * penetration;
-            let f_damp = -damping * v_contact.y;
-            let f_n = (f_spring + f_damp).max(0.0);
-            if f_n <= 0.0 {
-                continue;
-            }
-            let contact_point = body.position + contact_offset;
-            out[i] = Some(EndpointContact {
+            let contact_point = c.contact_point_world(&self.bodies);
+            // Assign to the nearer endpoint center.
+            let d0 = (contact_point - endpoint_centers_world[0]).norm();
+            let d1 = (contact_point - endpoint_centers_world[1]).norm();
+            let slot = if d0 <= d1 { 0 } else { 1 };
+            let ec = EndpointContact {
                 contact_point,
-                normal_force: f_n,
-            });
+                normal_force: c.lambda_normal / self.last_sub_dt,
+            };
+            // If two active constraints map to the same slot (shouldn't
+            // happen with 2 endpoints), keep the larger-force one.
+            match out[slot] {
+                Some(existing) if existing.normal_force >= ec.normal_force => {}
+                _ => out[slot] = Some(ec),
+            }
         }
         out
     }
@@ -582,6 +585,18 @@ impl XpbdWorld {
             );
             cc.solve(&mut self.bodies, dt);
             self.contact_constraints[i] = cc;
+        }
+        // Ground contact manifold — the multi-point non-penetration solve.
+        // Generated fresh each substep in `generate_ground_manifold`; solved
+        // alongside the user-facing contacts so a body settles onto all its
+        // load-bearing endpoints simultaneously.
+        for i in 0..self.ground_manifold.len() {
+            let mut cc = std::mem::replace(
+                &mut self.ground_manifold[i],
+                ContactConstraint::new(0, Vec3::zeros()),
+            );
+            cc.solve(&mut self.bodies, dt);
+            self.ground_manifold[i] = cc;
         }
     }
 

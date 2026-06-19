@@ -523,3 +523,72 @@ fn settling_chain_does_not_gain_energy() {
         e_end - e_start
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// Multi-point manifold contact
+// ════════════════════════════════════════════════════════════════════════
+
+/// Multi-point ground manifold: a single rigid horizontal capsule (axis
+/// along world +X, so its two end-spheres form a 2-point footprint) resting
+/// with its CoM centered over that base must stay upright and LEVEL over 2 s
+/// — AND both endpoints must be simultaneously load-bearing.
+///
+/// This is the direct guard for "manifold, not single deepest point." With
+/// the old per-endpoint penalty pass the body micro-bounced on one endpoint
+/// at a time (max 1 simultaneous contact), and any small roll perturbation
+/// would not be corrected because only one support point ever pushed back.
+/// The SI manifold solves both endpoints together, so the pair shares load
+/// and the body levels out.
+#[test]
+fn manifold_keeps_resting_capsule_level_with_two_active_contacts() {
+    let radius = 0.03;
+    let half_h = 0.15; // wide base: endpoints 30 cm apart along X
+    let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
+
+    let mut body = RigidBody::new_capsule(2.0, half_h, radius);
+    // Axis along world +X (rotate local +Y onto +X about world -Z).
+    let level = Quat::from_scaled_axis(Vec3::new(0.0, 0.0, -std::f64::consts::FRAC_PI_2));
+    // Seed a small initial roll about X (3°) so a single-point contact could
+    // NOT recover it; the manifold must drive it back to level.
+    let perturb = Quat::from_scaled_axis(Vec3::new(3f64.to_radians(), 0.0, 0.0));
+    body.orientation = perturb * level;
+    body.position = Vec3::new(0.0, radius, 0.0); // resting height
+    let idx = world.add_body(body);
+
+    run_for(&mut world, 2.0);
+
+    let b = &world.bodies[idx];
+    assert!(finite(b.position) && finite(b.linear_velocity), "went non-finite");
+
+    // Upright: the capsule axis (local +Y) must remain (anti)parallel to the
+    // ground, i.e. its world-Y component must be ~0 (axis stays horizontal).
+    let axis_world = b.orientation * Vec3::new(0.0, 1.0, 0.0);
+    let tilt_deg = axis_world.y.abs().asin().to_degrees();
+    assert!(
+        tilt_deg < 2.0,
+        "capsule did not stay level: axis tilt {tilt_deg:.2}° (> 2°)"
+    );
+
+    // Settled: not drifting/spinning.
+    assert!(b.linear_velocity.norm() < 0.02, "still translating: {} m/s", b.linear_velocity.norm());
+    assert!(b.angular_velocity.norm() < 0.1, "still rotating: {} rad/s", b.angular_velocity.norm());
+
+    // Rest height preserved (CoM over base, both ends on the floor).
+    assert!((b.position.y - radius).abs() < 0.004, "rest height {} m, expected ≈ {radius} m", b.position.y);
+
+    // THE manifold assertion: both endpoints are simultaneously load-bearing.
+    let eng = world.engaged_endpoints(idx);
+    let active = eng.iter().filter(|e| e.is_some()).count();
+    assert!(
+        active >= 2,
+        "expected >=2 simultaneous active ground contacts (manifold), got {active}"
+    );
+    // Both should carry positive normal force that together support the weight.
+    let total_fn: f64 = eng.iter().filter_map(|e| e.map(|c| c.normal_force)).sum();
+    let weight = 2.0 * 9.81;
+    assert!(
+        (total_fn - weight).abs() < 0.25 * weight,
+        "total normal force {total_fn:.2} N should ≈ weight {weight:.2} N"
+    );
+}

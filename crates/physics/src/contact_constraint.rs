@@ -77,6 +77,7 @@ impl ContactConstraint {
     pub fn with_plane_y(mut self, y: f64) -> Self { self.plane_y = y; self }
     pub fn with_friction(mut self, mu: f64) -> Self { self.friction_coefficient = mu; self }
     pub fn with_compliance(mut self, c: f64) -> Self { self.compliance = c; self }
+    pub fn with_baumgarte(mut self, b: f64) -> Self { self.baumgarte = b; self }
 
     /// Reset accumulated impulses. Called once per substep, BEFORE the
     /// SI iteration loop.
