@@ -7,6 +7,10 @@ first principles on an XPBD (extended position-based dynamics) substrate with
 sequential-impulse constraints, implicit integration for stiff components, and
 anatomically-faithful joint modeling.
 
+In plain terms: a simulated human skeleton with real bone-by-bone anatomy —
+down to a 26-bone foot standing on physically simulated ground contact —
+built so that every claim about its behavior is backed by a test you can run.
+
 The long-term goal is a general human-motion simulator that integrates the
 best ideas from the leading physics engines — MuJoCo's soft constraints,
 Drake's inverse dynamics, Bullet's sequential-impulse contacts, OpenSim's
@@ -18,8 +22,8 @@ football motion as the driving use case.
 **26-bone anatomical foot** (`src/anatomy/foot.rs`) — every tarsal,
 metatarsal, and phalanx is a distinct rigid body with literature-sourced
 dimensions and mass distribution (Zatsiorsky/de Leva segment data,
-osteometric bone studies). 21 articulated joints, anatomically axed —
-oblique where the literature says it matters: the subtalar joint uses
+osteometric bone studies). 21 articulated joints with anatomically
+oriented axes — oblique where the literature says it matters: the subtalar joint uses
 Manter/Inman's 42°-inclination, 23°-medial-deviation axis (the mechanism
 behind inversion ankle sprains) and the Chopart pair carry their oblique
 axes; the remaining joints use their dominant anatomical plane — plus 8

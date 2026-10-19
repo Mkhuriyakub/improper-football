@@ -110,7 +110,15 @@ pub struct JointSpec {
     pub kind: JointKind,
 }
 
-// Shared passive/limit constants (spec §3; analogy-derived where noted).
+// Shared passive/limit constants (spec §3). Published moment-angle data
+// exists for only three foot joints; these shared values are SIZED to land
+// in those curves' ranges and inherited by analogy everywhere else:
+// - Soft-limit: torque = K·(Δθ)² past the ROM bound, so 8000·(0.05)² =
+//   20 N·m at 0.05 rad past the talocrural dorsiflexion limit — inside
+//   Riener & Edrich (1999)'s ~20-30 N·m functional-extreme passive range.
+// - Passive centering 4.0 N·m/rad is order-matched to the stiffest
+//   published first-MTP passive quasi-stiffness (Heng et al. 2016,
+//   0.66-53.4 N·mm/deg ≈ up to ~3 N·m/rad).
 const ARTIC_PASSIVE_K: f64 = 4.0;     // N·m/rad passive centering (primary axis)
 const ARTIC_PASSIVE_C: f64 = 1.0;     // N·m·s/rad
 const ARTIC_LIMIT_K: f64 = 8000.0;    // primary-axis ROM soft-limit stiffness
@@ -155,7 +163,7 @@ pub const JOINTS: [JointSpec; 29] = [
             rom_min: -0.18, rom_max: 0.18, kp: 20.0, kd: 0.6 } }, // TMT5
     JointSpec { parent: Bone::Mt1, child: Bone::HalluxPp,
         kind: JointKind::Articulated { axis_anat: Vec3::new(0.0, 1.0, 0.0),
-            rom_min: -0.61, rom_max: 1.22, kp: 30.0, kd: 1.0 } }, // hallux MTP DF70/PF35
+            rom_min: -0.61, rom_max: 1.22, kp: 30.0, kd: 1.0 } }, // hallux MTP DF70/PF35 (clinical ROM; passive stiffness context: Heng 2016)
     JointSpec { parent: Bone::Mt2, child: Bone::Toe2Pp,
         kind: JointKind::Articulated { axis_anat: Vec3::new(0.0, 1.0, 0.0),
             rom_min: -0.70, rom_max: 0.70, kp: 8.0, kd: 0.3 } },
