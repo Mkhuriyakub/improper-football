@@ -9,13 +9,11 @@ use crate::positional_spring::PositionalSpring;
 use crate::positional_damper::PositionalDamper;
 use crate::tendon::Tendon;
 use crate::torque_dispatcher::TorqueDispatcher;
-use crate::foot_contact::FootContact;
 use crate::contact_constraint::ContactConstraint;
 use crate::math::{Vec2, Vec3};
 use nalgebra::UnitQuaternion;
 
 pub const GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
-pub const SOLVER_ITERATIONS: usize = 30;
 /// Default number of sequential-impulse iterations per substep. Each iteration
 /// is one Gauss-Seidel pass over all positional and angular constraints,
 /// refining the impulses that satisfy the velocity-level constraints.
@@ -41,35 +39,24 @@ pub struct EndpointContact {
 /// Contact itself is resolved by the multi-point SI non-penetration
 /// manifold (`XpbdWorld::generate_ground_manifold` + `ContactConstraint`),
 /// which is rigid and needs no stiffness/damping tuning. `friction_coefficient`
-/// is the Coulomb μ handed to each manifold constraint. The `stiffness`,
-/// `damping`, and `friction_damping` fields are legacy penalty-model
-/// parameters retained for API compatibility; the manifold ignores them.
+/// is the Coulomb μ handed to each manifold constraint.
 pub struct Ground {
     pub plane_y: Option<f64>,
-    pub stiffness: f64,
-    pub damping: f64,
     pub friction_coefficient: f64,
-    pub friction_damping: f64,
 }
 
 impl Ground {
     pub fn at_y(plane_y: f64) -> Self {
         Self {
             plane_y: Some(plane_y),
-            stiffness: 1.0e5,
-            damping: 600.0,
             friction_coefficient: 0.6,
-            friction_damping: 1000.0,
         }
     }
 
     pub fn disabled() -> Self {
         Self {
             plane_y: None,
-            stiffness: 1.0e5,
-            damping: 600.0,
             friction_coefficient: 0.6,
-            friction_damping: 1000.0,
         }
     }
 }
@@ -86,7 +73,6 @@ pub struct XpbdWorld {
     pub positional_dampers: Vec<PositionalDamper>,
     pub tendons: Vec<Tendon>,
     pub torque_dispatchers: Vec<TorqueDispatcher>,
-    pub foot_contacts: Vec<FootContact>,
     pub contact_constraints: Vec<ContactConstraint>,
     /// Per-substep ground contact manifold: one `ContactConstraint` per
     /// capsule endpoint penetrating (or about to penetrate) the ground
@@ -121,7 +107,6 @@ impl XpbdWorld {
             positional_dampers: Vec::new(),
             tendons: Vec::new(),
             torque_dispatchers: Vec::new(),
-            foot_contacts: Vec::new(),
             contact_constraints: Vec::new(),
             ground_manifold: Vec::new(),
             ground: Ground::at_y(0.0),
@@ -240,13 +225,6 @@ impl XpbdWorld {
         Vec2::new(p.x, p.z)
     }
 
-    pub fn step(&mut self, dt: f64) {
-        let sub_dt = dt / SOLVER_ITERATIONS as f64;
-        for _ in 0..SOLVER_ITERATIONS {
-            self.substep(sub_dt);
-        }
-    }
-
     /// Run one substep using the velocity-level (sequential impulse) solver.
     ///
     /// Order of operations:
@@ -266,7 +244,6 @@ impl XpbdWorld {
         self.apply_pd_controllers();
         self.apply_torque_dispatchers();
         self.apply_tendons();
-        self.apply_foot_contacts();
         self.integrate_velocities(sub_dt);
         // Ground contact is now a multi-point manifold of unilateral SI
         // non-penetration constraints (one per penetrating capsule endpoint),
@@ -523,12 +500,6 @@ impl XpbdWorld {
     /// the ground.
     pub fn is_in_contact(&self, body_idx: usize) -> bool {
         self.engaged_endpoints(body_idx).iter().any(|e| e.is_some())
-    }
-
-    fn apply_foot_contacts(&mut self) {
-        for c in &self.foot_contacts {
-            c.apply(&mut self.bodies);
-        }
     }
 
     fn integrate_velocities(&mut self, dt: f64) {

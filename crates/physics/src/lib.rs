@@ -10,7 +10,6 @@ pub mod positional_spring;
 pub mod positional_damper;
 pub mod tendon;
 pub mod torque_dispatcher;
-pub mod foot_contact;
 pub mod contact_constraint;
 pub mod inverse_dynamics;
 pub mod math;

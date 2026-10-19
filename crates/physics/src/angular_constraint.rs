@@ -86,7 +86,4 @@ impl AngularLimitConstraint {
         bodies[self.body_a].angular_velocity -= i_inv_a * n * lambda;
         bodies[self.body_b].angular_velocity += i_inv_b * n * lambda;
     }
-
-    /// No-op for the SI solver. Kept for API compatibility.
-    pub fn reset_lambda(&mut self) {}
 }

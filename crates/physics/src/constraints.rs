@@ -90,6 +90,4 @@ impl PositionalConstraint {
         bodies[self.body_a].angular_velocity -= i_inv_a * ra_cross_n * lambda;
         bodies[self.body_b].angular_velocity += i_inv_b * rb_cross_n * lambda;
     }
-
-    pub fn reset_lambda(&mut self) {}
 }

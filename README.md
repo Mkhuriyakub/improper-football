@@ -87,9 +87,8 @@ src/bin/                 Validation + visual binaries (one concern each)
   ankle_anatomical.rs    Foot+ankle validation suite (PASS/FAIL, CI-ready)
   foot_rigid_balance_diag.rs Contact-model diagnostic (exits nonzero if the
                          nominal rigid assembly stops standing)
-  balance_*.rs, elbow_*.rs, ...  Incremental motion milestones
-  (a Bevy visual demo of the 26-bone foot is planned; the existing
-  ankle_anatomical_demo.rs still shows the superseded Phase-1 foot)
+  balance_*.rs, *_demo.rs, ...  Incremental motion milestones
+  (a Bevy visual demo of the 26-bone foot is in progress)
 ```
 
 Physics runs at 120 Hz frames × 60 substeps (sub-dt ≈ 139 µs). Rendering

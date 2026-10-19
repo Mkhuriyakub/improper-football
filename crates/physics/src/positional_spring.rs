@@ -5,13 +5,13 @@ use crate::rigid_body::RigidBody;
 /// resistance of a joint capsule + cartilage + ligament system that resists
 /// separation of the two bones forming a joint.
 ///
-/// For zero `rest_length` (every joint/weld in the project), prefer
-/// `apply_implicit` (called after `integrate_velocities`): it integrates the
-/// spring — including the lever-arm torque it exerts at the anchors —
-/// implicitly, and is unconditionally stable. The explicit `apply` path feeds
-/// `r × F` straight into the angular dynamics, whose stability bound
-/// (`dt < 2·√(I_red/(k·r²))`) the stiff welds (k = 10⁶ N/m) violate on the
-/// foot's small tarsals/phalanges, exploding the assembly within a few frames.
+/// The spring is integrated by `apply_implicit` (called after
+/// `integrate_velocities`): it integrates the spring — including the
+/// lever-arm torque it exerts at the anchors — implicitly, and is
+/// unconditionally stable. (The old explicit path fed `r × F` straight into
+/// the angular dynamics, whose stability bound (`dt < 2·√(I_red/(k·r²))`)
+/// the stiff welds (k = 10⁶ N/m) violated on the foot's small
+/// tarsals/phalanges, exploding the assembly within a few frames.)
 ///
 /// Force on body B at its anchor: `F = -stiffness * (offset - rest_length * n_hat)`
 /// where `offset = pb - pa` is the world-space vector from anchor A to anchor B.
@@ -66,38 +66,11 @@ impl PositionalSpring {
         0.5 * self.stiffness * stretch_vec.norm_squared()
     }
 
-    pub fn apply(&self, bodies: &mut Vec<RigidBody>) {
-        let r_a = bodies[self.body_a].orientation * self.local_anchor_a;
-        let r_b = bodies[self.body_b].orientation * self.local_anchor_b;
-        let pa = bodies[self.body_a].position + r_a;
-        let pb = bodies[self.body_b].position + r_b;
-        let offset = pb - pa;
-
-        // Force on body B at its anchor (pulls toward A if separated past rest_length).
-        let force_on_b = if self.rest_length == 0.0 {
-            -self.stiffness * offset
-        } else {
-            let dist = offset.norm();
-            if dist < 1e-12 {
-                return;
-            }
-            let n = offset / dist;
-            -self.stiffness * (dist - self.rest_length) * n
-        };
-        let force_on_a = -force_on_b;
-
-        // Apply force at each anchor: linear force + lever-arm torque.
-        bodies[self.body_a].apply_force(force_on_a);
-        bodies[self.body_b].apply_force(force_on_b);
-        bodies[self.body_a].apply_torque(r_a.cross(&force_on_a));
-        bodies[self.body_b].apply_torque(r_b.cross(&force_on_b));
-    }
-
     /// Implicit (backward-Euler) spring update for the zero-rest-length case:
     /// directly modifies linear/angular velocities instead of routing an
     /// explicit force through the accumulator. Must be called once per substep,
-    /// after `integrate_velocities`. For non-zero `rest_length` it falls back
-    /// to the explicit `apply` (no project code uses non-zero rest_length on a
+    /// after `integrate_velocities`. The implicit path assumes zero rest
+    /// length (no project code sets a non-zero `rest_length` on a
     /// PositionalSpring; tendons are a separate primitive).
     ///
     /// With anchor offsets `r_a, r_b`, current anchor separation `d = pb − pa`,
@@ -109,10 +82,14 @@ impl PositionalSpring {
     /// because it integrates the lever-arm torque (via K's inertia terms)
     /// implicitly rather than as an explicit penalty.
     pub fn apply_implicit(&self, bodies: &mut Vec<RigidBody>, dt: f64) {
-        if self.rest_length != 0.0 {
-            self.apply(bodies);
-            return;
-        }
+        // The implicit formulation below assumes zero rest length (the
+        // restoring force is linear in the anchor offset). A non-zero
+        // rest_length would need the normalized-direction form, which no
+        // project code uses.
+        debug_assert!(
+            self.rest_length == 0.0,
+            "apply_implicit assumes zero rest_length; non-zero rest lengths are unsupported"
+        );
 
         let r_a = bodies[self.body_a].orientation * self.local_anchor_a;
         let r_b = bodies[self.body_b].orientation * self.local_anchor_b;

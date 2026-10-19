@@ -2,14 +2,11 @@
 name = "improper-football"
 version = "0.1.0"
 edition = "2021"
-default-run = "improper-football"
 
 [dependencies]
 bevy = { version = "0.14" }
 nalgebra = "0.33"
 physics = { path = "crates/physics" }
-ball = { path = "crates/ball" }
-player = { path = "crates/player" }
 
 [profile.dev]
 opt-level = 1
@@ -25,6 +22,4 @@ path = "src/lib.rs"
 members = [
     ".",
     "crates/physics",
-    "crates/ball",
-    "crates/player",
 ]

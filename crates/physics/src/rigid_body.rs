@@ -28,8 +28,6 @@ pub struct RigidBody {
     pub inv_inertia_tensor: Mat3,
     pub force_accumulator: Vec3,
     pub torque_accumulator: Vec3,
-    pub restitution: f64,
-    pub friction: f64,
     /// Optional capsule collision shape. When present, the world's
     /// ground-contact system applies penalty contact to this body.
     /// `None` means the body is not collidable against the ground
@@ -53,8 +51,6 @@ impl RigidBody {
             inv_inertia_tensor: inv_inertia,
             force_accumulator: Vec3::zeros(),
             torque_accumulator: Vec3::zeros(),
-            restitution: 0.6,
-            friction: 0.4,
             capsule_shape: None,
         }
     }

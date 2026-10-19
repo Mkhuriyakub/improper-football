@@ -26,7 +26,6 @@ use physics::angular_soft_limit::AngularSoftLimit;
 use physics::angular_pd_controller::AngularPDController;
 use physics::positional_spring::PositionalSpring;
 use physics::positional_damper::PositionalDamper;
-use physics::foot_contact::FootContact;
 use physics::torque_dispatcher::{DispatchRoute, TorqueDispatcher};
 use physics::inverse_dynamics::{IDJoint, InverseDynamics, SupportedBody};
 use physics::math::{Vec2, Vec3, convex_hull_2d, signed_distance_to_convex_polygon_2d,
