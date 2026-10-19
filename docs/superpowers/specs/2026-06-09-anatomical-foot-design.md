@@ -1,8 +1,33 @@
 # Anatomical foot — 26-bone high-fidelity design
 
-**Status:** Draft for review
+**Status:** Implemented, with outcome corrections (see addendum)
 **Date:** 2026-06-09
 **Supersedes:** the foot portion of `2026-05-18-anatomical-ankle-phase1-design.md` (single foot capsule + lumped forefoot are deleted)
+
+## Outcome addendum (2026-06 → 2026-07)
+
+The foot was built as designed (26 bodies, 21 articulated + 8 welded joints,
+per-bone ground contact). Three outcomes diverged from this spec and are the
+record of what was learned:
+
+1. **§5 test 1 ("static balance, no postural controller — the headline") was
+   re-scoped.** Diagnosis (`foot_rigid_balance_diag`) proved the layering:
+   the fully-RIGID assembly stands (so contact and load are fine), but the
+   bare ligamentous articulated foot slowly twists off its support through
+   the compliant subtalar/midfoot joints. Anatomically, weight-bearing arch
+   rigidity comes from the plantar fascia / windlass (Phase 3) and intrinsic
+   muscles (Phase 4) — neither in scope here. The shipped test asserts what
+   this phase actually achieves: the footprint bears full body weight over a
+   distributed manifold (`test_footprint_bears_full_weight`).
+2. **Ground contact had to become a multi-point SI manifold** (engine work
+   this spec didn't anticipate): independent per-endpoint contact collapsed
+   the footprint to one intermittent point. See the manifold commit and the
+   engine regression test.
+3. **Placement:** the plan's column-chaining placement was replaced during
+   integration by an explicit `REST_POS` coordinate table with a flattened
+   sole plane — documented in `src/anatomy/foot.rs`.
+4. **§5 tests 6–8 (inversion resistance, ROM clamping, talocrural passive
+   moment) are not yet implemented** — tracked as open validation work.
 
 ## 1. Context and motivation
 

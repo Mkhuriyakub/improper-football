@@ -1,7 +1,14 @@
 # Football Game Design Spec
 **Date:** 2026-04-17
 **Project:** improper-football
-**Status:** Approved
+**Status:** HISTORICAL — superseded (2026-04-26) by the engine-first direction
+
+> This is the original game-first plan. The project pivoted to building a
+> biomechanically-faithful human-motion physics engine first (see README);
+> the game-layer crates it describes were abandoned, and the tackle
+> milestone was explicitly dropped as premature. Kept as a record of the
+> starting point. Crate statuses and milestones below do NOT describe the
+> current repo.
 
 ---
 

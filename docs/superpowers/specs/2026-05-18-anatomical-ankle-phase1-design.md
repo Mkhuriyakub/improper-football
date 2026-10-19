@@ -1,5 +1,10 @@
 # Anatomical ankle — Phase 1: joint topology and passive structure
 
+> **SUPERSEDED (2026-06-09)** by `2026-06-09-anatomical-foot-design.md`:
+> the lumped foot/forefoot bodies and the 9-test rig described here were
+> replaced by the 26-bone foot and its validation suite. The talocrural
+> joint design and the honest-scoping note below carried forward.
+
 **Note on naming:** Phase 1 builds the **kinematic structure and passive constraints** of an anatomical ankle, plus placeholder PD actuators. "Fully functional" requires Phase 4 (Hill-type muscle model). The original framing "fully functional ankle in Phase 1" was wrong — corrected here.
 
 ---

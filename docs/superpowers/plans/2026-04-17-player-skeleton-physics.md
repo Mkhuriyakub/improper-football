@@ -1,5 +1,11 @@
 # Player Skeleton & Physics — Implementation Plan
 
+> **HISTORICAL — superseded (2026-04-26).** This plan belongs to the
+> abandoned game-first direction (see the 2026-04-17 football spec's
+> banner). The tackle sandbox was dropped; the physics work continued
+> engine-first with biomechanical joint primitives instead. Unchecked
+> boxes below are permanent — the plan was not completed and will not be.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Expand the `player` crate into a fully articulated 17-segment rigid body skeleton with PD joint control, balance correction, and a stride generator — culminating in a runnable tackle simulation sandbox.

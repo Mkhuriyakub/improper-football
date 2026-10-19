@@ -119,8 +119,10 @@ cargo run --release --bin balance_bilateral_demo  # shows the current limit of
 
 The project is built motion-by-motion in small verified increments, with a
 spec → plan → implementation → review cycle for each milestone
-(`docs/superpowers/specs/`, `docs/superpowers/plans/`). Two principles are
-enforced throughout:
+(`docs/superpowers/specs/`, `docs/superpowers/plans/`; superseded documents
+carry historical banners). The diagnosed-root-cause history lives in
+[`docs/findings.md`](docs/findings.md). Two principles are enforced
+throughout:
 
 - **Diagnose, don't tune.** When something fails, the root cause is isolated
   with a decisive experiment before anything is changed. Example: when the
