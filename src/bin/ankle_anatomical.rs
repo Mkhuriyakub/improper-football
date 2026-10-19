@@ -7,10 +7,10 @@
 
 use physics::xpbd::XpbdWorld;
 use physics::rigid_body::RigidBody;
-use physics::math::Vec3;
+use physics::math::{Vec3, swing_twist_angle};
 use nalgebra::UnitQuaternion;
 
-use improper_football::anatomy::foot::{self, FootHandles};
+use improper_football::anatomy::foot::{self, Bone, FootHandles};
 
 // ─── Simulation timing ────────────────────────────────────────────────
 
@@ -32,12 +32,10 @@ const STICK_RADIUS:  f64 = 0.08;
 
 struct Assembly {
     world: XpbdWorld,
-    #[allow(dead_code)]
     foot: FootHandles,
     #[allow(dead_code)]
     shin_idx: usize,
     stick_idx: usize,
-    #[allow(dead_code)]
     talocrural_pd_idx: usize,
 }
 
@@ -191,6 +189,138 @@ fn test_footprint_bears_full_weight() -> TestResult {
     }
 }
 
+/// Force-weighted centroid of all ground contacts (center of pressure).
+fn center_of_pressure(world: &XpbdWorld) -> Option<Vec3> {
+    let mut num = Vec3::zeros();
+    let mut den = 0.0;
+    for idx in 0..world.bodies.len() {
+        for e in world.engaged_endpoints(idx).iter().flatten() {
+            num += e.contact_point * e.normal_force;
+            den += e.normal_force;
+        }
+    }
+    if den > 1e-6 { Some(num / den) } else { None }
+}
+
+/// Joint angle as the PD controller itself measures it: swing-twist of the
+/// child-in-parent orientation (relative to the PD's baseline) about the
+/// PD's axis. Mirrors `AngularPDController::angle`.
+fn pd_joint_angle(world: &XpbdWorld, pd_idx: usize) -> f64 {
+    let pd = &world.angular_pd_controllers[pd_idx];
+    let q_b_in_a = world.bodies[pd.body_a].orientation.inverse()
+                 * world.bodies[pd.body_b].orientation;
+    let q_from_rest = q_b_in_a * pd.baseline.inverse();
+    swing_twist_angle(q_from_rest, pd.axis_local_a)
+}
+
+/// Center-of-pressure migration under a plantarflexion command.
+///
+/// Settles the full assembly to flat-foot stance, then commands the
+/// talocrural PD toward plantarflexion (positive target — verified
+/// empirically: positive raises the heel and shifts load forward) and
+/// checks that the CoP migrates anteriorly (world +z) by at least 5 mm
+/// while ground contact persists. Measured inside the short stable-stance
+/// window (settle 0.25 s, command 0.25 s) — sustained standing is a
+/// deferred milestone (see test_footprint_bears_full_weight's note).
+fn test_cop_migration() -> TestResult {
+    let mut a = build_world();
+    simulate(&mut a.world, 0.25, |_, _| {});
+
+    let cop0 = match center_of_pressure(&a.world) {
+        Some(c) => c,
+        None => return TestResult::fail("CoP migration",
+            "no ground contact after settling".into()),
+    };
+
+    // Gentle plantarflexion command (positive = PF, verified by probe:
+    // +0.2 rad raises the heel ~2 cm and shifts the CoP anteriorly).
+    a.world.angular_pd_controllers[a.talocrural_pd_idx].target_angle = 0.2;
+
+    let mut max_anterior_shift = f64::MIN;
+    simulate(&mut a.world, 0.25, |w, _| {
+        if let Some(c) = center_of_pressure(w) {
+            max_anterior_shift = max_anterior_shift.max(c.z - cop0.z);
+        }
+    });
+
+    if max_anterior_shift >= 0.005 {
+        TestResult::pass("CoP migration")
+    } else {
+        TestResult::fail("CoP migration", format!(
+            "CoP anterior shift {:.1} mm under plantarflexion command (expected >= 5 mm)",
+            max_anterior_shift * 1000.0))
+    }
+}
+
+/// Arch compression under body weight.
+///
+/// The medial longitudinal arch should flex slightly when loaded: the
+/// navicular (arch apex) drops a small, bounded amount. Zero drop would
+/// mean the arch isn't load-responsive; more than 2 cm would be collapse.
+///
+/// MEASURED FINDING: the drop is ~6 µm — positive and bounded (PASS by
+/// the stated criteria) but three orders of magnitude below the
+/// physiological navicular drop (~5 mm). The navicular IS in the load
+/// path (the forefoot bears ~107 N through the midfoot at the measured
+/// instant), but sagittal arch flexion is structurally near-rigid: the
+/// midfoot welds are rigid 3-axis locks, the articulated off-axes are
+/// locked to ±0.05 rad SI constraints, and neither articulated midfoot
+/// primary axis (talonavicular ≈ vertical, naviculocuneiform ≈ anterior)
+/// lowers the navicular when rotated. Physiological arch compliance would
+/// need sagittal midfoot DOFs — a Phase 3 (plantar fascia / windlass)
+/// design question, since adding the compliance without its stabilizers
+/// would worsen the known twist-collapse.
+fn test_arch_compression() -> TestResult {
+    let mut a = build_world();
+    let nav_idx = a.foot.body(Bone::Navicular);
+    let y0 = a.world.bodies[nav_idx].position.y;
+
+    simulate(&mut a.world, 0.30, |_, _| {});
+
+    let y1 = a.world.bodies[nav_idx].position.y;
+    let drop = y0 - y1;
+
+    if drop > 0.0 && drop < 0.02 {
+        TestResult::pass("arch compression")
+    } else {
+        TestResult::fail("arch compression", format!(
+            "navicular drop {:.2} mm under load (expected 0 < drop < 20 mm)",
+            drop * 1000.0))
+    }
+}
+
+/// MTP push-off: hallux MTP joint tracks a commanded dorsiflexion.
+///
+/// Foot-only world (no shin/stick load) — the bare foot is stable
+/// indefinitely, isolating the MTP joint's command tracking from the
+/// deferred full-load standing milestone. Commands +0.8 rad dorsiflexion
+/// (positive = toes up at this joint — verified empirically; within the
+/// DF ROM of 1.22) and checks the achieved angle, measured exactly as the
+/// PD measures it (baseline-aware swing-twist).
+fn test_mtp_pushoff() -> TestResult {
+    let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
+    let foot = foot::build_foot(&mut world, Vec3::new(0.0, 0.039, 0.0));
+
+    simulate(&mut world, 0.5, |_, _| {});
+
+    let pd_idx = foot.pd_by_child[Bone::HalluxPp as usize];
+    let target = 0.8;
+    world.angular_pd_controllers[pd_idx].target_angle = target;
+
+    simulate(&mut world, 1.0, |_, _| {});
+
+    let achieved = pd_joint_angle(&world, pd_idx);
+    let err = achieved - target;
+
+    if err.abs() <= 0.15 {
+        TestResult::pass("MTP push-off")
+    } else {
+        TestResult::fail("MTP push-off", format!(
+            "achieved {achieved:.3} rad vs target {target:.1} rad (err {err:+.3}, tolerance 0.15)"))
+    }
+}
+
 fn diagnose() {
     let mut a = build_world();
     let mut tprev = 0.0;
@@ -231,6 +361,9 @@ fn main() {
     let mut results = vec![];
     results.push(test_sustained_stability());
     results.push(test_footprint_bears_full_weight());
+    results.push(test_cop_migration());
+    results.push(test_arch_compression());
+    results.push(test_mtp_pushoff());
     for r in &results {
         println!("{}: {}", r.name, r.message);
     }
