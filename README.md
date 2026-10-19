@@ -16,12 +16,16 @@ football motion as the driving use case.
 **26-bone anatomical foot** (`src/anatomy/foot.rs`) — every tarsal,
 metatarsal, and phalanx is a distinct rigid body with literature-sourced
 dimensions and mass distribution (Zatsiorsky/de Leva segment data,
-osteometric bone studies). 21 articulated joints with anatomically-oblique
-axes — the subtalar joint uses Manter/Inman's 42°-inclination,
-23°-medial-deviation axis, the mechanism behind inversion ankle sprains —
-plus 8 stiff welds for the cadaver-confirmed minimal-motion midfoot joints.
-Data-driven construction: bone and joint parameter tables consumed by
-generic builders, no hand-placed magic numbers.
+osteometric bone studies). 21 articulated joints, anatomically axed —
+oblique where the literature says it matters: the subtalar joint uses
+Manter/Inman's 42°-inclination, 23°-medial-deviation axis (the mechanism
+behind inversion ankle sprains) and the Chopart pair carry their oblique
+axes; the remaining joints use their dominant anatomical plane — plus 8
+stiff welds for the cadaver-confirmed minimal-motion midfoot joints.
+Construction is data-driven: bone and joint parameter tables consumed by
+generic builders. Rest placement is an explicit, documented coordinate
+table (`REST_POS`), refined against geometry checkpoints rather than
+hand-tweaked in place.
 
 **Multi-point manifold ground contact** — ground contact is solved as
 simultaneous sequential-impulse non-penetration constraints across all
@@ -31,8 +35,11 @@ failure: independent per-point penalty contact collapsed a rigid foot's
 84 cm² footprint to one intermittent contact point (0.39 cm²), so bodies
 tipped over instead of standing. With the manifold, the same assembly
 stands at 2.3° tilt on 36 simultaneous contacts. The diagnostic that
-isolated this (`src/bin/foot_rigid_balance_diag.rs`) is kept as a standing
-acceptance gate.
+isolated this (`src/bin/foot_rigid_balance_diag.rs`) is kept and exits
+nonzero if the nominal rigid assembly ever stops standing; the CI-level
+regression gate for the manifold property is
+`manifold_keeps_resting_capsule_level_with_two_active_contacts` in the
+engine test suite.
 
 **Stiffness-safe integration** — explicit-Euler force application is
 unstable for stiff springs/dampers on small bodies (the foot's 2-gram
@@ -44,10 +51,12 @@ XPBD/SI constraints. The engine survived its hardest test to date: a
 bones) settling stably on the ground.
 
 **Biological constraints always** — every joint constrains every anatomical
-axis: primary axis with ROM soft-limits and passive stiffness/damping from
-published moment-angle data (Riener & Edrich 1999, Heng 2016), off-axes
-locked with physiological slop. Per-joint parameters are data, not
-engine-level constants — biological variance is the design.
+axis: primary axis with ROM soft-limits from clinical range-of-motion data,
+off-axes locked with physiological slop. Passive stiffness is sized from
+published moment-angle data where it exists (Riener & Edrich 1999 for the
+talocrural; Heng 2016 for the first MTP) and assigned by analogy elsewhere —
+only three foot joints have published curves. ROMs and gains are per-joint
+data, not engine-level constants — biological variance is the design.
 
 **Inverse dynamics** (`crates/physics/src/inverse_dynamics.rs`) — per-joint
 gravity feedforward G(q) computed each substep and fed to the PD
@@ -76,9 +85,11 @@ src/anatomy/             Reusable anatomical assemblies (data-driven)
 
 src/bin/                 Validation + visual binaries (one concern each)
   ankle_anatomical.rs    Foot+ankle validation suite (PASS/FAIL, CI-ready)
-  ankle_anatomical_demo.rs   Bevy visual companion
-  foot_rigid_balance_diag.rs Contact-model acceptance diagnostic
+  foot_rigid_balance_diag.rs Contact-model diagnostic (exits nonzero if the
+                         nominal rigid assembly stops standing)
   balance_*.rs, elbow_*.rs, ...  Incremental motion milestones
+  (a Bevy visual demo of the 26-bone foot is planned; the existing
+  ankle_anatomical_demo.rs still shows the superseded Phase-1 foot)
 ```
 
 Physics runs at 120 Hz frames × 60 substeps (sub-dt ≈ 139 µs). Rendering
@@ -95,12 +106,13 @@ cargo test -p improper-football --lib
 cargo run --release --bin ankle_anatomical
 cargo run --release --bin ankle_anatomical -- --diagnose   # support-polygon trace
 
-# Contact-model acceptance diagnostic (rigid assembly must stand)
+# Contact-model diagnostic (Case 1 must stand; exits nonzero otherwise)
 cargo run --release --bin foot_rigid_balance_diag
 
 # Visual demos (Bevy)
-cargo run --release --bin ankle_anatomical_demo
-cargo run --release --bin balance_bilateral_demo
+cargo run --release --bin full_body_demo          # whole-body milestone
+cargo run --release --bin balance_bilateral_demo  # shows the current limit of
+                                                  # PD-only bilateral balance
 ```
 
 ## Method
