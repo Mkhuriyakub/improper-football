@@ -1,5 +1,7 @@
 # improper-football
 
+![CI](https://github.com/Mkhuriyakub/improper-football/actions/workflows/ci.yml/badge.svg?branch=feature%2Frendering)
+
 A biomechanically-grounded human motion physics engine in Rust, built from
 first principles on an XPBD (extended position-based dynamics) substrate with
 sequential-impulse constraints, implicit integration for stiff components, and

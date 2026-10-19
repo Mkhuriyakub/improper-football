@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feature/rendering]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Bevy's Linux build dependencies (the root lib links Bevy for the
+      # render_util observer layer; the physics crate itself has none).
+      - name: System dependencies for Bevy
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Engine regression suite: contact behavior, small-body stability,
+      # energy boundedness, manifold multi-contact property.
+      - name: Engine regression tests
+        run: cargo test -p physics
+
+      # Anatomy module tests (26-bone foot: tables, placement, settle).
+      - name: Anatomy unit tests
+        run: cargo test -p improper-football --lib
+
+      # Biomechanical validation suite: builds the 28-body foot+ankle+load
+      # assembly and asserts stability, load-bearing footprint, CoP
+      # migration, arch response, and MTP tracking. Exits nonzero on any
+      # failure. Debug profile reuses the dep artifacts from the test
+      # steps; the simulation is deterministic, so profile doesn't matter.
+      - name: Foot + ankle validation suite
+        run: cargo run --bin ankle_anatomical
