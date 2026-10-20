@@ -228,9 +228,11 @@ impl XpbdWorld {
     /// Run one substep using the velocity-level (sequential impulse) solver.
     ///
     /// Order of operations:
-    ///   1. Apply external forces/torques (dampers, springs, soft limits, PD,
-    ///      tendons) into the accumulators.
+    ///   1. Apply external forces/torques (torque dispatchers, tendons) into
+    ///      the accumulators.
     ///   2. Integrate velocities from accumulated forces + gravity.
+    ///      (Springs, dampers, soft limits, and both PD terms are integrated
+    ///      implicitly after this step — see below.)
     ///   3. Solve constraints — multiple Gauss-Seidel iterations of impulse
     ///      application on the constraints. Modifies velocities only.
     ///   4. Integrate positions using the corrected velocities.
@@ -241,7 +243,6 @@ impl XpbdWorld {
     /// every substep (same as before the rewrite).
     pub fn substep(&mut self, sub_dt: f64) {
         self.last_sub_dt = sub_dt;
-        self.apply_pd_controllers();
         self.apply_torque_dispatchers();
         self.apply_tendons();
         self.integrate_velocities(sub_dt);
@@ -257,14 +258,27 @@ impl XpbdWorld {
         // the SI loop, with zero accumulated impulse — no separate reset
         // needed since it is rebuilt fresh every substep.
         self.generate_ground_manifold();
-        // Springs, soft-limits, and dampers applied implicitly AFTER the
-        // explicit velocity update — unconditionally stable for any
+        // Springs, soft-limits, dampers, and BOTH PD terms applied implicitly
+        // AFTER the explicit velocity update — unconditionally stable for any
         // stiffness/damping coefficient, fixing the explicit-Euler instability
         // that affected small-inertia bodies. Passive AngularSprings,
-        // AngularSoftLimits, AngularDampers, the KD-term of PD controllers, and
-        // the linear PositionalSprings/PositionalDampers are all integrated
-        // here. The PositionalSpring lever-arm torque in particular is the one
-        // that exploded the foot's small bones when applied explicitly.
+        // AngularSoftLimits, AngularDampers, the KP- and KD-terms of PD
+        // controllers, and the linear PositionalSprings/PositionalDampers are
+        // all integrated here. The PositionalSpring lever-arm torque is the
+        // one that exploded the foot's small bones when applied explicitly;
+        // the PD KP-term (2026-10) was the last stiff explicit term — on the
+        // foot's few-gram phalanges its per-substep kick pumped energy through
+        // the contact manifold and toppled/detonated otherwise-quiet
+        // assemblies.
+        // Order: stiffness terms first (PD KP, positional/angular springs,
+        // soft limits), dampers after — so every damper sees and dissipates
+        // the stiff terms' velocity impulses within the same substep. This
+        // mirrors the pre-2026-10 pipeline position of the (then explicit)
+        // PD KP kick, which fired in integrate_velocities ahead of all
+        // implicit damping; applying a stiff term after the dampers lets its
+        // velocity excursion reach the SI loop undamped on small-inertia
+        // bodies and detonates the foot's toe chains.
+        self.apply_pd_kp_implicit(sub_dt);
         self.apply_positional_springs_implicit(sub_dt);
         self.apply_springs_implicit(sub_dt);
         self.apply_soft_limits_implicit(sub_dt);
@@ -309,9 +323,9 @@ impl XpbdWorld {
         }
     }
 
-    fn apply_pd_controllers(&mut self) {
+    fn apply_pd_kp_implicit(&mut self, sub_dt: f64) {
         for ctrl in &self.angular_pd_controllers {
-            ctrl.apply(&mut self.bodies);
+            ctrl.apply_implicit_kp(&mut self.bodies, sub_dt);
         }
     }
 

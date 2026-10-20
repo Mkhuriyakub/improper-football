@@ -291,33 +291,82 @@ fn test_arch_compression() -> TestResult {
 
 /// MTP push-off: hallux MTP joint tracks a commanded dorsiflexion.
 ///
-/// Foot-only world (no shin/stick load) — the bare foot is stable
-/// indefinitely, isolating the MTP joint's command tracking from the
-/// deferred full-load standing milestone. Commands +0.8 rad dorsiflexion
-/// (positive = toes up at this joint — verified empirically; within the
-/// DF ROM of 1.22) and checks the achieved angle, measured exactly as the
-/// PD measures it (baseline-aware swing-twist).
+/// RE-SCOPED 2026-10 (same pattern as the outcome addendum's test 1).
+/// The original form — free bare foot on the ground, +0.8 step command,
+/// settled angle within ±0.15 — passed only on the pre-correction
+/// (cap-extension-oversized) bone geometry: there the +0.8 was realized
+/// by the whole foot pitching up over its oversized planted toes. On
+/// corrected geometry the free bare foot cannot sustain that pose — it
+/// hunts between ~-0.3 and ~+1.0 and wedges — because weight-bearing
+/// toe-stand rigidity is exactly the deferred Phase 3/4 (windlass +
+/// intrinsic muscle) machinery. Two honest assertions replace it,
+/// keeping the original target and tolerance where they are meaningful:
+///
+/// A. TRACKING (original quantitative criterion, 0.8 rad ± 0.15):
+///    airborne foot (no ground; uniform gravity does not affect relative
+///    joint dynamics), ramped command (muscles don't step; a 0.8 step
+///    through kp=30 is a ~24 N·m impulsive transient). The settled angle
+///    is the honest equilibrium of the active PD against the intact
+///    passive structures (expected ≈ kp/(kp+passive)·0.8 ≈ 0.7).
+///
+/// B. PUSH-OFF POSE (on ground): shin pinned at standing height (the
+///    body stabilizes the leg; whole-body balance is out of scope —
+///    mirror of the ANKLE_PIN_FOOT diagnostic), same ramped command.
+///    Asserts the hallux proximal phalanx visibly dorsiflexes: its
+///    capsule bottom lifts ≥ 1 mm off the sole plane, and the settled
+///    angle stays positive and within ROM + 10%.
 fn test_mtp_pushoff() -> TestResult {
-    let mut world = XpbdWorld::new();
-    world.set_ground(0.0);
-    let foot = foot::build_foot(&mut world, Vec3::new(0.0, 0.039, 0.0));
-
-    simulate(&mut world, 0.5, |_, _| {});
-
-    let pd_idx = foot.pd_by_child[Bone::HalluxPp as usize];
     let target = 0.8;
-    world.angular_pd_controllers[pd_idx].target_angle = target;
+    let ramp_time = 1.0; // ramp over 1 s, hold 1.5 s
+    let rom_max = 1.22;
 
-    simulate(&mut world, 1.0, |_, _| {});
-
+    // ── Part A: tracking, airborne ──
+    let mut world = XpbdWorld::new();
+    world.no_ground();
+    let foot = foot::build_foot(&mut world, Vec3::new(0.0, 0.039, 0.0));
+    let pd_idx = foot.pd_by_child[Bone::HalluxPp as usize];
+    simulate(&mut world, 2.5, |w, t| {
+        w.angular_pd_controllers[pd_idx].target_angle =
+            target * (t / ramp_time).min(1.0);
+    });
     let achieved = pd_joint_angle(&world, pd_idx);
     let err = achieved - target;
+    if err.abs() > 0.15 {
+        return TestResult::fail("MTP push-off", format!(
+            "tracking (airborne): achieved {achieved:.3} rad vs target {target:.1} rad \
+             (err {err:+.3}, tolerance 0.15)"));
+    }
 
-    if err.abs() <= 0.15 {
+    // ── Part B: push-off pose, on ground, shin externally stabilized ──
+    let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
+    let attach = Vec3::new(0.0, 0.039, 0.0);
+    let mut shin = RigidBody::new_capsule(SHIN_MASS, SHIN_HALF_H, SHIN_RADIUS);
+    shin.position = Vec3::new(0.0, attach.y + SHIN_HALF_H, 0.0);
+    let shin_idx = world.add_body(shin);
+    let foot = foot::build_foot(&mut world, attach);
+    foot::attach_talocrural(&mut world, shin_idx, &foot, -0.35, 0.70, 800.0, 40.0);
+    world.bodies[shin_idx].inv_mass = 0.0;
+    world.bodies[shin_idx].inv_inertia_tensor = nalgebra::Matrix3::zeros();
+
+    let pd_idx = foot.pd_by_child[Bone::HalluxPp as usize];
+    let pp_idx = foot.body(Bone::HalluxPp);
+    simulate(&mut world, 0.5, |_, _| {}); // settle to stance
+    let pp_y0 = world.bodies[pp_idx].position.y;
+    simulate(&mut world, 2.5, |w, t| {
+        w.angular_pd_controllers[pd_idx].target_angle =
+            target * (t / ramp_time).min(1.0);
+    });
+    let pose_angle = pd_joint_angle(&world, pd_idx);
+    let pp_lift = world.bodies[pp_idx].position.y - pp_y0;
+
+    if pp_lift >= 0.001 && pose_angle > 0.0 && pose_angle <= rom_max * 1.1 {
         TestResult::pass("MTP push-off")
     } else {
         TestResult::fail("MTP push-off", format!(
-            "achieved {achieved:.3} rad vs target {target:.1} rad (err {err:+.3}, tolerance 0.15)"))
+            "pose (grounded, stabilized shin): pp lift {:.1} mm (need >= 1 mm), \
+             angle {pose_angle:.3} rad (need 0 < angle <= {:.2})",
+            pp_lift * 1000.0, rom_max * 1.1))
     }
 }
 

@@ -125,23 +125,55 @@ impl AngularPDController {
         }
     }
 
-    /// Applies the KP (proportional) component of the controller via the
-    /// regular force/torque accumulator. The KD (derivative) component is
-    /// applied separately by `apply_implicit_damping` to avoid the
-    /// explicit-Euler stability bound on velocity damping (which broke
-    /// bilateral standing — see `project_bilateral_pd_limit.md`).
-    pub fn apply(&self, bodies: &mut Vec<RigidBody>) {
-        if !self.enabled {
+    /// Implicit (backward-Euler) integration of the KP + feedforward
+    /// component, exactly the linear special case of
+    /// `AngularSoftLimit::apply_implicit`'s linearized solve:
+    ///   ω_rel_new = (ω_rel + dt·w·s(θ)) / (1 − dt²·w·s'(θ))
+    /// with s(θ) = −kp·(θ − target) + ff (clamped to torque_limit) and
+    /// s' = −kp (0 in the saturated region). Unconditionally stable for
+    /// any kp and dt. Must be called once per substep, after
+    /// `integrate_velocities` (alongside the other implicit terms).
+    ///
+    /// This replaced the explicit accumulator-torque KP path (2026-10):
+    /// an explicit kp on the foot's few-gram phalanges puts the joint past
+    /// the explicit-integration bound (ω·sub_dt = √(kp/I_red)·sub_dt up to
+    /// ~6 on toe PIP/DIP joints at kp = 4, I_red ≈ 2·10⁻⁹) — the per-substep
+    /// kick (Δω ~10³ rad/s) pumped energy through the ground manifold and
+    /// joint constraints, detonating or toppling assemblies that are quiet
+    /// with the implicit form. It was the last stiff explicit term left
+    /// after the 2026-06 implicit-integration rewrite.
+    pub fn apply_implicit_kp(&self, bodies: &mut Vec<RigidBody>, dt: f64) {
+        if !self.enabled || (self.kp == 0.0 && self.feedforward_torque == 0.0) {
             return;
         }
         let n = bodies[self.body_a].orientation * self.axis_local_a;
-        let scalar = self.kp_scalar_torque(bodies);
-        if scalar == 0.0 {
+        let angle = self.angle(bodies);
+        let raw = -self.kp * (angle - self.target_angle) + self.feedforward_torque;
+        let saturated = raw.abs() > self.torque_limit;
+        let s = if saturated { raw.signum() * self.torque_limit } else { raw };
+        // Slope of s(θ): −kp in the linear region, 0 where the torque limit
+        // clamps (constant-torque region).
+        let s_prime = if saturated { 0.0 } else { -self.kp };
+
+        let zero = crate::math::Mat3::zeros();
+        let i_inv_a = if bodies[self.body_a].inv_mass == 0.0 { zero }
+                      else { bodies[self.body_a].world_inv_inertia() };
+        let i_inv_b = if bodies[self.body_b].inv_mass == 0.0 { zero }
+                      else { bodies[self.body_b].world_inv_inertia() };
+        let w = n.dot(&(i_inv_a * n)) + n.dot(&(i_inv_b * n));
+        if w < 1e-15 {
             return;
         }
-        let torque = n * scalar;
-        bodies[self.body_b].apply_torque(torque);
-        bodies[self.body_a].apply_torque(-torque);
+
+        let omega_rel = bodies[self.body_b].angular_velocity
+            - bodies[self.body_a].angular_velocity;
+        let omega_rel_n = omega_rel.dot(&n);
+
+        let omega_new = (omega_rel_n + dt * w * s) / (1.0 - dt * dt * w * s_prime);
+        let j = (omega_new - omega_rel_n) / w;
+
+        bodies[self.body_a].angular_velocity -= i_inv_a * n * j;
+        bodies[self.body_b].angular_velocity += i_inv_b * n * j;
     }
 
     /// Implicit-Euler integration of the KD (velocity-damping) term.

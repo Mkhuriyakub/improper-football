@@ -162,8 +162,9 @@ impl Commander {
                 // (nothing anchoring it; gravity-restoring torque < 1 N·m)
                 // is flipped by the hallux MTP's kp=30 at +0.3 and above
                 // even with the extra damping; +0.1 hallux / +0.4 lesser
-                // is stable. The loaded validation world (11 kg column)
-                // tracks the full +0.8 fine (test_mtp_pushoff).
+                // is stable. (test_mtp_pushoff asserts full +0.8 tracking
+                // airborne and lift-off under a stabilized shin — see its
+                // 2026-10 re-scope note.)
                 self.set(Bone::HalluxPp, 0.1);
                 for chain in LESSER_TOES {
                     self.set(chain[0], 0.4);
@@ -241,13 +242,18 @@ fn build_bare() -> Built {
 
     // Extra passive damping, host-side composition with the engine's
     // AngularDamper (as attach_talocrural and the balance demos do).
-    // Probed finding: on the UNLOADED 1 kg foot, commanding the strong
-    // PDs (hallux MTP kp=30, subtalar kp=50) against the ground manifold
-    // excites a slowly-growing oscillation that detonates the foot
-    // airborne within ~1-3 s — even AFTER the target has returned to 0
-    // (the ring keeps growing). The validated loaded world never shows
-    // this; its 11 kg column anchors the foot. The added joint damping
-    // drains the ring so the commanded scenarios can run bare.
+    // History: these were added because commanding the strong PDs (hallux
+    // MTP kp=30, subtalar kp=50) against the ground manifold excited a
+    // growing oscillation that detonated the unloaded foot within ~1-3 s.
+    // Root cause (diagnosed 2026-10, after the bone-geometry correction
+    // made it much worse): the PD proportional term was the engine's last
+    // stiff EXPLICIT term — its per-substep velocity kick on the few-gram
+    // toe bones pumped energy through the contact manifold. The KP term is
+    // now integrated implicitly (AngularPDController::apply_implicit_kp)
+    // and the detonation is gone, but the extra damping is kept: probed on
+    // the corrected geometry, the undamped bare foot still shows bounded
+    // 20-30 deg tilt excursions (recovering pops), while with these
+    // dampers it stands at ~2 deg with only millimeter-scale toe jitter.
     let subtalar_axis = foot::anat_to_world(foot::subtalar_axis_anat());
     world.angular_dampers.push(physics::angular_damper::AngularDamper::new(
         foot.body(Bone::Talus), foot.body(Bone::Calcaneus), subtalar_axis, 3.0));
@@ -789,9 +795,219 @@ fn probe() {
     }
 }
 
+// ─── Toe-5 jitter probe (--probe-toe5): headless neutral stance ─────────
+//
+// Quantifies the pinky-toe jitter reported from visual inspection. Probes
+// SIX configurations (the demo world is not the module world, and zeroing
+// kp while keeping kd isolates the PD proportional term — the diagnosed
+// energy pump — from the PD's load-bearing implicit damping):
+//   1/2. the demo's build_bare() (bare-mode extra AngularDampers — what the
+//        user actually saw), as-is and with foot PD kp zeroed;
+//   3/4. raw build_foot() alone (no host dampers), as-is and kp-zeroed;
+//   5/6. the loaded world (shin + talocrural + stick), as-is and kp-zeroed.
+// All start at resting contact height (attach y=0.039, like the demo; the
+// settle-test 6 cm drop lands the foot on its side and is useless here).
+// No commands. 1 s settle, then 5 s measured. Contact activity is sampled
+// PER SUBSTEP (contact chatter at the manifold boundary lives below frame
+// rate); kinematics are sampled per frame.
+//
+// Also prints the rest-pose joint-gap audit (center distance vs summed
+// capsule extents for every JOINTS pair) used by the Issue-1 geometry check.
+
+fn probe_toe5() {
+    // ── Joint-gap audit at rest (geometry only, config-independent) ──
+    {
+        let mut world = XpbdWorld::new();
+        world.set_ground(0.0);
+        let foot = foot::build_foot(&mut world, NaVec3::new(0.0, 0.039, 0.0));
+        println!("── rest-pose joint-gap audit (gap = center distance − summed capsule extents) ──");
+        let mut worst: (f64, &str, &str) = (f64::MIN, "", "");
+        for spec in JOINTS.iter() {
+            let p = &BONES[spec.parent as usize];
+            let c = &BONES[spec.child as usize];
+            let d = (world.bodies[foot.body(spec.parent)].position
+                - world.bodies[foot.body(spec.child)].position).norm();
+            let extents = (p.half_h + p.radius) + (c.half_h + c.radius);
+            let gap = d - extents;
+            if gap > worst.0 { worst = (gap, p.name, c.name); }
+            let flag = if gap > 0.008 { "  <-- GAP > 8 mm" } else { "" };
+            println!("  {:>14} - {:<14} d={:.4} extents={:.4} gap={:+.4}{}",
+                p.name, c.name, d, extents, gap, flag);
+        }
+        println!("  worst gap: {:+.4} m ({} - {})\n", worst.0, worst.1, worst.2);
+    }
+
+    const PROBE_BONES: [(Bone, &str); 8] = [
+        (Bone::Toe5Pp, "toe5_pp"), (Bone::Toe5Mp, "toe5_mp"), (Bone::Toe5Dp, "toe5_dp"),
+        (Bone::Toe4Pp, "toe4_pp"), (Bone::Toe4Mp, "toe4_mp"), (Bone::Toe4Dp, "toe4_dp"),
+        (Bone::HalluxPp, "hallux_pp"), (Bone::HalluxDp, "hallux_dp"),
+    ];
+    const NPROBE: usize = 8;
+
+    #[derive(Clone, Copy)]
+    struct Stat {
+        max_v: f64, sum_v: f64,       // linear speed (per frame)
+        max_w: f64, sum_w: f64,       // angular speed (per frame)
+        ymin: f64, ymax: f64,         // center y (per frame)
+        contact_substeps: u64,        // substeps with active contact
+        toggles: u64,                 // substep-level contact on/off flips
+        last_contact: bool,
+        vy_flips: u64,                // substep-level vy sign changes (osc freq)
+        last_vy_sign: i8,
+        n_substeps: u64,
+    }
+    impl Stat {
+        fn new() -> Self {
+            Stat { max_v: 0.0, sum_v: 0.0, max_w: 0.0, sum_w: 0.0,
+                   ymin: f64::MAX, ymax: f64::MIN, contact_substeps: 0,
+                   toggles: 0, last_contact: false, vy_flips: 0,
+                   last_vy_sign: 0, n_substeps: 0 }
+        }
+    }
+
+    let secs_total = std::env::var("FOOT_PROBE_TOE5_SECS")
+        .ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(5.0);
+
+    // zero_pd zeroes ONLY the explicit proportional gain kp. The PD's kd is
+    // integrated implicitly (unconditionally stable) and is part of the
+    // assembly's load-bearing damping — zeroing it too detonates the raw
+    // world outright and discriminates nothing.
+    // Config: 0 = demo world (build_bare), 1 = raw build_foot, 2 = loaded
+    // (ankle_anatomical's world: shin + talocrural + 7 kg stick).
+    for (label, cfg, zero_pd) in [
+        ("DEMO world (build_bare, with bare-mode extra dampers)", 0, false),
+        ("DEMO world with all foot PD kp zeroed (kd kept)", 0, true),
+        ("RAW module world (build_foot alone, no extra dampers)", 1, false),
+        ("RAW module world with all foot PD kp zeroed (kd kept)", 1, true),
+        ("LOADED world (shin + talocrural + stick)", 2, false),
+        ("LOADED world with all FOOT PD kp zeroed (talocrural kept)", 2, true),
+    ] {
+        let (mut world, foot) = match cfg {
+            1 => {
+                let mut w = XpbdWorld::new();
+                w.set_ground(0.0);
+                let f = foot::build_foot(&mut w, NaVec3::new(0.0, 0.039, 0.0));
+                (w, f)
+            }
+            2 => {
+                let Built { world, foot, .. } = build_loaded();
+                (world, foot)
+            }
+            _ => {
+                let Built { world, foot, .. } = build_bare();
+                (world, foot)
+            }
+        };
+        if zero_pd {
+            // Zero only the FOOT joints' kp (via pd_by_child); in the loaded
+            // config the talocrural PD stays, since it balances the column.
+            for &pd_idx in foot.pd_by_child.iter() {
+                if pd_idx != usize::MAX {
+                    world.angular_pd_controllers[pd_idx].kp = 0.0;
+                }
+            }
+        }
+        println!("── {} ──", label);
+        let calc_baseline = world.bodies[foot.body(Bone::Calcaneus)].orientation;
+
+        // 1 s settle, no commands.
+        for _ in 0..120 {
+            for _ in 0..SOLVER_ITERATIONS { world.substep(SUB_DT); }
+        }
+
+        // Measured window (default 5 s), no commands.
+        let frames = (secs_total / DT).round() as usize;
+        let mut st = [Stat::new(); NPROBE];
+        // Per-0.5s window: whole-foot pose + toe5 chain transient character
+        // (persistent limit cycle vs single pop vs decay).
+        let mut win_vmax = [0.0_f64; 3];     // toe5 pp/mp/dp
+        let mut win_wmax = [0.0_f64; 3];
+        let mut win_toggles = [0_u64; 3];
+        let mut win_prev_toggles = [0_u64; 3];
+        println!("  t(s)  calc-tilt  contacts | toe5 pp/mp/dp window v_max (m/s) | w_max (rad/s) | toggles | toe4_pp y(mm)");
+        for (k, &(b, _)) in PROBE_BONES.iter().enumerate() {
+            st[k].last_contact = world.is_in_contact(foot.body(b));
+        }
+        for frame in 0..frames {
+            for _ in 0..SOLVER_ITERATIONS {
+                world.substep(SUB_DT);
+                for (k, &(b, _)) in PROBE_BONES.iter().enumerate() {
+                    let idx = foot.body(b);
+                    let s = &mut st[k];
+                    let active = world.is_in_contact(idx);
+                    if active != s.last_contact { s.toggles += 1; s.last_contact = active; }
+                    if active { s.contact_substeps += 1; }
+                    let vy = world.bodies[idx].linear_velocity.y;
+                    let sign = if vy > 1e-6 { 1 } else if vy < -1e-6 { -1 } else { 0 };
+                    if sign != 0 {
+                        if s.last_vy_sign != 0 && sign != s.last_vy_sign { s.vy_flips += 1; }
+                        s.last_vy_sign = sign;
+                    }
+                    s.n_substeps += 1;
+                }
+                // Window-resolved toe5 kinematics (substep-sampled so spikes
+                // shorter than a frame aren't aliased away).
+                for k in 0..3 {
+                    let body = &world.bodies[foot.body(PROBE_BONES[k].0)];
+                    win_vmax[k] = win_vmax[k].max(body.linear_velocity.norm());
+                    win_wmax[k] = win_wmax[k].max(body.angular_velocity.norm());
+                }
+            }
+            for (k, &(b, _)) in PROBE_BONES.iter().enumerate() {
+                let body = &world.bodies[foot.body(b)];
+                let v = body.linear_velocity.norm();
+                let w = body.angular_velocity.norm();
+                let s = &mut st[k];
+                s.max_v = s.max_v.max(v); s.sum_v += v;
+                s.max_w = s.max_w.max(w); s.sum_w += w;
+                s.ymin = s.ymin.min(body.position.y);
+                s.ymax = s.ymax.max(body.position.y);
+            }
+            if (frame + 1) % 60 == 0 {
+                let calc = &world.bodies[foot.body(Bone::Calcaneus)];
+                let tilt = (calc_baseline.inverse() * calc.orientation)
+                    .scaled_axis().norm().to_degrees();
+                let mut n_contacts = 0;
+                for i in 0..BONE_COUNT {
+                    n_contacts += world.engaged_endpoints(foot.bodies[i])
+                        .iter().flatten().count();
+                }
+                for k in 0..3 { win_toggles[k] = st[k].toggles - win_prev_toggles[k]; }
+                println!("  {:4.1}  {:8.1}°  {:8} | {:8.4} {:8.4} {:8.4}       | {:6.2} {:6.2} {:6.2} | {:4} {:4} {:4} | {:8.2}",
+                    (frame + 1) as f64 * DT, tilt, n_contacts,
+                    win_vmax[0], win_vmax[1], win_vmax[2],
+                    win_wmax[0], win_wmax[1], win_wmax[2],
+                    win_toggles[0], win_toggles[1], win_toggles[2],
+                    world.bodies[foot.body(Bone::Toe4Pp)].position.y * 1000.0);
+                win_vmax = [0.0; 3];
+                win_wmax = [0.0; 3];
+                for k in 0..3 { win_prev_toggles[k] = st[k].toggles; }
+            }
+        }
+        let secs = frames as f64 * DT;
+        println!("  bone     | v_mean    v_max    (m/s) | w_mean   w_max  (rad/s) | y range (mm)      | contact duty | toggles/s | vy-flip freq (Hz)");
+        for (k, &(_, name)) in PROBE_BONES.iter().enumerate() {
+            let s = &st[k];
+            println!("  {:<8} | {:9.5} {:9.5}    | {:7.3} {:8.3}       | [{:7.3},{:7.3}] | {:6.1}%      | {:8.1}  | {:8.1}",
+                name,
+                s.sum_v / frames as f64, s.max_v,
+                s.sum_w / frames as f64, s.max_w,
+                s.ymin * 1000.0, s.ymax * 1000.0,
+                100.0 * s.contact_substeps as f64 / s.n_substeps as f64,
+                s.toggles as f64 / secs,
+                s.vy_flips as f64 / (2.0 * secs));
+        }
+        println!();
+    }
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────
 
 fn main() {
+    if std::env::args().any(|a| a == "--probe-toe5") {
+        probe_toe5();
+        return;
+    }
     if std::env::args().any(|a| a == "--probe") {
         probe();
         return;

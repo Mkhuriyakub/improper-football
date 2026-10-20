@@ -120,3 +120,26 @@ surface-contact joint spacing. A rest-pose joint-gap audit (center distance
 vs summed capsule extents, per JOINTS pair) now prints in the demo's
 `--probe-toe5` mode.
 
+## 2026-10 — The explicit PD proportional term was the last energy pump
+
+The pinky-toe "spasm" seen in the demo was diagnosed by probe
+(`foot_anatomical_demo --probe-toe5`): with PD kp zeroed (kd kept) the toe
+chains are kinematically quiet (ω ≤ 0.5 rad/s, sub-0.03 mm motion); with
+kp active they limit-cycle, and on the corrected (smaller) bone inertias
+the pump grew categorical — the undamped bare foot toppled in <0.5 s and
+the loaded world's toe chains detonated. Root cause: the 2026-06 implicit
+rewrite moved every stiff term to backward-Euler velocity solves EXCEPT
+the PD proportional term, which still fired a per-substep explicit kick
+(Δω = kp·err·dt/I ≈ 10³ rad/s on 10⁻⁹–10⁻⁶ kg·m² toe inertias; the shared
+c = 1.0 dampers that contained it are ~90× supracritical for a toe and
+rectified the kick into wrong-direction drift through the Baumgarte
+anchors). Fix: `AngularPDController::apply_implicit_kp` — the same
+linearized backward-Euler solve as `AngularSoftLimit`, applied BEFORE the
+dampers so they dissipate its impulse within the same substep (ordering
+matters: applied after the dampers, the undamped excursion reaches the SI
+loop and detonates). Residual toe jitter with the demo's extra dampers is
+millimeter-scale and bounded. Knock-on: the MTP push-off test's original
+pass had depended on the oversized geometry (the free foot pitching over
+fat toes); it is re-scoped to airborne tracking (original 0.8 ± 0.15
+criterion) plus grounded lift-off under a stabilized shin — holding a
+free-standing toe-stand awaits the Phase 3/4 arch stabilizers.
