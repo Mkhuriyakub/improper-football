@@ -240,6 +240,18 @@ fn build_bare() -> Built {
     world.set_ground(0.0);
     let foot = foot::build_foot(&mut world, NaVec3::new(0.0, 0.039, 0.0));
 
+    // Stance boundary condition: anchor the talus. A bare foot with no leg
+    // has nothing commanding its absolute orientation — the joints control
+    // RELATIVE angles only, so the hindfoot block slowly rolls about the
+    // heel contact into a sprawled rest (observed: talus slumps off the
+    // calcaneus over ~4 s; ground Fn reads one talus-weight short while it
+    // moves). In a real neutral stance the tibia holds the talus. Pinning
+    // it reproduces that boundary condition, exactly as the validation
+    // suite's pinned-shin MTP test does.
+    let talus_idx = foot.body(Bone::Talus);
+    world.bodies[talus_idx].inv_mass = 0.0;
+    world.bodies[talus_idx].inv_inertia_tensor = nalgebra::Matrix3::zeros();
+
     // Extra passive damping, host-side composition with the engine's
     // AngularDamper (as attach_talocrural and the balance demos do).
     // History: these were added because commanding the strong PDs (hallux
@@ -480,8 +492,8 @@ fn setup(
         // Close anterior-lateral three-quarter view: the foot is only ~25 cm
         // long, so the camera sits near enough that it fills the frame for
         // the README capture.
-        Mode::Bare => Transform::from_xyz(0.28, 0.17, 0.33)
-            .looking_at(Vec3::new(0.0, 0.03, 0.07), Vec3::Y),
+        Mode::Bare => Transform::from_xyz(0.20, 0.13, 0.24)
+            .looking_at(Vec3::new(0.0, 0.03, 0.08), Vec3::Y),
         Mode::Loaded => Transform::from_xyz(1.1, 0.85, 1.3)
             .looking_at(Vec3::new(0.0, 0.45, 0.0), Vec3::Y),
     };
@@ -695,6 +707,7 @@ fn update_readout(sim: Res<Sim>, mut q: Query<&mut Text, With<Readout>>) {
             };
             format!(
                 "26-bone anatomical foot | manifold ground contact\n\
+                 talus anchored (stance boundary condition: the tibia's hold)\n\
                  scenario: {}\n\
                  sim time: {:.1} s\n\
                  contacts: {}   total Fn: {:.1} N",
