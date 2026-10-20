@@ -472,12 +472,18 @@ fn angular_soft_limit_clamps_beyond_rom() {
 /// A small chain of capsules joined by stiff constraints, released under
 /// gravity onto the ground, must not *gain* mechanical energy as it settles.
 ///
-/// NOTE: this engine has a documented XPBD energy artifact (~0.024 J/s
-/// injection from the constraint solver — see memory
-/// `project_engine_energy_artifact`). So we assert energy growth is BOUNDED,
-/// not exactly conserved: total energy at t = 3 s must not exceed the start
-/// energy by more than 0.2 J (≈ 8× the documented 0.024 J/s × 3 s artifact
-/// budget, leaving headroom; a real instability would blow far past this).
+/// HISTORY: the bound here was originally 0.2 J, budgeted against a
+/// "~0.024 J/s constraint-solver injection" measured in 2026-04 on the OLD
+/// engine scheme (textbook XPBD position projection with `v += dx/dt`
+/// velocity feedback). That scheme — and with it the injection — was removed
+/// by the 2026-06 velocity-level SI rewrite. The 2026-10-19 Baumgarte
+/// energy-attribution sweep (docs/findings.md) re-measured this exact scene
+/// at β ∈ {0.2, 0.02, 0.002}: net DISSIPATION of ~0.150 J over 3 s at every
+/// β, steady-tail rate ≈ −5.6e-5 J/s, and peak energy never exceeding the
+/// release energy at all. The bound is tightened accordingly: 1 mJ of
+/// headroom (~18× the |tail-rate| × 3 s scale) instead of 0.2 J. Never
+/// loosen this bound — a regression that needs more than 1 mJ of growth here
+/// is a real injector.
 #[test]
 fn settling_chain_does_not_gain_energy() {
     let mut world = XpbdWorld::new();
@@ -515,11 +521,13 @@ fn settling_chain_does_not_gain_energy() {
         assert!(finite(world.bodies[i].position), "chain went non-finite");
     }
     let e_end = total_mechanical_energy(&world);
-    // Energy must not GROW beyond the documented-artifact budget. A genuine
-    // explicit-Euler instability would push e_end orders of magnitude higher.
+    // Energy must not GROW. Measured behavior (2026-10-19): e_end ≈
+    // e_start − 0.150 J, so the 1 mJ headroom is ~150× the distance from the
+    // measured value to the bound's physical meaning of "conserved".
     assert!(
-        e_end < e_start + 0.2,
-        "chain gained energy: start {e_start} J → end {e_end} J (Δ {} J > 0.2 J budget)",
+        e_end < e_start + 0.001,
+        "chain gained energy: start {e_start} J → end {e_end} J (Δ {} J > 1 mJ budget — \
+         the engine has no known injector; see docs/findings.md 2026-10-19)",
         e_end - e_start
     );
 }

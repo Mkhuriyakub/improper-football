@@ -17,7 +17,28 @@ pub struct PositionalConstraint {
     pub local_anchor_b: Vec3,
     pub rest_length: f64,
     pub compliance: f64,
-    /// Baumgarte position-error feedback coefficient.
+    /// Baumgarte position-error feedback coefficient, applied per SUBSTEP
+    /// (β/sub_dt ≈ 1440/s at sub_dt = 1/7200). Unlike `ContactConstraint`
+    /// (which rescaled its β to 0.002 — see its doc), this aggressive rate is
+    /// correct for BILATERAL joints and was kept deliberately after a
+    /// measured sweep (2026-10-19, β ∈ {0.2, 0.02, 0.002} over a settling
+    /// chain, the 26-bone foot, and a 5 mm-assembly-error chain —
+    /// docs/findings.md):
+    /// - Energy does not track β: tail rates were identical across the sweep
+    ///   (chain ≈ −5.6e-5 J/s net dissipation at every β). The bias velocity
+    ///   a bilateral constraint grants on the way in is reclaimed by the same
+    ///   constraint on the way out (overshoot is pulled back, not released),
+    ///   so no steady injection exists — contact's launch failure mode is a
+    ///   UNILATERAL artifact (separation deactivates the constraint before
+    ///   the energy is reclaimed) and does not transfer here.
+    /// - Constraint quality DOES track β: anchor separation scaled inversely
+    ///   (chain 4.6e-8 m at 0.2 → 4.7e-6 m at 0.002; foot welds 1.1e-4 m →
+    ///   9.6e-3 m, where the assembly went spongy and ejected a bone at
+    ///   6.5 m/s). β = 0.2 dominated every scene.
+    /// - A 5 mm assembly error does NOT launch: measured peak 2.06 m/s and a
+    ///   +0.41 J transient, fully reabsorbed within ~20 substeps (~3 ms). No
+    ///   bias clamp is needed; still, assemble joints with coincident anchors
+    ///   (zero preload) as `src/anatomy/foot.rs::anchor_at` does.
     pub baumgarte: f64,
 }
 
@@ -33,6 +54,9 @@ impl PositionalConstraint {
             baumgarte: 0.2,
         }
     }
+
+    /// Override the Baumgarte position-feedback coefficient (per substep).
+    pub fn with_baumgarte(mut self, b: f64) -> Self { self.baumgarte = b; self }
 
     pub fn solve(&mut self, bodies: &mut Vec<RigidBody>, dt: f64) {
         // Solve each world axis independently. Convergence to the full

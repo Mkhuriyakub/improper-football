@@ -16,6 +16,17 @@ pub struct AngularLimitConstraint {
     pub min_angle: f64,
     pub max_angle: f64,
     pub compliance: f64,
+    /// Baumgarte position-error feedback coefficient, applied per SUBSTEP
+    /// (β/sub_dt ≈ 1440/s at sub_dt = 1/7200). Kept at the aggressive 0.2 —
+    /// NOT rescaled the way `ContactConstraint` rescaled its β to 0.002 —
+    /// on measured evidence (2026-10-19 sweep, docs/findings.md): energy is
+    /// β-independent (bilateral bias velocity is reclaimed as the error
+    /// closes; the contact launch artifact is unilateral-only), while lock
+    /// rigidity tracks β directly. The 26-bone foot's welds ([0,0]-range
+    /// locks) held to 2.4e-3 rad at β = 0.2 but degraded to 0.12–0.17 rad at
+    /// β = 0.002 — the feedback is what holds welded orientations against
+    /// sustained gravity load, so lowering β makes assemblies spongy without
+    /// buying any energy improvement.
     pub baumgarte: f64,
 }
 
@@ -31,6 +42,9 @@ impl AngularLimitConstraint {
             baumgarte: 0.2,
         }
     }
+
+    /// Override the Baumgarte position-feedback coefficient (per substep).
+    pub fn with_baumgarte(mut self, b: f64) -> Self { self.baumgarte = b; self }
 
     pub fn solve(&mut self, bodies: &mut Vec<RigidBody>, dt: f64) {
         // Constraint axis in world frame (follows body_a's orientation).

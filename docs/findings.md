@@ -168,3 +168,57 @@ kp/(kp+K)·target at toe scale, and command flips barely move through the
 ~90×-supracritical shared c = 1.0 dampers. A known, documented bias — to be
 removed by a combined coaxial-stiffness solve (all same-axis stiff terms in
 one linearized solve) when Phase 3 needs accurate toe tracking.
+
+## 2026-10-19 — Joint Baumgarte β = 0.2 acquitted; the May 0.024 J/s artifact is gone
+
+An engine review flagged the joint constraints' unscaled per-substep
+Baumgarte (β = 0.2 at sub_dt = 1/7200 → ~1440/s feedback, vs contact's
+deliberately rescaled ~12/s) as a classic energy injector and the prime
+suspect for the May "~0.024 J/s solver injection" accepted back then as a
+known limitation. A three-scene sweep (β ∈ {0.2, 0.02, 0.002} on BOTH joint
+constraint types together; energy = ΣKE + gravitational PE per frame;
+constraint quality = max anchor separation + max angular-lock violation)
+measured the opposite of the prediction:
+
+| scene | β | tail rate (J/s) | peak \|v\| (m/s) | max anchor sep (m) | max ang viol (rad) |
+|---|---|---|---|---|---|
+| settling chain (6 s, tail 2 s) | 0.2 | −5.6e-5 | 0.98 | 4.6e-8 | 0 |
+| | 0.02 | −5.6e-5 | 0.98 | 4.5e-7 | 0 |
+| | 0.002 | −5.8e-5 | 0.98 | 4.7e-6 | 0 |
+| 26-bone foot settle (4 s, tail 1 s) | 0.2 | +1.5e-3 | 0.57 | 1.1e-4 | 2.4e-3 |
+| | 0.02 | +1.8e-3 | 0.57 | 4.8e-4 | 8.9e-3 |
+| | 0.002 | +1.6e-3 | **6.50** | **9.6e-3** | **1.2e-1** |
+| chain + 5 mm anchor error (6 s, tail 2 s) | 0.2 | −4.4e-6 | 0.90 | 1.3e-8 | 0 |
+| | 0.02 | −1.4e-5 | 0.98 | 2.6e-6 | 0 |
+| | 0.002 | −5.2e-6 | 0.98 | 4.1e-6 | 0 |
+
+Three findings. (1) **Energy does not track β** — the predicted injection
+does not exist. The reason is structural: a BILATERAL constraint reclaims
+its own bias velocity. The Baumgarte bias accelerates the bodies toward
+closure, but the next substeps' solves command progressively smaller biases
+and decelerate them again — the transient energy is pulled back out by the
+same constraint. Contact's documented launch failure (the reason IT runs
+β = 0.002) is a UNILATERAL artifact: a launched body separates, the
+constraint deactivates, and the bias energy escapes before being reclaimed.
+The 5 mm-assembly-error scene showed the mechanism directly: the predicted
+"1440/s × 5 mm = 7.2 m/s one-substep launch" measured as a 2.06 m/s,
++0.41 J transient decaying geometrically (~0.8×/substep) and fully
+reabsorbed within ~20 substeps (3 ms) — no clamp needed (zero-preload
+assembly, as `foot.rs::anchor_at` guarantees, remains good practice).
+(2) **Constraint quality tracks β directly** — β = 0.2 dominates every
+scene. Lowering β starves the foot's [0,0]-range weld locks of the position
+feedback that holds them against sustained gravity load: at β = 0.002 the
+welds gape 9.6 mm / 0.12 rad, the assembly goes spongy, and a bone is
+ejected at 6.5 m/s. Defaults stay 0.2; both constraints gained a
+`with_baumgarte` builder for future experiments. (3) **The May artifact is
+resolved as HISTORICAL**: the 0.024 J/s was measured (elbow-pendulum rigs,
+2026-04) on the old textbook-XPBD scheme — position projection plus
+`v += dx/dt` velocity feedback, where each correction deposits ½m(dv)² that
+nothing reclaims. The 2026-06 velocity-level SI rewrite removed that scheme,
+and with it the injection: the same settling-chain scene now NET-DISSIPATES
+0.150 J over 3 s with a −5.6e-5 J/s steady tail at every β, and its
+regression bound is tightened from +0.2 J to +1 mJ. The foot scene's small
+positive tail (+1.5e-3 J/s at 4 s) is not a solver injection either: over a
+10 s run its energy is flat from t = 1 s to t = 8 s (+1.3e-4 J/s) with
+episodic bumps from the documented bare-foot structural twist (PD and
+ROM-limit events), and it does not track β.
