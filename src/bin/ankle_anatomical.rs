@@ -7,7 +7,7 @@
 
 use physics::xpbd::XpbdWorld;
 use physics::rigid_body::RigidBody;
-use physics::math::{Vec3, swing_twist_angle};
+use physics::math::Vec3;
 use nalgebra::UnitQuaternion;
 
 use improper_football::anatomy::foot::{self, Bone, FootHandles};
@@ -36,7 +36,7 @@ struct Assembly {
     #[allow(dead_code)]
     shin_idx: usize,
     stick_idx: usize,
-    talocrural_pd_idx: usize,
+    talocrural_ja_idx: usize,
 }
 
 fn build_world() -> Assembly {
@@ -71,7 +71,7 @@ fn build_world() -> Assembly {
     }
 
     // Talocrural joint shin↔talus (baseline-aware; DF 20°/PF 40°).
-    let talocrural_pd_idx = foot::attach_talocrural(
+    let talocrural_ja_idx = foot::attach_talocrural(
         &mut world, shin_idx, &foot, -0.35, 0.70, 800.0, 40.0);
 
     // Load stick welded to the shin top (both identity-oriented, so the
@@ -85,7 +85,7 @@ fn build_world() -> Assembly {
     let anchor_stick = foot::anchor_at(&world, stick_idx, weld_pt);
     foot::weld(&mut world, shin_idx, stick_idx, anchor_shin, anchor_stick);
 
-    Assembly { world, foot, shin_idx, stick_idx, talocrural_pd_idx }
+    Assembly { world, foot, shin_idx, stick_idx, talocrural_ja_idx }
 }
 
 // ─── Test framework ───────────────────────────────────────────────────
@@ -201,15 +201,11 @@ fn center_of_pressure(world: &XpbdWorld) -> Option<Vec3> {
     if den > 1e-6 { Some(num / den) } else { None }
 }
 
-/// Joint angle as the PD controller itself measures it: swing-twist of the
-/// child-in-parent orientation (relative to the PD's baseline) about the
-/// PD's axis. Mirrors `AngularPDController::angle`.
-fn pd_joint_angle(world: &XpbdWorld, pd_idx: usize) -> f64 {
-    let pd = &world.angular_pd_controllers[pd_idx];
-    let q_b_in_a = world.bodies[pd.body_a].orientation.inverse()
-                 * world.bodies[pd.body_b].orientation;
-    let q_from_rest = q_b_in_a * pd.baseline.inverse();
-    swing_twist_angle(q_from_rest, pd.axis_local_a)
+/// Joint angle as the combined solve itself measures it: swing-twist of
+/// the child-in-parent orientation (relative to the joint's baseline)
+/// about the joint's axis — `JointAxis::angle`.
+fn ja_joint_angle(world: &XpbdWorld, ja_idx: usize) -> f64 {
+    world.joint_axes[ja_idx].angle(&world.bodies)
 }
 
 /// Center-of-pressure migration under a plantarflexion command.
@@ -233,7 +229,7 @@ fn test_cop_migration() -> TestResult {
 
     // Gentle plantarflexion command (positive = PF, verified by probe:
     // +0.2 rad raises the heel ~2 cm and shifts the CoP anteriorly).
-    a.world.angular_pd_controllers[a.talocrural_pd_idx].target_angle = 0.2;
+    a.world.joint_axes[a.talocrural_ja_idx].target_angle = 0.2;
 
     let mut max_anterior_shift = f64::MIN;
     simulate(&mut a.world, 0.25, |w, _| {
@@ -323,12 +319,12 @@ fn test_mtp_pushoff() -> TestResult {
     let mut world = XpbdWorld::new();
     world.no_ground();
     let foot = foot::build_foot(&mut world, Vec3::new(0.0, 0.039, 0.0));
-    let pd_idx = foot.pd_by_child[Bone::HalluxPp as usize];
+    let ja_idx = foot.ja_by_child[Bone::HalluxPp as usize];
     simulate(&mut world, 2.5, |w, t| {
-        w.angular_pd_controllers[pd_idx].target_angle =
+        w.joint_axes[ja_idx].target_angle =
             target * (t / ramp_time).min(1.0);
     });
-    let achieved = pd_joint_angle(&world, pd_idx);
+    let achieved = ja_joint_angle(&world, ja_idx);
     let err = achieved - target;
     if err.abs() > 0.15 {
         return TestResult::fail("MTP push-off", format!(
@@ -347,15 +343,15 @@ fn test_mtp_pushoff() -> TestResult {
     foot::attach_talocrural(&mut world, shin_idx, &foot, -0.35, 0.70, 800.0, 40.0);
     world.bodies[shin_idx].pin();
 
-    let pd_idx = foot.pd_by_child[Bone::HalluxPp as usize];
+    let ja_idx = foot.ja_by_child[Bone::HalluxPp as usize];
     let pp_idx = foot.body(Bone::HalluxPp);
     simulate(&mut world, 0.5, |_, _| {}); // settle to stance
     let pp_y0 = world.bodies[pp_idx].position.y;
     simulate(&mut world, 2.5, |w, t| {
-        w.angular_pd_controllers[pd_idx].target_angle =
+        w.joint_axes[ja_idx].target_angle =
             target * (t / ramp_time).min(1.0);
     });
-    let pose_angle = pd_joint_angle(&world, pd_idx);
+    let pose_angle = ja_joint_angle(&world, ja_idx);
     let pp_lift = world.bodies[pp_idx].position.y - pp_y0;
 
     if pp_lift >= 0.001 && pose_angle > 0.0 && pose_angle <= rom_max * 1.1 {

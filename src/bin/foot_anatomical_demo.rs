@@ -191,21 +191,17 @@ const INV_COP_DX_MM: f64 = 15.0;        // 70% of measured +21.3
 const EV_SUBTALAR_SHIFT: f64 = -0.0013; // 70% of measured -0.0018
 const EV_COP_DZ_MM: f64 = -18.0;        // 70% of measured -26.4
 
-/// Joint angle exactly as the PD controller measures it: swing-twist of
-/// the child-in-parent orientation (relative to the PD's baseline) about
-/// the PD's axis. Mirrors `AngularPDController::angle` and
-/// ankle_anatomical.rs's `pd_joint_angle`.
-fn pd_joint_angle(world: &XpbdWorld, pd_idx: usize) -> f64 {
-    let pd = &world.angular_pd_controllers[pd_idx];
-    let q_b_in_a = world.bodies[pd.body_a].orientation.inverse()
-                 * world.bodies[pd.body_b].orientation;
-    let q_from_rest = q_b_in_a * pd.baseline.inverse();
-    swing_twist_angle(q_from_rest, pd.axis_local_a)
+/// Joint angle exactly as the combined solve measures it: swing-twist of
+/// the child-in-parent orientation (relative to the joint's baseline)
+/// about the joint's axis — `JointAxis::angle`. Mirrors
+/// ankle_anatomical.rs's `ja_joint_angle`.
+fn ja_joint_angle(world: &XpbdWorld, ja_idx: usize) -> f64 {
+    world.joint_axes[ja_idx].angle(&world.bodies)
 }
 
 /// Angle of the articulated joint whose CHILD is `child`.
 fn child_angle(world: &XpbdWorld, foot: &FootHandles, child: Bone) -> f64 {
-    pd_joint_angle(world, foot.pd_by_child[child as usize])
+    ja_joint_angle(world, foot.ja_by_child[child as usize])
 }
 
 /// Mean angle of the four lesser-toe MTP joints.
@@ -545,7 +541,7 @@ impl Commander {
     /// transition (both the windowed and the headless drivers do).
     fn begin_scenario(&mut self, world: &XpbdWorld, foot: &FootHandles) {
         self.subtalar_ref =
-            pd_joint_angle(world, foot.pd_by_child[Bone::Calcaneus as usize]);
+            ja_joint_angle(world, foot.ja_by_child[Bone::Calcaneus as usize]);
     }
 
     /// Set the goal for the joint whose child is `child`, clamped to the
@@ -653,17 +649,17 @@ impl Commander {
         }
     }
 
-    /// Move every PD target one frame-step toward its goal.
+    /// Move every joint target one frame-step toward its goal.
     fn tick(&self, world: &mut XpbdWorld, foot: &FootHandles, dt: f64) {
         let max_step = TARGET_RAMP_RATE * dt;
         for child in 0..BONE_COUNT {
-            let pd_idx = foot.pd_by_child[child];
-            if pd_idx == usize::MAX {
-                continue; // welded child — no PD
+            let ja_idx = foot.ja_by_child[child];
+            if ja_idx == usize::MAX {
+                continue; // welded child — no articulated joint
             }
-            let pd = &mut world.angular_pd_controllers[pd_idx];
-            let delta = self.goals[child] - pd.target_angle;
-            pd.target_angle += delta.clamp(-max_step, max_step);
+            let ja = &mut world.joint_axes[ja_idx];
+            let delta = self.goals[child] - ja.target_angle;
+            ja.target_angle += delta.clamp(-max_step, max_step);
         }
     }
 }
@@ -1514,10 +1510,35 @@ fn probe() {
             commander.update(i, scenario_t);
         }
         commander.tick(&mut world, &foot, DT);
+        // TEMP stop-motion instrumentation: during the toe-curl scenario,
+        // trace the toe4 DIP's signed angular velocity about its hinge —
+        // per frame, plus within-frame min/max sampled per substep.
+        let dip_trace = std::env::var("FOOT_PROBE_DIP").is_ok() && scenario == Some(2);
+        let (mut w_min, mut w_max) = (f64::MAX, f64::MIN);
         for _ in 0..SOLVER_ITERATIONS {
             world.substep(SUB_DT);
+            if dip_trace {
+                let p = foot.body(Bone::Toe4Mp);
+                let c = foot.body(Bone::Toe4Dp);
+                let n = world.bodies[p].orientation * NaVec3::x();
+                let w_rel = (world.bodies[c].angular_velocity
+                    - world.bodies[p].angular_velocity).dot(&n);
+                w_min = w_min.min(w_rel);
+                w_max = w_max.max(w_rel);
+            }
         }
         t += DT;
+        if dip_trace {
+            let p = foot.body(Bone::Toe4Mp);
+            let c = foot.body(Bone::Toe4Dp);
+            let n = world.bodies[p].orientation * NaVec3::x();
+            let w_rel = (world.bodies[c].angular_velocity
+                - world.bodies[p].angular_velocity).dot(&n);
+            let q = world.bodies[p].orientation.inverse() * world.bodies[c].orientation;
+            let ang = swing_twist_angle(q, NaVec3::x());
+            println!("DIPTRACE,{:.4},{:+.6},{:+.6},{:+.6},{:+.6}",
+                scenario_t, ang, w_rel, w_min, w_max);
+        }
         let (contacts, cop, fn_total) = gather_contacts(&world);
         fn_smooth += (fn_total - fn_smooth) * (DT / FN_SMOOTH_TAU).min(1.0);
         if let Some(tr) = &mut track {
@@ -1705,11 +1726,11 @@ fn probe_toe5() {
             }
         };
         if zero_pd {
-            // Zero only the FOOT joints' kp (via pd_by_child); in the loaded
+            // Zero only the FOOT joints' kp (via ja_by_child); in the loaded
             // config the talocrural PD stays, since it balances the column.
-            for &pd_idx in foot.pd_by_child.iter() {
-                if pd_idx != usize::MAX {
-                    world.angular_pd_controllers[pd_idx].kp = 0.0;
+            for &ja_idx in foot.ja_by_child.iter() {
+                if ja_idx != usize::MAX {
+                    world.joint_axes[ja_idx].kp = 0.0;
                 }
             }
         }
