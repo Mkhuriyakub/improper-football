@@ -5,6 +5,7 @@ use crate::angular_damper::AngularDamper;
 use crate::angular_spring::AngularSpring;
 use crate::angular_soft_limit::AngularSoftLimit;
 use crate::angular_pd_controller::AngularPDController;
+use crate::joint_axis::JointAxis;
 use crate::positional_spring::PositionalSpring;
 use crate::positional_damper::PositionalDamper;
 use crate::tendon::Tendon;
@@ -69,6 +70,11 @@ pub struct XpbdWorld {
     pub angular_springs: Vec<AngularSpring>,
     pub angular_soft_limits: Vec<AngularSoftLimit>,
     pub angular_pd_controllers: Vec<AngularPDController>,
+    /// Combined coaxial joints: each solves ALL of its coaxial angular
+    /// terms (PD, passive spring, soft limit, dampers) in ONE implicit
+    /// solve with a shared denominator — no split-pass gain attenuation,
+    /// no inter-term ordering sensitivity. See `joint_axis.rs`.
+    pub joint_axes: Vec<JointAxis>,
     pub positional_springs: Vec<PositionalSpring>,
     pub positional_dampers: Vec<PositionalDamper>,
     pub tendons: Vec<Tendon>,
@@ -103,6 +109,7 @@ impl XpbdWorld {
             angular_springs: Vec::new(),
             angular_soft_limits: Vec::new(),
             angular_pd_controllers: Vec::new(),
+            joint_axes: Vec::new(),
             positional_springs: Vec::new(),
             positional_dampers: Vec::new(),
             tendons: Vec::new(),
@@ -278,6 +285,14 @@ impl XpbdWorld {
         // implicit damping; applying a stiff term after the dampers lets its
         // velocity excursion reach the SI loop undamped on small-inertia
         // bodies and detonates the foot's toe chains.
+        //
+        // The combined JointAxis pass runs FIRST in this slot. A joint
+        // migrated to JointAxis is ordering-free by construction: all of
+        // its coaxial terms (KP, spring, limit, dampers) share one solve
+        // and one denominator, so there is no intra-joint stiff-vs-damper
+        // sequence left to get wrong. The legacy pass ordering below is
+        // unchanged and still load-bearing for the legacy primitives.
+        self.apply_joint_axes(sub_dt);
         self.apply_pd_kp_implicit(sub_dt);
         self.apply_positional_springs_implicit(sub_dt);
         self.apply_springs_implicit(sub_dt);
@@ -320,6 +335,15 @@ impl XpbdWorld {
     fn apply_pd_dampers_implicit(&mut self, sub_dt: f64) {
         for ctrl in &self.angular_pd_controllers {
             ctrl.apply_implicit_damping(&mut self.bodies, sub_dt);
+        }
+    }
+
+    fn apply_joint_axes(&mut self, sub_dt: f64) {
+        // &mut: the solve updates each joint's tear latch and diagnostics
+        // (`applied_active_torque`, `applied_total_torque`) and clears its
+        // per-substep ext_* injections.
+        for ja in &mut self.joint_axes {
+            ja.apply_implicit(&mut self.bodies, sub_dt);
         }
     }
 

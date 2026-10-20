@@ -6,6 +6,7 @@ pub mod angular_damper;
 pub mod angular_spring;
 pub mod angular_soft_limit;
 pub mod angular_pd_controller;
+pub mod joint_axis;
 pub mod positional_spring;
 pub mod positional_damper;
 pub mod tendon;
