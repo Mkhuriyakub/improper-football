@@ -88,43 +88,6 @@ impl AngularPDController {
         swing_twist_angle(q_from_rest, self.axis_local_a)
     }
 
-    /// Scalar torque the controller would apply this substep, given the current
-    /// state (includes KP + KD + feedforward). Useful for logging the muscle effort.
-    pub fn scalar_torque(&self, bodies: &[RigidBody]) -> f64 {
-        if !self.enabled {
-            return 0.0;
-        }
-        let n = bodies[self.body_a].orientation * self.axis_local_a;
-        let angle = self.angle(bodies);
-        let omega_rel = bodies[self.body_b].angular_velocity
-            - bodies[self.body_a].angular_velocity;
-        let omega_rel_n = omega_rel.dot(&n);
-        let raw = -self.kp * (angle - self.target_angle) - self.kd * omega_rel_n
-                  + self.feedforward_torque;
-        if raw.abs() > self.torque_limit {
-            raw.signum() * self.torque_limit
-        } else {
-            raw
-        }
-    }
-
-    /// KP + feedforward components of the controller torque, with
-    /// `torque_limit` applied to the sum. The KD term is integrated
-    /// separately by `apply_implicit_damping` and is intentionally NOT
-    /// included here.
-    pub fn kp_scalar_torque(&self, bodies: &[RigidBody]) -> f64 {
-        if !self.enabled {
-            return 0.0;
-        }
-        let angle = self.angle(bodies);
-        let raw = -self.kp * (angle - self.target_angle) + self.feedforward_torque;
-        if raw.abs() > self.torque_limit {
-            raw.signum() * self.torque_limit
-        } else {
-            raw
-        }
-    }
-
     /// Implicit (backward-Euler) integration of the KP + feedforward
     /// component, exactly the linear special case of
     /// `AngularSoftLimit::apply_implicit`'s linearized solve:

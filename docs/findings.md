@@ -143,3 +143,28 @@ pass had depended on the oversized geometry (the free foot pitching over
 fat toes); it is re-scoped to airborne tracking (original 0.8 ± 0.15
 criterion) plus grounded lift-off under a stabilized shin — holding a
 free-standing toe-stand awaits the Phase 3/4 arch stabilizers.
+
+## 2026-10 — Sequential implicit passes attenuate PD gain by 1/(1+dt²·w·kp)
+
+Locking the implicit-KP fix in with an asserting regression ray
+(engine_regression.rs: metatarsal-rooted toe5 chain on the ground manifold)
+both re-verified the fix and quantified a bias it carries. The fix itself:
+the explicit PD proportional term was the last stiff explicit term after the
+2026-06 rewrite and pumped energy through the contact manifold on gram-scale
+bodies — visible as toe jitter, categorical once the bone-geometry correction
+shrank toe inertias — cured by integrating kp implicitly, with the ordering
+load-bearing: moved after the damper passes, the undamped kp excursion
+reaches the SI loop and the regression ray limit-cycles at 264 rad/s
+sustained (vs 0.167 in the correct order), and against the pre-fix explicit
+engine the ray keeps only 5–20% command authority (DIP 0.014 rad vs 0.210
+for a 0.3 rad press — the damper-rectification mechanism measured on the
+pinned hallux). The quantified discovery: because each stiff term is
+integrated one-at-a-time, every backward-Euler pass divides its contribution
+by 1 + dt²·w·k — effective proportional gain kp_eff = kp/(1 + dt²·w·kp) —
+negligible on kg-scale segments but ~94% attenuation on gram-scale toe
+joints at the current substep rate (dt²·w·kp ≈ 19: w ≈ 2.5·10⁸, kp = 4,
+sub_dt = 1/7200). Equilibria therefore do NOT follow the rigid split
+kp/(kp+K)·target at toe scale, and command flips barely move through the
+~90×-supracritical shared c = 1.0 dampers. A known, documented bias — to be
+removed by a combined coaxial-stiffness solve (all same-axis stiff terms in
+one linearized solve) when Phase 3 needs accurate toe tracking.

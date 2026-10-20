@@ -592,3 +592,293 @@ fn manifold_keeps_resting_capsule_level_with_two_active_contacts() {
         "total normal force {total_fn:.2} N should ≈ weight {weight:.2} N"
     );
 }
+
+
+// ════════════════════════════════════════════════════════════════════════
+// PD proportional term — implicit integration (the 2026-10 pump fix)
+// ════════════════════════════════════════════════════════════════════════
+
+/// One link of a grounded toe ray: capsule params + the joint stack gains
+/// connecting it to the previous link.
+struct ToeLink {
+    mass: f64,
+    half_h: f64,
+    radius: f64,
+    kp: f64,
+    kd: f64,
+    rom: (f64, f64),
+}
+
+/// Build a "toe ray" on the ground plane: a fixed-root parent capsule
+/// (metatarsal scale) resting on the ground, plus a chain of toe-bone links,
+/// each joined to the previous by the foot's full articulated-joint stack
+/// (positional constraint at compliance 1/60000, primary-axis soft limit
+/// k = 8000 exp 2, passive spring k = 4, passive damper c = 1.0, active PD,
+/// off-axis locks ±0.05 rad with dampers — exactly
+/// `foot.rs::add_articulated`). All bones lie along world +Z with their
+/// undersides on the ground plane; every hinge is world X (== local X), and
+/// a POSITIVE joint angle pitches the child DOWN into the ground.
+fn build_toe_ray(
+    parent_mhr: (f64, f64, f64),
+    links: &[ToeLink],
+) -> (XpbdWorld, Vec<usize>) {
+    let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
+
+    // Capsule long axis (local +Y) along world +Z: rotate +90° about X.
+    let along_z = Quat::from_scaled_axis(Vec3::new(std::f64::consts::FRAC_PI_2, 0.0, 0.0));
+
+    // Fixed world anchor for the chain root; same orientation as the parent
+    // so the weld's zero-relative-rotation locks are satisfied at rest
+    // (AngularLimitConstraint has no baseline).
+    let mut anchor = RigidBody::new(0.0, Mat3::identity());
+    anchor.orientation = along_z;
+    let anchor_idx = world.add_body(anchor);
+
+    let (pm, ph, pr) = parent_mhr;
+    let mut parent = RigidBody::new_capsule(pm, ph, pr);
+    parent.orientation = along_z;
+    parent.position = Vec3::new(0.0, pr, 0.0); // resting on the ground
+    let parent_idx = world.add_body(parent);
+    add_weld(&mut world, anchor_idx, parent_idx, Vec3::new(0.0, pr, 0.0));
+
+    let mut idxs = vec![parent_idx];
+    let mut prev_idx = parent_idx;
+    let mut prev_tip_z = ph + pr; // world z of the previous capsule surface tip
+    let mut prev_r = pr;
+    for link in links {
+        let joint_world = Vec3::new(0.0, (prev_r + link.radius) * 0.5, prev_tip_z);
+        let mut b = RigidBody::new_capsule(link.mass, link.half_h, link.radius);
+        b.orientation = along_z;
+        b.position = Vec3::new(0.0, link.radius, prev_tip_z + link.half_h + link.radius);
+        let idx = world.add_body(b);
+
+        // The foot's articulated-joint stack (mirrors add_articulated).
+        let mut c = PositionalConstraint::new(prev_idx, idx, 0.0, 1.0 / 60_000.0);
+        c.local_anchor_a = anchor_local(&world, prev_idx, joint_world);
+        c.local_anchor_b = anchor_local(&world, idx, joint_world);
+        world.constraints.push(c);
+        world.angular_soft_limits.push(AngularSoftLimit::new(
+            prev_idx, idx, Vec3::x(), link.rom.0, link.rom.1, 8000.0, 2.0,
+        ));
+        world.angular_springs.push(physics::angular_spring::AngularSpring::new(
+            prev_idx, idx, Vec3::x(), 4.0, 0.0,
+        ));
+        world.angular_dampers.push(AngularDamper::new(prev_idx, idx, Vec3::x(), 1.0));
+        world.angular_pd_controllers.push(
+            AngularPDController::new(prev_idx, idx, Vec3::x(), link.kp, link.kd),
+        );
+        for off in [Vec3::y(), Vec3::z()] {
+            world.angular_constraints.push(AngularLimitConstraint::new(
+                prev_idx, idx, off, -0.05, 0.05,
+            ));
+            world.angular_dampers.push(AngularDamper::new(prev_idx, idx, off, 1.0));
+        }
+
+        idxs.push(idx);
+        prev_idx = idx;
+        prev_tip_z += 2.0 * (link.half_h + link.radius);
+        prev_r = link.radius;
+    }
+    (world, idxs)
+}
+
+fn toe5_ray() -> (XpbdWorld, Vec<usize>) {
+    // toe5 ray behind a 30 g metatarsal-scale root: pp, mp, dp at the foot's
+    // BONES-table values; MTP gains kp = 8 / kd = 0.3, PIP and DIP kp = 4 /
+    // kd = 0.15. In this rig + is flexion (down), so the PIP/DIP ROMs
+    // [0, 0.61] / [0, 1.05] rest at their straight-toe boundary like the
+    // real foot's.
+    build_toe_ray(
+        (0.030, 0.025, 0.004),
+        &[
+            ToeLink { mass: 0.0061, half_h: 0.0060, radius: 0.0040, kp: 8.0, kd: 0.3, rom: (-0.70, 0.70) },
+            ToeLink { mass: 0.0022, half_h: 0.0010, radius: 0.0025, kp: 4.0, kd: 0.15, rom: (0.0, 0.61) },
+            ToeLink { mass: 0.0024, half_h: 0.0010, radius: 0.0030, kp: 4.0, kd: 0.15, rom: (0.0, 1.05) },
+        ],
+    )
+}
+
+fn joint_angle(world: &XpbdWorld, a: usize, b: usize) -> f64 {
+    let q_rel = world.bodies[a].orientation.inverse() * world.bodies[b].orientation;
+    physics::math::swing_twist_angle(q_rel, Vec3::x())
+}
+
+/// Per-phase measurements over a toe ray.
+struct ChainMeasure {
+    /// max |ω| over every toe bone and every substep of the phase.
+    max_w: f64,
+    /// max |ω| over every toe bone, last simulated second only (the
+    /// sustained-jitter ceiling, free of the command-step transient).
+    max_w_last: f64,
+    /// Per joint (root-most first): mean joint angle over the last second.
+    joint_means: Vec<f64>,
+}
+
+/// Advance `seconds` and measure. `idxs` is the full chain (parent first).
+fn run_chain_measured(world: &mut XpbdWorld, idxs: &[usize], seconds: f64) -> ChainMeasure {
+    let frames = (seconds / DT).round() as usize;
+    let last_sec_from = frames.saturating_sub((1.0 / DT).round() as usize) * SUBSTEPS_PER_FRAME;
+    let mut max_w: f64 = 0.0;
+    let mut max_w_last: f64 = 0.0;
+    let n_joints = idxs.len() - 1;
+    let mut sums = vec![0.0f64; n_joints];
+    let mut n_samples = 0usize;
+    let mut substep_i = 0usize;
+    for _ in 0..frames {
+        for _ in 0..SUBSTEPS_PER_FRAME {
+            world.substep(SUB_DT);
+            for &i in &idxs[1..] {
+                let w = world.bodies[i].angular_velocity.norm();
+                if !w.is_finite() || w > max_w {
+                    max_w = w;
+                }
+                if substep_i >= last_sec_from && (!w.is_finite() || w > max_w_last) {
+                    max_w_last = w;
+                }
+            }
+            if substep_i >= last_sec_from {
+                for (j, pair) in idxs.windows(2).enumerate() {
+                    sums[j] += joint_angle(world, pair[0], pair[1]);
+                }
+                n_samples += 1;
+            }
+            substep_i += 1;
+        }
+    }
+    ChainMeasure {
+        max_w,
+        max_w_last,
+        joint_means: sums.iter().map(|s| s / n_samples as f64).collect(),
+    }
+}
+
+/// The 2026-10 PD-proportional-term fix (`AngularPDController::apply_implicit_kp`),
+/// guarded from BOTH directions it can regress.
+///
+/// REAL FAILURE GUARDED. The PD proportional term was the last stiff explicit
+/// term left after the 2026-06 implicit rewrite. On the foot's gram-scale
+/// phalanges its per-substep kick is past the explicit-integration bound
+/// (√(kp/I_red)·sub_dt ≈ 4.4–6.1 on the lesser-toe PIP/DIP joints, where > 2
+/// is unstable; I_red ≈ 4·10⁻⁹ kg·m²). In the full 26-bone foot that pumped
+/// energy through the ground manifold (toe jitter; a toppled bare foot;
+/// detonating loaded toe chains). In this minimal single-ray world the
+/// ~90×-supracritical shared c = 1.0 dampers contain the kick instead and
+/// RECTIFY it into loss of command authority — the same mechanism e9dda0b
+/// measured on a pinned hallux ray that crept back to 0 against 24 N·m of PD
+/// torque. Both faces are asserted here: bounded sustained motion (no pump)
+/// and retained command authority (no rectification).
+///
+/// Scenario: the toe5 ray above (metatarsal root welded to the world, pp–mp–dp
+/// chain with the foot's full per-joint stack) resting on the ground plane.
+/// Three phases: neutral rest, MTP commanded +0.3 rad (pressing the toe into
+/// the manifold — the sustained PD-vs-contact fight), MTP flipped to −0.3 rad
+/// (lift). The commanded press is realized down the chain: the MTP itself is
+/// wedged by the manifold/friction loop, and the DIP — the joint with the
+/// smallest inertia, the pump's epicenter — carries the response.
+///
+/// MEASURED (current engine, the values the bounds derive from, ~3× headroom):
+///   P0 rest:   max|ω| 4.8e-2, last-sec 3.3e-7 rad/s; joints ≈ 0.
+///   P1 press:  max|ω| 42.7 (transient), last-sec 0.167 rad/s;
+///              DIP mean +0.2100 rad, PIP −0.086, MTP ≈ 0 (wedged).
+///   P2 lift:   max|ω| 208.8 (transient), last-sec 8.0e-3 rad/s;
+///              DIP mean −0.1557 rad.
+///
+/// EQUILIBRIUM BAND. The DIP band [0.10, 0.35] is around the MEASURED settle,
+/// not an analytic prediction: the sequential one-term-at-a-time implicit
+/// passes attenuate each term's effective gain by 1/(1 + dt²·w·k) (review
+/// formula kp_eff = kp/(1 + dt²·w·kp)): on a gram-scale toe joint
+/// (w ≈ 2.5·10⁸, kp = 4, sub_dt = 1/7200) that is ≈ 95% attenuation, so the
+/// classic rigid-split prediction kp/(kp + K_spring)·target does NOT hold and
+/// the settle also includes manifold support. This dt-dependent effective-gain
+/// bias is a KNOWN, documented limitation (docs/findings.md 2026-10), to be
+/// removed by a combined coaxial-stiffness solve when Phase 3 needs accurate
+/// toe tracking.
+///
+/// BITE-VERIFIED against the pre-fix explicit-kp engine (checkout of
+/// e9dda0b~1 angular_pd_controller.rs + xpbd.rs): P1 DIP mean 0.0141 rad and
+/// P2 DIP mean −0.0345 rad — both outside their bands (kick damper-rectified
+/// to ~5–20% authority) — the test FAILS against the old engine.
+///
+/// ORDERING CANARY (this test doubles as it). `apply_pd_kp_implicit` must run
+/// BEFORE the damper passes in `XpbdWorld::substep` so the dampers dissipate
+/// its velocity impulse within the same substep. Measured with the call
+/// temporarily moved AFTER the dampers: the undamped excursion reaches the SI
+/// contact loop and the ray limit-cycles — P1 last-sec ω = 264 rad/s
+/// (vs 0.167), P2 last-sec ω = 32.0 rad/s (vs 0.008), P1 max|ω| 272
+/// (vs 42.7), P2 max|ω| 1104 (vs 209). The sustained-ω and max-ω bounds
+/// below sit between the regimes and FAIL the flipped ordering.
+#[test]
+fn gram_scale_pd_in_ground_contact_does_not_pump() {
+    let (mut world, idxs) = toe5_ray();
+
+    // Phase 0 — 3 s at neutral targets (resting stance).
+    let p0 = run_chain_measured(&mut world, &idxs, 3.0);
+    for &i in &idxs {
+        let b = &world.bodies[i];
+        assert!(
+            finite(b.position) && finite(b.linear_velocity) && finite(b.angular_velocity),
+            "phase 0 (rest) went non-finite"
+        );
+    }
+    assert!(
+        p0.max_w_last < 0.01,
+        "resting toe chain is not quiet: sustained |ω| {} rad/s (measured 3.3e-7)",
+        p0.max_w_last
+    );
+
+    // Phase 1 — 4 s with the MTP commanded +0.3 (pressing the toe into the
+    // ground): the sustained PD-vs-manifold fight that pumped pre-fix.
+    world.angular_pd_controllers[0].target_angle = 0.3;
+    let p1 = run_chain_measured(&mut world, &idxs, 4.0);
+    for &i in &idxs {
+        let b = &world.bodies[i];
+        assert!(
+            finite(b.position) && finite(b.linear_velocity) && finite(b.angular_velocity),
+            "phase 1 (press) went non-finite — PD-vs-manifold energy pump"
+        );
+    }
+    assert!(
+        p1.max_w < 130.0,
+        "press transient |ω| {} rad/s > 130 (measured 42.7; flipped kp-after-dampers ordering gives 272)",
+        p1.max_w
+    );
+    assert!(
+        p1.max_w_last < 0.5,
+        "press phase sustains |ω| {} rad/s > 0.5 (measured 0.167; flipped ordering limit-cycles at 264)",
+        p1.max_w_last
+    );
+    let dip_press = p1.joint_means[2];
+    assert!(
+        (0.10..=0.35).contains(&dip_press),
+        "press response lost: DIP mean {dip_press} rad outside [0.10, 0.35] \
+         (measured 0.210; the pre-fix explicit-kp engine damper-rectifies to 0.014)"
+    );
+
+    // Phase 2 — flip the MTP command to lift (−0.3), 3 s.
+    world.angular_pd_controllers[0].target_angle = -0.3;
+    let p2 = run_chain_measured(&mut world, &idxs, 3.0);
+    for &i in &idxs {
+        let b = &world.bodies[i];
+        assert!(
+            finite(b.position) && finite(b.linear_velocity) && finite(b.angular_velocity),
+            "phase 2 (lift) went non-finite — PD-vs-manifold energy pump"
+        );
+    }
+    assert!(
+        p2.max_w < 650.0,
+        "lift transient |ω| {} rad/s > 650 (measured 208.8; flipped ordering gives 1104)",
+        p2.max_w
+    );
+    assert!(
+        p2.max_w_last < 0.05,
+        "lift phase sustains |ω| {} rad/s > 0.05 (measured 0.008; flipped ordering limit-cycles at 32)",
+        p2.max_w_last
+    );
+    let dip_lift = p2.joint_means[2];
+    assert!(
+        (-0.35..=-0.08).contains(&dip_lift),
+        "lift response lost: DIP mean {dip_lift} rad outside [−0.35, −0.08] \
+         (measured −0.156; the pre-fix engine gives −0.035, flipped ordering +0.0003)"
+    );
+}
