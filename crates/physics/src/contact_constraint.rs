@@ -98,15 +98,23 @@ impl ContactConstraint {
         let contact_world = body.position + r;
         let penetration = self.plane_y - contact_world.y;
 
-        // Skip if no contact AND no accumulated impulse to maintain.
-        if penetration <= 0.0 && self.lambda_normal <= 0.0 {
-            return;
-        }
-
         // ─── Normal constraint (world +Y) ─────────────────────────────
         let n = Vec3::new(0.0, 1.0, 0.0);
         let v_contact = body.linear_velocity + body.angular_velocity.cross(&r);
         let v_n = v_contact.dot(&n);
+
+        // Skip when the constraint can produce no impulse this iteration:
+        // not yet touching (penetration ≤ 0), nothing accumulated to
+        // maintain or unwind, and not approaching fast enough to cross the
+        // plane within this substep (v_n ≥ penetration/dt — with that
+        // speculative bias the normal solve below would yield
+        // delta_lambda ≤ 0, clamped to zero by unilaterality).
+        if penetration <= 0.0
+            && self.lambda_normal <= 0.0
+            && v_n >= penetration / dt
+        {
+            return;
+        }
 
         let inv_mass = body.inv_mass;
         let i_inv = body.world_inv_inertia();
@@ -117,9 +125,21 @@ impl ContactConstraint {
         }
         let cfm = self.compliance / dt;
 
-        // Baumgarte velocity bias: drives penetration → 0 over time.
-        // Want v_n ≥ baumgarte/dt × penetration (separating velocity).
-        let bias = (self.baumgarte / dt) * penetration.max(0.0);
+        let bias = if penetration > 0.0 {
+            // Baumgarte velocity bias: drives penetration → 0 over time.
+            // Want v_n ≥ baumgarte/dt × penetration (separating velocity).
+            (self.baumgarte / dt) * penetration
+        } else {
+            // Speculative contact (not yet touching): allow the body to
+            // close the remaining gap within this substep but no more —
+            // target floor v_n ≥ penetration/dt (negative: still
+            // approaching). The impulse removes exactly the approach speed
+            // that would overshoot the plane, so the body lands on the
+            // surface instead of embedding one substep deep. Purely
+            // dissipative: λ ≥ 0 only ever REDUCES approach speed, and the
+            // floor is never positive, so a separated body is never pushed.
+            penetration / dt
+        };
         let velocity_error = v_n - bias;
         let delta_lambda_n = -velocity_error / (w_n + cfm);
 

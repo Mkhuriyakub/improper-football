@@ -356,24 +356,30 @@ impl XpbdWorld {
         }
     }
 
-    /// Margin (m) within which an endpoint is included in the manifold even
-    /// before it actually penetrates. The constraint stays inactive
-    /// (`lambda_normal == 0`) until the endpoint truly penetrates, but
-    /// pre-generating it lets the SI solver catch fast-approaching contacts
-    /// within the substep rather than one substep late.
-    const MANIFOLD_MARGIN: f64 = 1.0e-3;
-
     /// Regenerate the per-substep ground contact manifold.
     ///
     /// For every body whose `capsule_shape` is `Some(...)` and whose
     /// `inv_mass` is non-zero (pinned bodies pass through — contact would
     /// have no effect), check both capsule endpoints against the ground
-    /// plane. For each endpoint within `MANIFOLD_MARGIN` of (or below) the
-    /// plane, push a fresh rigid `ContactConstraint` anchored at the
-    /// end-sphere bottom (expressed in body-local coordinates). These are
-    /// then solved together in the SI loop, yielding a consistent
-    /// multi-point load-sharing solution instead of the old independent
-    /// per-endpoint penalty impulses.
+    /// plane. A constraint is generated when the endpoint either already
+    /// penetrates (penetration > 0) or is PREDICTED to penetrate by the end
+    /// of this substep (speculative contact, Bullet-style):
+    /// `penetration + (−v_n)·sub_dt > 0`, with `v_n` the endpoint contact
+    /// point's current normal velocity. Positions are frozen during the
+    /// velocity-level SI loop, so a fast-approaching endpoint that will
+    /// cross the plane within the substep must get its constraint NOW or it
+    /// is caught one substep late, permanently embedded by up to `v·sub_dt`
+    /// (≈1 mm per 7 m/s of impact speed at sub_dt = 1/7200 — permanent
+    /// because the manifold runs Baumgarte = 0, see below).
+    /// `ContactConstraint::solve` gives a not-yet-touching contact a
+    /// negative velocity bias (`penetration/dt`) so it only removes the
+    /// approach speed in excess of "lands exactly on the plane": it never
+    /// pushes on a separating body and is purely dissipative.
+    ///
+    /// Each constraint is anchored at the end-sphere bottom (expressed in
+    /// body-local coordinates); all are solved together in the SI loop,
+    /// yielding a consistent multi-point load-sharing solution instead of
+    /// the old independent per-endpoint penalty impulses.
     ///
     /// Because the manifold is rebuilt every substep, the fixed
     /// material-point (local_point) approximation only needs to hold for a
@@ -408,14 +414,26 @@ impl XpbdWorld {
                 // Bottom of the end-sphere = endpoint center - radius (along +y).
                 let bottom_y = endcenter_world.y - r;
                 let penetration = plane_y - bottom_y;
-                if penetration <= -Self::MANIFOLD_MARGIN {
-                    continue;
+                // Contact point in world = end-sphere bottom.
+                let contact_world = endcenter_world - Vec3::new(0.0, r, 0.0);
+                if penetration <= 0.0 {
+                    // Not yet touching: generate only if the contact point
+                    // is predicted to cross the plane within this substep
+                    // (speculative contact — see the method doc).
+                    let lever = contact_world - position;
+                    let body = &self.bodies[body_idx];
+                    let v_contact = body.linear_velocity
+                        + body.angular_velocity.cross(&lever);
+                    let penetration_pred =
+                        penetration - v_contact.y * self.last_sub_dt;
+                    if penetration_pred <= 0.0 {
+                        continue;
+                    }
                 }
 
-                // Contact point in world = end-sphere bottom. Express it in
-                // body-local so the constraint tracks the material point as
-                // the body rotates within this substep.
-                let contact_world = endcenter_world - Vec3::new(0.0, r, 0.0);
+                // Express the contact point in body-local so the constraint
+                // tracks the material point as the body rotates within this
+                // substep.
                 let local_point = orientation.inverse() * (contact_world - position);
 
                 // Baumgarte = 0 (no separating-velocity bias). The default
@@ -455,6 +473,11 @@ impl XpbdWorld {
     /// divided by the last substep dt (`lambda_normal / last_sub_dt`).
     /// Returns `[None, None]` if the ground is disabled, the body has no
     /// capsule shape, the body is pinned, or no substep has run yet.
+    ///
+    /// Note one substep of pose skew: `lambda_normal` is the impulse the SI
+    /// loop converged for the PRE-integration pose, while `contact_point`
+    /// (via `contact_point_world`) evaluates at the POST-integration pose —
+    /// micrometers at rest, so CoP analyses should not chase it.
     pub fn engaged_endpoints(
         &self,
         body_idx: usize,

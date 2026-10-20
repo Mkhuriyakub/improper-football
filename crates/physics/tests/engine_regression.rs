@@ -1328,6 +1328,89 @@ fn contact_release_unwinds_accumulated_friction_to_the_cone() {
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// Speculative ground contact — fast impacts land on the plane
+// ════════════════════════════════════════════════════════════════════════
+
+/// Lowest point (world y) across both end-spheres of a capsule.
+fn capsule_bottom_y(world: &XpbdWorld, idx: usize) -> f64 {
+    let b = &world.bodies[idx];
+    let s = b.capsule_shape.unwrap();
+    let axis = b.orientation * Vec3::new(0.0, 1.0, 0.0);
+    let e0 = b.position + axis * s.half_h;
+    let e1 = b.position - axis * s.half_h;
+    (e0.y - s.radius).min(e1.y - s.radius)
+}
+
+/// Speculative contact: a fast-dropping capsule must land ON the ground
+/// plane, not embed one substep deep into it.
+///
+/// Positions are frozen during the velocity-level SI loop, so without
+/// speculative generation (`generate_ground_manifold` predicting the
+/// end-of-substep crossing) a contact is only created AFTER the body has
+/// already penetrated — by up to v·sub_dt, which the manifold's Baumgarte=0
+/// (load-bearing, see generate_ground_manifold) then never recovers:
+/// a permanent embed. MEASURED with speculative generation reverted to
+/// penetration>0-only (these exact initial conditions, deterministic):
+/// max/settled penetration 0.0150 mm at 3 m/s, 0.5627 mm at 5 m/s,
+/// 0.0032 mm at 7.2 m/s (depth is phase-of-crossing dependent, bounded by
+/// v·sub_dt = 0.42/0.69/1.0 mm). MEASURED with speculative contact:
+/// 0.0002/0.0003/0.0004 mm. The 0.02 mm bound sits ~50× above the
+/// speculative result and ~28× below the worst reverted embed — it FAILS
+/// the reverted engine at 5 m/s (bite-verified).
+#[test]
+fn fast_impact_lands_on_plane_without_embedding() {
+    for impact_speed in [3.0, 5.0, 7.2] {
+        let mut world = XpbdWorld::new();
+        world.set_ground(0.0);
+
+        // Foot-scale capsule, long axis horizontal (local +y → world +z):
+        // both endpoints strike together, a 2-point manifold like a sole.
+        let mut cap = RigidBody::new_capsule(1.0, 0.10, 0.03);
+        cap.orientation = Quat::from_scaled_axis(
+            Vec3::new(-std::f64::consts::FRAC_PI_2, 0.0, 0.0));
+        // 5 mm above contact, already moving at impact speed (the end of a
+        // free fall without simulating the fall).
+        cap.position = Vec3::new(0.0, 0.03 + 0.005, 0.0);
+        cap.linear_velocity = Vec3::new(0.0, -impact_speed, 0.0);
+        let idx = world.add_body(cap);
+
+        let mut max_pen: f64 = 0.0;
+        for _ in 0..((0.3 / SUB_DT) as usize) {
+            world.substep(SUB_DT);
+            max_pen = max_pen.max(-capsule_bottom_y(&world, idx));
+        }
+
+        const PEN_BOUND: f64 = 2.0e-5; // 20 µm — see header for derivation
+        assert!(
+            max_pen < PEN_BOUND,
+            "{impact_speed} m/s impact embedded {:.4} mm > 0.02 mm \
+             (speculative contact measured 0.0002–0.0004 mm; one-substep-late \
+             contact embeds up to v·sub_dt = {:.2} mm)",
+            max_pen * 1e3,
+            impact_speed * SUB_DT * 1e3
+        );
+        // Settles cleanly: resting on the plane, supported by its weight,
+        // no residual motion (no bounce survives 300 ms).
+        let settled = capsule_bottom_y(&world, idx);
+        assert!(
+            settled.abs() < PEN_BOUND,
+            "{impact_speed} m/s impact settled at {settled} m, not on the plane"
+        );
+        let v_end = world.bodies[idx].linear_velocity.norm();
+        assert!(
+            v_end < 1e-3,
+            "{impact_speed} m/s impact still moving at {v_end} m/s after 300 ms"
+        );
+        let support = world.total_normal_force(idx);
+        assert!(
+            (support - 9.81).abs() < 0.5,
+            "{impact_speed} m/s impact settled with ground support {support} N \
+             (expected ≈ weight 9.81 N)"
+        );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // AngularPDController torque_limit — one budget across KP + FF + KD
 // ════════════════════════════════════════════════════════════════════════
 
