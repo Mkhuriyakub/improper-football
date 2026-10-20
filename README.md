@@ -94,7 +94,7 @@ src/bin/                 Validation + visual binaries (one concern each)
   foot_rigid_balance_diag.rs Contact-model diagnostic (exits nonzero if the
                          nominal rigid assembly stops standing)
   balance_*.rs, *_demo.rs, ...  Incremental motion milestones
-  (a Bevy visual demo of the 26-bone foot is in progress)
+  foot_anatomical_demo.rs  26-bone foot showcase (--loaded for the full-load limit)
 ```
 
 Physics runs at 120 Hz frames × 60 substeps (sub-dt ≈ 139 µs). Rendering
@@ -115,6 +115,7 @@ cargo run --release --bin ankle_anatomical -- --diagnose   # support-polygon tra
 cargo run --release --bin foot_rigid_balance_diag
 
 # Visual demos (Bevy)
+cargo run --release --bin foot_anatomical_demo    # 26-bone foot + manifold contact
 cargo run --release --bin full_body_demo          # whole-body milestone
 cargo run --release --bin balance_bilateral_demo  # shows the current limit of
                                                   # PD-only bilateral balance
