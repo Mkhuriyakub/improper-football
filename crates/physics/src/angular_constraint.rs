@@ -32,6 +32,11 @@ pub struct AngularLimitConstraint {
 
 impl AngularLimitConstraint {
     pub fn new(body_a: usize, body_b: usize, axis: Vec3, min: f64, max: f64) -> Self {
+        debug_assert!(
+            (axis.norm() - 1.0).abs() < 1e-6,
+            "AngularLimitConstraint axis must be unit length (norm = {})",
+            axis.norm()
+        );
         Self {
             body_a,
             body_b,

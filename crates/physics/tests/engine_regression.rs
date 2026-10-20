@@ -1326,3 +1326,81 @@ fn contact_release_unwinds_accumulated_friction_to_the_cone() {
         "released contact left stale angular velocity {stale_omega} rad/s from friction torque"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// AngularPDController torque_limit — one budget across KP + FF + KD
+// ════════════════════════════════════════════════════════════════════════
+
+/// `torque_limit` caps the controller's TOTAL output. The KP+FF pass clamps
+/// its own applied torque and records it (`applied_kp_torque`); the KD pass
+/// (a later pass of the same substep) clamps its torque into the remaining
+/// budget. Scenario where BOTH terms individually overspend a 0.5 N·m limit:
+/// angle error 0.5 rad at kp = 50 (raw 25 N·m) and ω_rel = 10 rad/s at
+/// kd = 5 (implicit KD torque ≈ 40 N·m). The total applied torque is
+/// reconstructed exactly from the velocity delta across the two passes:
+/// τ_total = Δ(ω·n)/(w·sub_dt) with w = n·I_inv·n (partner pinned).
+///
+/// BITE-VERIFIED (both legs of the budget):
+/// - KD clamp disabled: τ_total = −42.25 N·m — fails the |τ| ≤ limit assert.
+/// - KP recording zeroed (budget blind to the KP spend): KD clamps to the
+///   full ±limit on its own, τ_total = −1.0 N·m = 2× limit — fails.
+/// With `torque_limit` left at the default INFINITY the same scenario
+/// delivers |τ| ≫ limit (asserted below), so the capped leg cannot pass
+/// vacuously.
+#[test]
+fn pd_torque_limit_caps_total_kp_plus_kd_torque() {
+    const LIMIT: f64 = 0.5;
+    let axis = Vec3::x();
+
+    let run = |torque_limit: f64| -> (f64, f64) {
+        let mut anchor = RigidBody::new_capsule(1.0, 0.1, 0.03);
+        anchor.pin();
+        let mut arm = RigidBody::new_capsule(1.0, 0.1, 0.03);
+        // 0.5 rad from the target (0) about the axis, swinging away at
+        // 10 rad/s — both PD terms pull/brake in the same (−) direction.
+        arm.orientation = Quat::from_scaled_axis(Vec3::new(0.5, 0.0, 0.0));
+        arm.angular_velocity = Vec3::new(10.0, 0.0, 0.0);
+        let mut bodies = vec![anchor, arm];
+
+        let mut ctrl = AngularPDController::new(0, 1, axis, 50.0, 5.0)
+            .with_torque_limit(torque_limit);
+
+        let n = bodies[0].orientation * axis;
+        let w = n.dot(&(bodies[1].world_inv_inertia() * n)); // body 0 pinned
+        let omega_before = bodies[1].angular_velocity.dot(&n);
+
+        // The two engine passes of one substep, in substep order.
+        ctrl.apply_implicit_kp(&mut bodies, SUB_DT);
+        ctrl.apply_implicit_damping(&mut bodies, SUB_DT);
+
+        let omega_after = bodies[1].angular_velocity.dot(&n);
+        let tau_total = (omega_after - omega_before) / (w * SUB_DT);
+        (tau_total, ctrl.applied_kp_torque)
+    };
+
+    // Uncapped: the same scenario really would overspend the budget.
+    let (tau_uncapped, _) = run(f64::INFINITY);
+    assert!(
+        tau_uncapped.abs() > 10.0 * LIMIT,
+        "scenario does not overspend uncapped (τ = {tau_uncapped} N·m) — \
+         the capped assertion below would be vacuous"
+    );
+
+    // Capped: total respects the limit, and the controller is actually
+    // producing torque at the limit (not a no-op).
+    let (tau_total, applied_kp) = run(LIMIT);
+    assert!(
+        applied_kp.abs() <= LIMIT * (1.0 + 1e-12),
+        "KP pass overspent the budget on its own: {applied_kp} N·m"
+    );
+    assert!(
+        tau_total.abs() <= LIMIT * (1.0 + 1e-9),
+        "total PD torque {tau_total} N·m exceeds torque_limit {LIMIT} \
+         (KP applied {applied_kp}; the KD term must fit the remaining budget)"
+    );
+    assert!(
+        tau_total < -0.9 * LIMIT,
+        "controller under-delivers: τ = {tau_total} N·m, expected saturation \
+         near −{LIMIT} (both terms demand − torque far beyond the limit)"
+    );
+}

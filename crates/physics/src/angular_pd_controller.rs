@@ -35,9 +35,16 @@ pub struct AngularPDController {
     /// External code can update this per frame to do inverse-dynamics
     /// gravity compensation, anticipated-motion feedforward, etc.
     pub feedforward_torque: f64,
-    /// Optional torque cap (N·m). The output torque magnitude (PD + FF
-    /// combined) is clamped to this value; models the maximum force a
+    /// Optional torque cap (N·m) on the controller's TOTAL output
+    /// (KP + feedforward + KD combined); models the maximum torque a
     /// muscle can produce. Set to `f64::INFINITY` for no cap.
+    ///
+    /// Enforced as a per-substep budget across the two implicit passes:
+    /// `apply_implicit_kp` clamps its own applied torque to ±torque_limit
+    /// and records it in `applied_kp_torque`; `apply_implicit_damping`
+    /// (which runs in a later pass of the same substep) then clamps its
+    /// damping torque so the recorded KP torque plus the KD torque stays
+    /// within ±torque_limit.
     pub torque_limit: f64,
     /// If false, controller produces no torque. Models muscle deactivation.
     pub enabled: bool,
@@ -45,10 +52,21 @@ pub struct AngularPDController {
     /// `target_angle` is measured relative to this baseline using
     /// swing-twist factorization.
     pub baseline: UnitQuaternion<f64>,
+    /// Torque (N·m, signed, about the axis) the KP + feedforward pass
+    /// actually applied in the most recent substep. Written by
+    /// `apply_implicit_kp` every call (0 when it early-outs); read by
+    /// `apply_implicit_damping` to enforce the shared `torque_limit`
+    /// budget. Also readable as a diagnostic.
+    pub applied_kp_torque: f64,
 }
 
 impl AngularPDController {
     pub fn new(body_a: usize, body_b: usize, axis: Vec3, kp: f64, kd: f64) -> Self {
+        debug_assert!(
+            (axis.norm() - 1.0).abs() < 1e-6,
+            "AngularPDController axis must be unit length (norm = {})",
+            axis.norm()
+        );
         Self {
             body_a, body_b, axis_local_a: axis,
             kp, kd,
@@ -57,6 +75,7 @@ impl AngularPDController {
             torque_limit: f64::INFINITY,
             enabled: true,
             baseline: UnitQuaternion::identity(),
+            applied_kp_torque: 0.0,
         }
     }
 
@@ -95,7 +114,13 @@ impl AngularPDController {
     /// with s(θ) = −kp·(θ − target) + ff (clamped to torque_limit) and
     /// s' = −kp (0 in the saturated region). Unconditionally stable for
     /// any kp and dt. Must be called once per substep, after
-    /// `integrate_velocities` (alongside the other implicit terms).
+    /// `integrate_velocities` (alongside the other implicit terms) and
+    /// BEFORE `apply_implicit_damping` of the same substep.
+    ///
+    /// The applied impulse is additionally clamped to ±dt·torque_limit and
+    /// the resulting torque recorded in `applied_kp_torque`, so the later
+    /// KD pass can enforce the controller's total-output budget (see
+    /// `torque_limit`).
     ///
     /// This replaced the explicit accumulator-torque KP path (2026-10):
     /// an explicit kp on the foot's few-gram phalanges puts the joint past
@@ -105,7 +130,8 @@ impl AngularPDController {
     /// joint constraints, detonating or toppling assemblies that are quiet
     /// with the implicit form. It was the last stiff explicit term left
     /// after the 2026-06 implicit-integration rewrite.
-    pub fn apply_implicit_kp(&self, bodies: &mut Vec<RigidBody>, dt: f64) {
+    pub fn apply_implicit_kp(&mut self, bodies: &mut Vec<RigidBody>, dt: f64) {
+        self.applied_kp_torque = 0.0;
         if !self.enabled || (self.kp == 0.0 && self.feedforward_torque == 0.0) {
             return;
         }
@@ -133,7 +159,20 @@ impl AngularPDController {
         let omega_rel_n = omega_rel.dot(&n);
 
         let omega_new = (omega_rel_n + dt * w * s) / (1.0 - dt * dt * w * s_prime);
-        let j = (omega_new - omega_rel_n) / w;
+        let mut j = (omega_new - omega_rel_n) / w;
+
+        // Enforce torque_limit on the torque ACTUALLY applied, j/dt. The
+        // pre-solve clamp above tests |s| at the linearization angle θ, but
+        // the backward-Euler solve effectively evaluates the torque at the
+        // end-of-substep state (τ = (s − kp·dt·ω_rel)/(1 + kp·dt²·w)), which
+        // can exceed the limit when the joint is moving away from its target.
+        // Post-clamping the impulse to ±dt·torque_limit reproduces the
+        // saturated branch exactly (constant torque at the limit — the same
+        // bounded regime s_prime = 0 already models) and only ever REDUCES
+        // the applied magnitude, so it cannot destabilize. No-op when
+        // torque_limit is infinite.
+        j = j.clamp(-dt * self.torque_limit, dt * self.torque_limit);
+        self.applied_kp_torque = j / dt;
 
         bodies[self.body_a].angular_velocity -= i_inv_a * n * j;
         bodies[self.body_b].angular_velocity += i_inv_b * n * j;
@@ -143,7 +182,20 @@ impl AngularPDController {
     /// Same impulse-splitting math as `AngularDamper::apply_implicit`,
     /// using `self.kd` as the damping coefficient. Unconditionally
     /// stable for any `kd` and `dt`. Must be called once per substep,
-    /// after `integrate_velocities`.
+    /// after `integrate_velocities` AND after `apply_implicit_kp` (it
+    /// reads `applied_kp_torque` to enforce the shared torque budget).
+    ///
+    /// When `torque_limit` is finite, the damping torque is clamped so
+    /// that |applied_kp_torque + kd_torque| ≤ torque_limit: the limit
+    /// models one muscle's maximum output, so KP + FF + KD share a single
+    /// budget rather than each getting their own. The clamp is applied to
+    /// the impulse AFTER the implicit solve. That is safe: the implicit
+    /// solve's impulse moves ω_rel toward zero without overshoot, and
+    /// because |applied_kp_torque| ≤ torque_limit the budget interval
+    /// always contains zero, so clamping only ever REDUCES the damping
+    /// impulse's magnitude (never flips its sign). A dissipative term
+    /// with reduced magnitude removes less energy but can never inject
+    /// any, so the clamp cannot destabilize.
     pub fn apply_implicit_damping(&self, bodies: &mut Vec<RigidBody>, dt: f64) {
         if !self.enabled || self.kd == 0.0 {
             return;
@@ -169,7 +221,16 @@ impl AngularPDController {
         let factor = 1.0 + self.kd * dt * w;
         let omega_rel_new = omega_rel_n / factor;
         let delta_omega_rel = omega_rel_new - omega_rel_n;
-        let j = delta_omega_rel / w;
+        let mut j = delta_omega_rel / w;
+
+        // Shared torque budget with the KP + feedforward pass (see the
+        // method doc for the stability argument). kd torque = j/dt must
+        // fit in [−limit − applied_kp, +limit − applied_kp].
+        if self.torque_limit.is_finite() {
+            let lo = (-self.torque_limit - self.applied_kp_torque) * dt;
+            let hi = (self.torque_limit - self.applied_kp_torque) * dt;
+            j = j.clamp(lo, hi);
+        }
 
         bodies[self.body_a].angular_velocity -= i_inv_a * n * j;
         bodies[self.body_b].angular_velocity += i_inv_b * n * j;

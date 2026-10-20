@@ -39,6 +39,11 @@ pub struct AngularSpring {
 
 impl AngularSpring {
     pub fn new(body_a: usize, body_b: usize, axis: Vec3, stiffness: f64, target_angle: f64) -> Self {
+        debug_assert!(
+            (axis.norm() - 1.0).abs() < 1e-6,
+            "AngularSpring axis must be unit length (norm = {})",
+            axis.norm()
+        );
         Self {
             body_a, body_b, axis_local_a: axis,
             stiffness, target_angle,

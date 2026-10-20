@@ -51,6 +51,11 @@ impl AngularSoftLimit {
         min_angle: f64, max_angle: f64,
         stiffness: f64, exponent: f64,
     ) -> Self {
+        debug_assert!(
+            (axis.norm() - 1.0).abs() < 1e-6,
+            "AngularSoftLimit axis must be unit length (norm = {})",
+            axis.norm()
+        );
         Self {
             body_a, body_b, axis_local_a: axis,
             min_angle, max_angle, stiffness, exponent,

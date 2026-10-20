@@ -69,6 +69,11 @@ pub struct TorqueDispatcher {
 
 impl TorqueDispatcher {
     pub fn new(axis_world: Vec3, routes: Vec<DispatchRoute>) -> Self {
+        debug_assert!(
+            (axis_world.norm() - 1.0).abs() < 1e-6,
+            "TorqueDispatcher axis_world must be unit length (norm = {})",
+            axis_world.norm()
+        );
         Self {
             axis_world,
             routes,

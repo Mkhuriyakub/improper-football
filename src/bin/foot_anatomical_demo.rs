@@ -273,7 +273,11 @@ fn build_bare() -> Built {
             let axis = if spec.parent == Bone::Talus && spec.child == Bone::Calcaneus {
                 subtalar_axis
             } else {
-                foot::anat_to_world(axis_anat)
+                // Normalize: the JOINTS table literals are approximately unit
+                // (e.g. (0.26, 0, 0.97) has norm ~1.0042) and the engine
+                // primitives require exact unit axes (add_articulated
+                // normalizes too).
+                foot::anat_to_world(axis_anat).normalize()
             };
             world.angular_dampers.push(physics::angular_damper::AngularDamper::new(
                 foot.body(spec.parent), foot.body(spec.child), axis, 1.0));

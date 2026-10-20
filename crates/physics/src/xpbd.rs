@@ -324,7 +324,10 @@ impl XpbdWorld {
     }
 
     fn apply_pd_kp_implicit(&mut self, sub_dt: f64) {
-        for ctrl in &self.angular_pd_controllers {
+        // &mut: the pass records each controller's actually-applied torque
+        // (`applied_kp_torque`) so the later KD pass can enforce the
+        // controller's shared torque_limit budget.
+        for ctrl in &mut self.angular_pd_controllers {
             ctrl.apply_implicit_kp(&mut self.bodies, sub_dt);
         }
     }
