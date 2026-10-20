@@ -141,6 +141,19 @@ throughout:
   assert what the system actually does, not what we wish it did — the
   validation suite's comments document exactly where each limit lies.
 
+## Built with AI, verified by experiment
+
+This project is exploratory research in AI-assisted engineering. I set the
+architecture, the biomechanical fidelity bar, and the milestones. Claude
+worked inside the requirements as a research partner and implementer, and
+every commit is co-authored in the open. What makes the approach trustworthy
+is the discipline around it: engine behavior changes are guarded by
+regression tests, each verified to fail on revert before being trusted, and
+physics claims are only believed after a decisive isolating experiment.
+[`docs/findings.md`](docs/findings.md) records what that process caught,
+including two of its own wrong conclusions. Rigorous testing, constraints,
+and standards are paramount with AI in the loop.
+
 ## Roadmap
 
 1. ~~Full-body joint topology with biological constraints~~ (done)
