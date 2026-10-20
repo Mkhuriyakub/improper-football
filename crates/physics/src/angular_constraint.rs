@@ -70,9 +70,17 @@ impl AngularLimitConstraint {
             return;
         }
 
-        // Generalized inverse mass along n.
-        let i_inv_a = bodies[self.body_a].world_inv_inertia();
-        let i_inv_b = bodies[self.body_b].world_inv_inertia();
+        // Generalized inverse mass along n. Pinned bodies (inv_mass == 0)
+        // are infinite-inertia: use a zero inverse inertia for them
+        // regardless of what their tensor holds (guards against phantom
+        // inertia on bodies pinned by hand). The zero i_inv flows into
+        // both w and the impulse application, so the dynamic partner
+        // receives the full impulse and the pinned body stays at rest.
+        let zero = crate::math::Mat3::zeros();
+        let i_inv_a = if bodies[self.body_a].inv_mass == 0.0 { zero }
+                      else { bodies[self.body_a].world_inv_inertia() };
+        let i_inv_b = if bodies[self.body_b].inv_mass == 0.0 { zero }
+                      else { bodies[self.body_b].world_inv_inertia() };
         let w_a = n.dot(&(i_inv_a * n));
         let w_b = n.dot(&(i_inv_b * n));
         let w = w_a + w_b;

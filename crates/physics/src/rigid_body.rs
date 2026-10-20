@@ -39,7 +39,19 @@ pub struct RigidBody {
 impl RigidBody {
     pub fn new(mass: f64, inertia_tensor: Mat3) -> Self {
         let inv_mass = if mass > 0.0 { 1.0 / mass } else { 0.0 };
-        let inv_inertia = inertia_tensor.try_inverse().unwrap_or(Mat3::zeros());
+        // A body constructed with mass <= 0 is pinned (kinematically fixed).
+        // Its inverse inertia must be zeroed along with inv_mass: a pinned
+        // body with a non-zero inv_inertia_tensor is a "phantom inertia" —
+        // SI constraints would deposit angular velocity into it that
+        // integrate_positions never consumes (it skips inv_mass == 0 bodies),
+        // so the phantom spin persists forever and contaminates every
+        // omega_rel read by dampers, springs, PDs, and the constraints'
+        // own velocity error.
+        let inv_inertia = if mass > 0.0 {
+            inertia_tensor.try_inverse().unwrap_or(Mat3::zeros())
+        } else {
+            Mat3::zeros()
+        };
         Self {
             position: Vec3::zeros(),
             orientation: UnitQuaternion::identity(),
@@ -80,6 +92,28 @@ impl RigidBody {
         let mut body = Self::new(mass, inertia);
         body.capsule_shape = Some(CapsuleShape::new(half_h, radius));
         body
+    }
+
+    /// Pin this body: make it kinematically fixed (infinite mass AND infinite
+    /// inertia) and at rest. This is the one correct way to pin an
+    /// already-constructed dynamic body.
+    ///
+    /// Both inverse tensors must be zeroed, not just `inv_mass`: the
+    /// integrators and the implicit primitives key off `inv_mass == 0.0`,
+    /// but the SI constraint solvers apply angular impulses through
+    /// `inv_inertia_tensor` directly. Leaving the dynamic body's inverse
+    /// inertia in place creates a phantom inertia — the solver deposits
+    /// angular velocity into the pinned body (never cleared, since
+    /// integrate_positions skips it), children are driven to track the
+    /// phantom spin, and impulses meant to be absorbed rigidly are split
+    /// with it, weakening welds to the pinned root. Velocities are zeroed
+    /// so any motion the body had at pin time doesn't persist as a frozen,
+    /// never-integrated velocity that constraints still read.
+    pub fn pin(&mut self) {
+        self.inv_mass = 0.0;
+        self.inv_inertia_tensor = Mat3::zeros();
+        self.linear_velocity = Vec3::zeros();
+        self.angular_velocity = Vec3::zeros();
     }
 
     pub fn apply_force(&mut self, force: Vec3) {

@@ -62,8 +62,17 @@ impl PositionalConstraint {
         // Generalized inverse mass along n.
         let inv_mass_a = bodies[self.body_a].inv_mass;
         let inv_mass_b = bodies[self.body_b].inv_mass;
-        let i_inv_a = bodies[self.body_a].world_inv_inertia();
-        let i_inv_b = bodies[self.body_b].world_inv_inertia();
+        // Pinned bodies (inv_mass == 0) are infinite-inertia: use a zero
+        // inverse inertia for them regardless of what their tensor holds
+        // (guards against phantom inertia on bodies pinned by hand). With
+        // the zero i_inv in BOTH the effective mass w below and the impulse
+        // application, the dynamic partner receives the full impulse rather
+        // than a split one, and the pinned body accumulates no velocity.
+        let zero = crate::math::Mat3::zeros();
+        let i_inv_a = if inv_mass_a == 0.0 { zero }
+                      else { bodies[self.body_a].world_inv_inertia() };
+        let i_inv_b = if inv_mass_b == 0.0 { zero }
+                      else { bodies[self.body_b].world_inv_inertia() };
         let ra_cross_n = r_a.cross(&n);
         let rb_cross_n = r_b.cross(&n);
         let w_a = inv_mass_a + ra_cross_n.dot(&(i_inv_a * ra_cross_n));

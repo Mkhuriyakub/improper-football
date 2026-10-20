@@ -249,8 +249,7 @@ fn build_bare() -> Built {
     // it reproduces that boundary condition, exactly as the validation
     // suite's pinned-shin MTP test does.
     let talus_idx = foot.body(Bone::Talus);
-    world.bodies[talus_idx].inv_mass = 0.0;
-    world.bodies[talus_idx].inv_inertia_tensor = nalgebra::Matrix3::zeros();
+    world.bodies[talus_idx].pin();
 
     // Extra passive damping, host-side composition with the engine's
     // AngularDamper (as attach_talocrural and the balance demos do).

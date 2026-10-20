@@ -595,6 +595,185 @@ fn manifold_keeps_resting_capsule_level_with_two_active_contacts() {
 
 
 // ════════════════════════════════════════════════════════════════════════
+// Pinned bodies — no phantom inertia (the 2026-10 pin fix)
+// ════════════════════════════════════════════════════════════════════════
+
+/// Drive a loaded chain hanging off the given pinned anchor and assert the
+/// anchor is PERFECTLY inert.
+///
+/// Rig: pinned anchor at (0, 0.26, 0) → loaded weld (positional constraint
+/// with a lever arm on the anchor + three zero-range AngularLimitConstraint
+/// locks) → body1 → articulated joint (positional + soft limit + spring +
+/// damper + PD + off-axis locks, the foot's add_articulated stack) → body2,
+/// which is kicked hard so it swings, strikes the ground plane (contact), and
+/// loads every constraint in the chain for the whole run.
+///
+/// Asserted every frame (120 Hz, 3 s): the anchor's linear AND angular
+/// velocity are EXACTLY zero — not small, zero. integrate_velocities and
+/// integrate_positions skip inv_mass == 0 bodies and every implicit primitive
+/// guards on inv_mass, so the only writers that could deposit velocity into a
+/// pinned body are the two SI constraint solvers. Afterwards: the anchor's
+/// position and orientation are bit-identical to the start, and body2 has
+/// settled at a sane hanging pose (finite, slow, near the rig).
+fn assert_pinned_anchor_inert(anchor: RigidBody) {
+    let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
+
+    let mut anchor = anchor;
+    anchor.position = Vec3::new(0.0, 0.26, 0.0);
+    let anchor_idx = world.add_body(anchor);
+
+    // body1: welded to the anchor at (0, 0.24, 0) — 2 cm below the anchor
+    // center, so the positional constraint has a non-zero lever arm (r_a) on
+    // the anchor and its angular-impulse path is exercised, not just the
+    // weld's angular locks.
+    let mut body1 = RigidBody::new_capsule(0.5, 0.05, 0.02);
+    body1.position = Vec3::new(0.0, 0.19, 0.0); // top at 0.26, weld pt inside
+    let body1_idx = world.add_body(body1);
+    add_weld(&mut world, anchor_idx, body1_idx, Vec3::new(0.0, 0.24, 0.0));
+
+    // body2: hung off body1's bottom end by the articulated stack. Its lowest
+    // point starts ~1 cm above the ground, so the kicked swing strikes the
+    // ground manifold and keeps contact in the loop.
+    let joint_world = Vec3::new(0.0, 0.12, 0.0);
+    let mut body2 = RigidBody::new_capsule(0.2, 0.04, 0.015);
+    body2.position = Vec3::new(0.0, 0.065, 0.0);
+    // The kick: swing hard about the hinge so constraints fire hard.
+    body2.linear_velocity = Vec3::new(0.8, 0.0, 0.4);
+    body2.angular_velocity = Vec3::new(4.0, 1.0, 0.0);
+    let body2_idx = world.add_body(body2);
+
+    let mut c = PositionalConstraint::new(body1_idx, body2_idx, 0.0, 1.0 / 60_000.0);
+    c.local_anchor_a = anchor_local(&world, body1_idx, joint_world);
+    c.local_anchor_b = anchor_local(&world, body2_idx, joint_world);
+    world.constraints.push(c);
+    world.angular_soft_limits.push(AngularSoftLimit::new(
+        body1_idx, body2_idx, Vec3::x(), -0.7, 0.7, 8000.0, 2.0,
+    ));
+    world.angular_springs.push(physics::angular_spring::AngularSpring::new(
+        body1_idx, body2_idx, Vec3::x(), 4.0, 0.0,
+    ));
+    world.angular_dampers.push(AngularDamper::new(body1_idx, body2_idx, Vec3::x(), 0.5));
+    world.angular_pd_controllers.push(
+        AngularPDController::new(body1_idx, body2_idx, Vec3::x(), 8.0, 0.3),
+    );
+    for off in [Vec3::y(), Vec3::z()] {
+        world.angular_constraints.push(AngularLimitConstraint::new(
+            body1_idx, body2_idx, off, -0.05, 0.05,
+        ));
+        world.angular_dampers.push(AngularDamper::new(body1_idx, body2_idx, off, 0.5));
+    }
+
+    let start_pos = world.bodies[anchor_idx].position;
+    let start_orient = world.bodies[anchor_idx].orientation;
+    let body2_start = world.bodies[body2_idx].position;
+
+    let frames = (3.0 / DT).round() as usize;
+    for frame in 0..frames {
+        for _ in 0..SUBSTEPS_PER_FRAME {
+            world.substep(SUB_DT);
+        }
+        // (a) EXACT zero, every frame. Any phantom-inertia leak through the
+        // SI solvers shows up here as a non-zero accumulated velocity.
+        let a = &world.bodies[anchor_idx];
+        assert_eq!(
+            a.angular_velocity,
+            Vec3::zeros(),
+            "pinned anchor accumulated phantom angular velocity {:?} by frame {frame} \
+             (SI constraint applied an impulse through a non-zero inv_inertia_tensor)",
+            a.angular_velocity
+        );
+        assert_eq!(
+            a.linear_velocity,
+            Vec3::zeros(),
+            "pinned anchor accumulated linear velocity {:?} by frame {frame}",
+            a.linear_velocity
+        );
+    }
+
+    // (b) Pose bit-identical: the integrators skip pinned bodies, and with
+    // zero velocities nothing else may have moved it.
+    let a = &world.bodies[anchor_idx];
+    assert_eq!(a.position, start_pos, "pinned anchor position changed");
+    assert_eq!(
+        a.orientation.coords, start_orient.coords,
+        "pinned anchor orientation changed"
+    );
+
+    // (c) The hanging chain settled at a sane pose: finite, slow, still near
+    // the rig (a weakened weld or phantom-tracking children would drift or
+    // keep orbiting the phantom spin).
+    let b2 = &world.bodies[body2_idx];
+    assert!(
+        finite(b2.position) && finite(b2.linear_velocity) && finite(b2.angular_velocity),
+        "hanging body went non-finite"
+    );
+    assert!(
+        b2.linear_velocity.norm() < 0.05,
+        "hanging body still moving after 3 s: |v| = {} m/s",
+        b2.linear_velocity.norm()
+    );
+    assert!(
+        b2.angular_velocity.norm() < 0.5,
+        "hanging body still spinning after 3 s: |ω| = {} rad/s",
+        b2.angular_velocity.norm()
+    );
+    let drift = (b2.position - body2_start).norm();
+    assert!(
+        drift < 0.15,
+        "hanging body ended {drift} m from start (chain drifted — weld/joint not holding)"
+    );
+}
+
+/// REAL BUG GUARDED (found by the 2026-10 full engine review).
+/// `RigidBody::new(0.0, inertia)` zeroed `inv_mass` but still inverted the
+/// inertia tensor, leaving a pinned body with a full non-zero
+/// `inv_inertia_tensor` — a PHANTOM INERTIA. The implicit primitives all
+/// guard on `inv_mass == 0.0`, and the integrators skip pinned bodies, but
+/// the two SI constraint solvers (`PositionalConstraint::solve_axis`,
+/// `AngularLimitConstraint::solve`) applied angular impulses through the
+/// phantom tensor: the pinned body's `angular_velocity` accumulated and was
+/// NEVER cleared (integrate_positions skips it, so the orientation never
+/// moved — the spin was invisible), every `omega_rel` read by dampers,
+/// springs, PDs and the constraints' own velocity error was contaminated
+/// (children driven to TRACK the phantom spin), and welds to pinned roots
+/// were silently weakened (impulse split with the phantom inertia instead of
+/// absorbed rigidly).
+///
+/// Fix (three engine parts, all covered here): `RigidBody::new` zeroes the
+/// inverse inertia when mass <= 0; `RigidBody::pin()` is the one correct way
+/// to pin an existing body (zeroes both inverse tensors AND velocities); both
+/// SI solvers use a zero i_inv for `inv_mass == 0` bodies in the effective
+/// mass AND the impulse application (so the dynamic partner receives the
+/// FULL impulse, not a split one).
+///
+/// Both pinning paths are exercised: construction with zero mass, and
+/// pinning a live dynamic body mid-flight via `pin()`.
+///
+/// BITE-VERIFIED (2026-10-19): with the engine fix locally reverted
+/// (constructor inverting the tensor again and both SI solvers using the raw
+/// `world_inv_inertia()`), this test FAILS in the first frame on the exact-
+/// zero phantom angular-velocity assertion for the `RigidBody::new(0.0, ..)`
+/// anchor. With the fix restored it passes.
+#[test]
+fn pinned_body_stays_perfectly_inert_under_si_constraints() {
+    // Path 1: pinned at construction. Mat3::identity() is the review's exact
+    // reproducer: pre-fix it inverted to a full identity phantom inertia.
+    assert_pinned_anchor_inert(RigidBody::new(0.0, Mat3::identity()));
+
+    // Path 2: a live dynamic body (with velocities and a real inertia
+    // tensor) pinned via pin(). Must behave identically — pin() zeroes
+    // inv_mass, inv_inertia_tensor, AND both velocities.
+    let mut live = RigidBody::new_capsule(1.0, 0.05, 0.02);
+    live.linear_velocity = Vec3::new(1.0, -2.0, 0.5);
+    live.angular_velocity = Vec3::new(3.0, 1.0, -2.0);
+    live.pin();
+    assert_eq!(live.linear_velocity, Vec3::zeros(), "pin() must zero linear velocity");
+    assert_eq!(live.angular_velocity, Vec3::zeros(), "pin() must zero angular velocity");
+    assert_pinned_anchor_inert(live);
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // PD proportional term — implicit integration (the 2026-10 pump fix)
 // ════════════════════════════════════════════════════════════════════════
 

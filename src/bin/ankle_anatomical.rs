@@ -66,8 +66,7 @@ fn build_world() -> Assembly {
     // foot rocking off its small contact patch, NOT an ankle-gain problem.
     if std::env::var("ANKLE_PIN_FOOT").is_ok() {
         for &idx in foot.bodies.iter() {
-            world.bodies[idx].inv_mass = 0.0;
-            world.bodies[idx].inv_inertia_tensor = nalgebra::Matrix3::zeros();
+            world.bodies[idx].pin();
         }
     }
 
@@ -346,8 +345,7 @@ fn test_mtp_pushoff() -> TestResult {
     let shin_idx = world.add_body(shin);
     let foot = foot::build_foot(&mut world, attach);
     foot::attach_talocrural(&mut world, shin_idx, &foot, -0.35, 0.70, 800.0, 40.0);
-    world.bodies[shin_idx].inv_mass = 0.0;
-    world.bodies[shin_idx].inv_inertia_tensor = nalgebra::Matrix3::zeros();
+    world.bodies[shin_idx].pin();
 
     let pd_idx = foot.pd_by_child[Bone::HalluxPp as usize];
     let pp_idx = foot.body(Bone::HalluxPp);
