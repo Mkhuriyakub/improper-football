@@ -477,8 +477,11 @@ fn setup(
     // long, so the bare-mode camera sits close; loaded mode pulls back to
     // frame the 1.3 m column and its collapse.
     let camera_transform = match *mode {
-        Mode::Bare => Transform::from_xyz(0.45, 0.30, 0.50)
-            .looking_at(Vec3::new(0.0, 0.05, 0.08), Vec3::Y),
+        // Close anterior-lateral three-quarter view: the foot is only ~25 cm
+        // long, so the camera sits near enough that it fills the frame for
+        // the README capture.
+        Mode::Bare => Transform::from_xyz(0.28, 0.17, 0.33)
+            .looking_at(Vec3::new(0.0, 0.03, 0.07), Vec3::Y),
         Mode::Loaded => Transform::from_xyz(1.1, 0.85, 1.3)
             .looking_at(Vec3::new(0.0, 0.45, 0.0), Vec3::Y),
     };
@@ -691,7 +694,7 @@ fn update_readout(sim: Res<Sim>, mut q: Query<&mut Text, With<Readout>>) {
                 Some(i) => format!("{} ({}/{})", scenario_name(i), i + 1, SCENARIO_COUNT),
             };
             format!(
-                "26-bone anatomical foot — manifold ground contact\n\
+                "26-bone anatomical foot | manifold ground contact\n\
                  scenario: {}\n\
                  sim time: {:.1} s\n\
                  contacts: {}   total Fn: {:.1} N",
