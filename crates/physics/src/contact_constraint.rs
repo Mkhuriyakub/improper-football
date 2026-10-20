@@ -136,7 +136,32 @@ impl ContactConstraint {
         }
 
         // ─── Friction (Coulomb cone, world XZ tangent plane) ──────────
-        if self.friction_coefficient <= 0.0 || self.lambda_normal <= 0.0 {
+        if self.friction_coefficient <= 0.0 {
+            return;
+        }
+        if self.lambda_normal <= 0.0 {
+            // Contact released within this substep: an earlier SI iteration
+            // accumulated friction while λ_n > 0, then a later iteration
+            // clamped λ_n back to 0. The Coulomb cone is now |λ_t| ≤ μ·λ_n
+            // = 0, so any accumulated tangential impulse violates it —
+            // leaving it applied puts a stale friction kick on the body for
+            // the rest of the substep (and, since both contact containers
+            // rebuild/reset impulses every substep, it is never unwound
+            // later). Project to the cone: remove the accumulated impulse
+            // through the SAME lever arm it was applied with (r is
+            // orientation-dependent only, and orientation doesn't change
+            // within the SI loop, so the removal cancels exactly).
+            if self.lambda_friction.norm() > 1e-15 {
+                let body = &bodies[self.body];
+                let r = body.orientation * self.local_point;
+                let i_inv = body.world_inv_inertia();
+                let removal =
+                    Vec3::new(-self.lambda_friction.x, 0.0, -self.lambda_friction.y);
+                let r_cross_imp = r.cross(&removal);
+                bodies[self.body].linear_velocity += removal * inv_mass;
+                bodies[self.body].angular_velocity += i_inv * r_cross_imp;
+                self.lambda_friction = Vec2::zeros();
+            }
             return;
         }
         // Re-read body state after normal impulse.

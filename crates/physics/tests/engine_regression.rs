@@ -9,6 +9,7 @@
 //! `src/anatomy/foot.rs::foot_settles_on_ground_without_exploding`.
 
 use physics::angular_constraint::AngularLimitConstraint;
+use physics::contact_constraint::ContactConstraint;
 use physics::angular_damper::AngularDamper;
 use physics::angular_pd_controller::AngularPDController;
 use physics::angular_soft_limit::AngularSoftLimit;
@@ -1067,5 +1068,261 @@ fn gram_scale_pd_in_ground_contact_does_not_pump() {
         (-0.35..=-0.08).contains(&dip_lift),
         "lift response lost: DIP mean {dip_lift} rad outside [−0.35, −0.08] \
          (measured −0.156; the pre-fix engine gives −0.035, flipped ordering +0.0003)"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Coulomb friction — cone threshold, kinetic dissipation, release unwind
+// ════════════════════════════════════════════════════════════════════════
+
+/// A 1 kg capsule lying with its long axis along world +X (2-point footprint)
+/// at rest height. Pushed ALONG its axis so the response is pure sliding —
+/// a push perpendicular to the axis would let it roll instead of testing the
+/// friction cone.
+fn resting_axial_capsule(world: &mut XpbdWorld) -> usize {
+    let radius = 0.03;
+    let half_h = 0.15;
+    let mut body = RigidBody::new_capsule(1.0, half_h, radius);
+    // Local +Y onto world +X (same rotation as the manifold level test).
+    body.orientation = Quat::from_scaled_axis(Vec3::new(0.0, 0.0, -std::f64::consts::FRAC_PI_2));
+    body.position = Vec3::new(0.0, radius, 0.0);
+    world.add_body(body)
+}
+
+/// Advance `seconds` while applying a constant external force to `idx` every
+/// substep. Force accumulators clear at the end of every substep, so a
+/// sustained load must be re-applied inside the substep loop (applying it
+/// once per frame would deliver 1/60 of the intended authority).
+fn run_with_constant_force(world: &mut XpbdWorld, idx: usize, force: Vec3, seconds: f64) {
+    let frames = (seconds / DT).round() as usize;
+    for _ in 0..frames {
+        for _ in 0..SUBSTEPS_PER_FRAME {
+            world.bodies[idx].apply_force(force);
+            world.substep(SUB_DT);
+        }
+    }
+}
+
+/// Static friction cone threshold, pinned from BOTH sides. The engine's
+/// ground plane is horizontal-only, so slope loading is emulated by a
+/// constant lateral force F_t on a resting capsule of weight W = mg = 9.81 N
+/// with μ = 0.6 (the ground default): the Coulomb condition is hold for
+/// F_t < μW = 5.886 N, slide for F_t > μW.
+///
+/// Below the cone (F_t = 0.7·μW = 4.12 N): net horizontal displacement over
+/// 2 s must stay under 1 mm. The friction impulse needed per substep
+/// (F_t·sub_dt) is 70% of the cone budget (μ·λ_n ≈ μ·W·sub_dt), so the SI
+/// solver must cancel the push exactly every substep — any systematic creep
+/// is a cone leak.
+///
+/// Above the cone (F_t = 1.3·μW = 7.65 N): kinetic sliding at
+/// a = (1.3 − 1.0)·μ·g ≈ 1.766 m/s² ⇒ ideal displacement ½at² ≈ 3.53 m and
+/// ideal final speed ≈ 3.53 m/s over 2 s.
+#[test]
+fn static_friction_holds_below_cone_and_slides_above() {
+    let mu = 0.6;
+    let weight = 1.0 * 9.81;
+
+    // ── Below the cone: must NOT slide. ──────────────────────────────────
+    let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
+    assert_eq!(world.ground.friction_coefficient, mu, "test assumes ground μ = 0.6");
+    let idx = resting_axial_capsule(&mut world);
+    let start = world.bodies[idx].position;
+
+    run_with_constant_force(&mut world, idx, Vec3::new(0.7 * mu * weight, 0.0, 0.0), 2.0);
+
+    let b = &world.bodies[idx];
+    assert!(finite(b.position), "held capsule went non-finite");
+    let slip = ((b.position.x - start.x).powi(2) + (b.position.z - start.z).powi(2)).sqrt();
+    println!("below-cone horizontal displacement = {:.3e} m", slip);
+    assert!(
+        slip < 0.001,
+        "capsule slid {slip} m under sub-cone load 0.7·μW (static friction must hold; < 1 mm)"
+    );
+
+    // ── Above the cone: MUST slide, at the Coulomb kinetic rate. ─────────
+    let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
+    let idx = resting_axial_capsule(&mut world);
+    let start = world.bodies[idx].position;
+
+    run_with_constant_force(&mut world, idx, Vec3::new(1.3 * mu * weight, 0.0, 0.0), 2.0);
+
+    let b = &world.bodies[idx];
+    assert!(finite(b.position), "sliding capsule went non-finite");
+    let travel = b.position.x - start.x;
+    let v_end = b.linear_velocity.x;
+    println!("above-cone travel = {travel:.4} m, end speed = {v_end:.4} m/s (ideal 3.53 m, 3.53 m/s)");
+    // Ideal Coulomb values: 3.53 m and 3.53 m/s. Band ±25%: friction can
+    // only act through the cone, so travel below 75% of ideal means extra
+    // tangential resistance beyond μ·λ_n (cone violation from above), and
+    // travel beyond 125% means friction under-delivering (cone leak).
+    assert!(
+        (2.65..=4.42).contains(&travel),
+        "supra-cone slide traveled {travel} m; Coulomb kinetics predict 3.53 m (±25%)"
+    );
+    assert!(
+        v_end > 2.65,
+        "supra-cone slide end speed {v_end} m/s; Coulomb kinetics predict 3.53 m/s"
+    );
+}
+
+/// Kinetic friction dissipates a velocity kick at a = μg and nothing else.
+/// A resting capsule kicked to 1 m/s along its axis must decelerate at
+/// μg ≈ 5.886 m/s²: stop time v/μg ≈ 0.17 s, stopping distance
+/// v²/(2μg) ≈ 0.0849 m. Asserted on BOTH sides so the test pins the scale,
+/// not just "eventually stops": still moving at 0.05 s (Coulomb friction
+/// cannot decelerate faster than μg, so v(0.05 s) ≥ 1 − μg·0.05 ≈ 0.71 m/s),
+/// and at rest (< 0.01 m/s) by 0.5 s (≈ 3× the ideal stop time).
+#[test]
+fn kinetic_friction_stops_slide_at_coulomb_rate() {
+    let mu = 0.6;
+    let g = 9.81;
+    let v0 = 1.0;
+
+    let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
+    let idx = resting_axial_capsule(&mut world);
+    world.bodies[idx].linear_velocity = Vec3::new(v0, 0.0, 0.0);
+    let start = world.bodies[idx].position;
+
+    // 0.05 s = 6 frames: must NOT have stopped yet.
+    run_for(&mut world, 0.05);
+    let v_mid = world.bodies[idx].linear_velocity.norm();
+    println!("speed at 0.05 s = {v_mid:.4} m/s (ideal 0.706)");
+    assert!(
+        v_mid > 0.5,
+        "speed at 0.05 s is {v_mid} m/s — friction decelerating faster than the cone \
+         allows (μg bound predicts ≥ 0.71 m/s; > 0.5 with transient headroom)"
+    );
+
+    // By 0.5 s (≈ 3× the ideal 0.17 s stop time): at rest.
+    run_for(&mut world, 0.45);
+    let b = &world.bodies[idx];
+    assert!(finite(b.position), "slide-stop capsule went non-finite");
+    let v_end = b.linear_velocity.norm();
+    assert!(
+        v_end < 0.01,
+        "still sliding at 0.5 s: |v| = {v_end} m/s (μg = 5.886 m/s² stops 1 m/s in ~0.17 s)"
+    );
+
+    // Net displacement ≈ v²/(2μg) = 84.9 mm.
+    let travel = b.position.x - start.x;
+    let ideal = v0 * v0 / (2.0 * mu * g);
+    println!("slide-stop travel = {travel:.4} m (ideal {ideal:.4})");
+    assert!(
+        (ideal * 0.75..=ideal * 1.25).contains(&travel),
+        "slide-stop travel {travel} m; Coulomb kinetics predict v²/(2μg) = {ideal:.4} m (±25%)"
+    );
+}
+
+/// THE RELEASE-UNWIND BUG (2026-10 engine review). Within one substep's SI
+/// iterations, an early iteration can accumulate friction impulse
+/// (λ_n > 0, λ_t ≠ 0) and a later iteration can clamp λ_n back to 0 — the
+/// contact releasing mid-substep, e.g. another constraint in the Gauss-Seidel
+/// sweep yanking the body upward (foot roll-off / CoP migration regime).
+/// Pre-fix, `ContactConstraint::solve` early-returned from the friction
+/// section on `lambda_normal <= 0.0` BEFORE the cone projection, so the stale
+/// tangential impulse stayed applied for the rest of the substep: a
+/// systematic Coulomb-cone violation |λ_t| > μ·λ_n = 0. Both contact
+/// containers (`ground_manifold`, regenerated per substep, and the
+/// user-pushed `contact_constraints`, impulse-reset per substep) run this
+/// same solve path, so the stale impulse is never unwound later — the error
+/// lands on the body, bounded by one substep's friction impulse per release.
+///
+/// This test drives `ContactConstraint::solve` through exactly that
+/// iteration sequence, deterministically (the mid-sweep upward velocity
+/// change stands in for the interleaved constraint):
+///   iter 1: penetrating, moving down + sideways ⇒ accumulates λ_n and λ_t;
+///   between iters: +2 m/s upward velocity (Gauss-Seidel neighbor);
+///   iter 2: separating ⇒ λ_n clamps to 0 — the cone is now |λ_t| ≤ 0;
+///   iters 3..8: no-ops (default solver_iterations = 8).
+/// The contact geometry puts the contact point straight below the CoM
+/// (r ∥ n ⇒ r×n = 0), so the normal impulse cannot touch vx or ω: ANY net
+/// change in either is tangential impulse. After release the cone allows
+/// exactly zero net tangential impulse.
+///
+/// MEASURED (2026-10-20): the solve accumulates λ_t = 0.17393 N·s in
+/// iteration 1. Pre-fix the release leaves ALL of it on the body (net
+/// m·Δvx = −0.17393 N·s, stale ω = 6.354 rad/s from the friction torque).
+/// Post-fix the unwind applies −λ_t through the same lever arm, cancelling
+/// to float rounding. Bound 1e-9 N·s: ~10⁶× above f64 rounding of these
+/// O(0.1) impulses, ~10⁸× below the stale impulse.
+///
+/// BITE-VERIFIED (2026-10-20): with the cone projection reverted to the
+/// plain `lambda_normal <= 0.0` early-return, this test FAILS on the
+/// net-tangential-impulse assertion with the full −0.17393 N·s stale
+/// impulse. Tests `static_friction_holds_below_cone_and_slides_above` and
+/// `kinetic_friction_stops_slide_at_coulomb_rate` pass pre-fix too — they
+/// guard the cone generally, not this release path.
+#[test]
+fn contact_release_unwinds_accumulated_friction_to_the_cone() {
+    let mass = 1.0;
+    let half_h = 0.1;
+    let radius = 0.03;
+
+    // Upright capsule, contact point at the bottom tip, straight below the
+    // CoM: local_point ∥ -Y so r×n = 0 (normal impulses can't alter vx/ω).
+    let mut body = RigidBody::new_capsule(mass, half_h, radius);
+    let tip = half_h + radius;
+    body.position = Vec3::new(0.0, tip - 0.001, 0.0); // 1 mm penetration
+    let vx0 = 1.0;
+    body.linear_velocity = Vec3::new(vx0, -0.5, 0.0); // sliding + pressing
+    let mut bodies = vec![body];
+
+    let mut c = ContactConstraint::new(0, Vec3::new(0.0, -tip, 0.0))
+        .with_friction(0.6)
+        .with_baumgarte(0.0); // manifold constraints run β = 0
+    c.reset_impulses();
+
+    // Iteration 1: accumulate normal + friction.
+    c.solve(&mut bodies, SUB_DT);
+    assert!(c.lambda_normal > 0.0, "setup failed: no normal impulse accumulated");
+    let lambda_t_accum = c.lambda_friction.norm();
+    assert!(
+        lambda_t_accum > 0.05,
+        "setup failed: no meaningful friction accumulated (λ_t = {lambda_t_accum} N·s)"
+    );
+    assert!(
+        bodies[0].linear_velocity.x < vx0,
+        "setup failed: friction did not engage in iteration 1"
+    );
+
+    // Between iterations: a neighboring constraint in the Gauss-Seidel sweep
+    // yanks the body upward (release mid-substep).
+    bodies[0].linear_velocity.y += 2.0;
+
+    // Iterations 2..8 (default solver_iterations = 8): λ_n clamps to 0 in
+    // iter 2; the remaining iterations must leave the released state alone.
+    for _ in 0..7 {
+        c.solve(&mut bodies, SUB_DT);
+    }
+
+    assert_eq!(c.lambda_normal, 0.0, "contact did not release (λ_n = {})", c.lambda_normal);
+    // Net tangential impulse actually delivered to the body over the substep,
+    // and the stale angular velocity the friction torque would leave behind.
+    let net_tangential = mass * (bodies[0].linear_velocity.x - vx0);
+    let stale_omega = bodies[0].angular_velocity.norm();
+    println!(
+        "release substep: accumulated λ_t = {lambda_t_accum:.4} N·s, \
+         net delivered = {net_tangential:.3e} N·s, residual ω = {stale_omega:.3e} rad/s"
+    );
+    assert!(
+        net_tangential.abs() < 1e-9,
+        "released contact left {net_tangential} N·s of stale tangential impulse on the body \
+         (iteration-1 accumulation was {lambda_t_accum} N·s; cone with λ_n = 0 allows none)"
+    );
+    // The Coulomb cone with λ_n = 0 admits NO tangential impulse.
+    assert!(
+        c.lambda_friction.norm() <= 1e-12,
+        "released contact still holds friction accumulator |λ_t| = {} N·s (cone: |λ_t| ≤ μ·λ_n = 0)",
+        c.lambda_friction.norm()
+    );
+    // The unwind goes through the same lever arm, so the angular kick must
+    // cancel too (r×n = 0 ⇒ nothing else touched ω).
+    assert!(
+        stale_omega < 1e-9,
+        "released contact left stale angular velocity {stale_omega} rad/s from friction torque"
     );
 }
