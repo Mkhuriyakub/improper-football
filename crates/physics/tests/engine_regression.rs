@@ -965,12 +965,20 @@ fn run_chain_measured(world: &mut XpbdWorld, idxs: &[usize], seconds: f64) -> Ch
 /// wedged by the manifold/friction loop, and the DIP — the joint with the
 /// smallest inertia, the pump's epicenter — carries the response.
 ///
-/// MEASURED (current engine, the values the bounds derive from, ~3× headroom):
+/// MEASURED (pre-speculative-contact engine, the values the bounds were
+/// originally derived from, ~3× headroom):
 ///   P0 rest:   max|ω| 4.8e-2, last-sec 3.3e-7 rad/s; joints ≈ 0.
 ///   P1 press:  max|ω| 42.7 (transient), last-sec 0.167 rad/s;
 ///              DIP mean +0.2100 rad, PIP −0.086, MTP ≈ 0 (wedged).
 ///   P2 lift:   max|ω| 208.8 (transient), last-sec 8.0e-3 rad/s;
 ///              DIP mean −0.1557 rad.
+/// RE-MEASURED after speculative ground contact (ea16cf1): transients and
+/// settles nearly unchanged (P1 max|ω| 41.4, DIP press +0.2085, DIP lift
+/// −0.1606), but sustained jitter COLLAPSED by ~5 orders (P0 3e-12,
+/// P1 1.2e-11, P2 2.2e-12 rad/s) — settle-phase micro-embeds were a
+/// low-grade excitation source. Bounds kept at the pre-speculative
+/// calibration: they still discriminate the failure regimes by orders of
+/// magnitude and stay valid if speculative admission is ever tuned.
 ///
 /// EQUILIBRIUM BAND. The DIP band [0.10, 0.35] is around the MEASURED settle,
 /// not an analytic prediction: the sequential one-term-at-a-time implicit

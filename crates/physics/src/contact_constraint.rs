@@ -156,6 +156,16 @@ impl ContactConstraint {
         }
 
         // ─── Friction (Coulomb cone, world XZ tangent plane) ──────────
+        //
+        // POLICY NOTE (deliberate, not an accident): speculative contacts
+        // (generated for a predicted end-of-substep crossing while the point
+        // is still a hair above the plane) accumulate λ_n through the
+        // approach-speed floor, and therefore ALSO run friction — i.e.
+        // touchdown friction fires one substep early, at a point up to
+        // v·sub_dt (sub-mm) above the plane. This is the inelastic
+        // frictional-impact behavior moved one substep forward, bounded by
+        // the gap; NOT a sustained drag on separated bodies (a speculative
+        // contact that never develops λ_n > 0 never accumulates friction).
         if self.friction_coefficient <= 0.0 {
             return;
         }
