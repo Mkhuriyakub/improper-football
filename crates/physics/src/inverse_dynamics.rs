@@ -23,6 +23,16 @@ pub struct SupportedBody {
 /// local frame as the corresponding `AngularPDController`). The
 /// observer doesn't enforce consistency — the binary author is
 /// responsible.
+///
+/// COAXIAL-MIGRATION NOTE (Stage 2, 2026-10): `IDJoint` currently targets
+/// only `world.angular_pd_controllers` (via `pd_idx`). Joints migrated to
+/// the combined `JointAxis` primitive — the anatomical foot's, as of
+/// Stage 2 — cannot receive gravity feedforward until a JointAxis variant
+/// is added (an index into `world.joint_axes`, writing that joint's
+/// `feedforward_torque`, which the combined solve already folds into its
+/// active output). The extension is deferred deliberately: no migrated
+/// joint uses inverse dynamics today (the foot does not), so adding the
+/// variant now would be untested scaffolding.
 pub struct IDJoint {
     /// Index into `world.angular_pd_controllers`.
     pub pd_idx: usize,

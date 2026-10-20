@@ -342,6 +342,18 @@ impl JointAxis {
     ///    energy or destabilize. The passive terms keep their full implicit
     ///    treatment (their stiffness/damping stay in the denominator):
     ///    "the muscle saturates, the ligaments don't."
+    ///
+    ///    σ SIGN-FLIP SUB-CASE (intentional): σ is the sign of the
+    ///    END-OF-SUBSTEP demand τ_act⁺, not of the position error at θₙ.
+    ///    When the joint flies fast TOWARD the target, the velocity terms
+    ///    (−kd·ω⁺ and the kp term's −kp·dt·ω⁺ lookahead) can dominate and
+    ///    flip σ negative while kp·(target − θₙ) alone is still positive:
+    ///    the combined solve then BRAKES at −torque_limit where the legacy
+    ///    pass (which clamps the θₙ demand) kept pushing at +torque_limit.
+    ///    The muscle spends its bounded budget decelerating into the
+    ///    target instead of accelerating past it — more physical, and a
+    ///    deliberate divergence from the legacy criterion (see the T2
+    ///    saturation-criterion note in tests/joint_axis.rs).
     /// 6. Apply the single impulse J = (ω⁺ − ω)/w to both bodies; record
     ///    `applied_total_torque = J/dt`; clear the ext_* injections.
     pub fn apply_implicit(&mut self, bodies: &mut Vec<RigidBody>, dt: f64) {
@@ -353,6 +365,15 @@ impl JointAxis {
         self.ext_torque = 0.0;
         self.ext_stiffness = 0.0;
         self.ext_damping = 0.0;
+        // The denominator-≥-1 A-stability certificate (see the struct docs)
+        // requires every stiffness and damping contribution to be ≥ 0; the
+        // built-in terms are non-negative by construction, so the external
+        // injections are the only way a caller can break it.
+        debug_assert!(
+            ext_stiffness >= 0.0 && ext_damping >= 0.0,
+            "JointAxis ext_stiffness ({ext_stiffness}) and ext_damping ({ext_damping}) must \
+             be >= 0: a negative injection voids the denominator->=-1 A-stability certificate"
+        );
         self.applied_active_torque = 0.0;
         self.applied_total_torque = 0.0;
 

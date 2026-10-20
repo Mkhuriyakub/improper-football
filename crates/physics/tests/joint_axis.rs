@@ -79,14 +79,27 @@ fn pinned_pair(world: &mut XpbdWorld, child_mass: f64, child_inertia: f64) -> (u
 ///   combined: 0.4000000 at 1/7200, 0.4000000 at 1/3600 (both exactly on
 ///             the analytic 0.400)
 ///   legacy:   0.0001212 at 1/7200, 0.0000045 at 1/3600
-/// The legacy bias is far MORE severe than the design note's ≈0.038
-/// stationary estimate: at I = 1e-8 the shared damper is itself attenuated
-/// into a per-substep velocity annihilator (dt·w·c ≈ 1.4e4), which
-/// damper-rectifies the already ~90%-attenuated kp impulse to ~0.03% command
-/// authority — the same rectification mechanism e9dda0b measured on the
-/// pinned hallux, here taken to its small-inertia extreme. Because both
-/// legacy values are near zero, "lands at a DIFFERENT value at 1/3600" is
-/// asserted as a RATIO (measured 26.7×), not an absolute gap.
+/// The legacy figures are velocity-annihilated CREEP SNAPSHOTS at this
+/// test's pinned 6.0 s horizon, NOT settles. The sequential map's own
+/// quasi-fixed points (stationarity: the kp pass's velocity contribution,
+/// attenuated by its own denominator, balances the spring pass's raw
+/// torque — kp·(t − θ)/(1 + dt²·w·kp) = K_sp·θ) sit at θ** ≈ 0.0823 at
+/// 1/7200 (dt²·w·kp = 7.72) and ≈ 0.0243 at 1/3600 (30.9). But the shared
+/// damper is itself attenuated into a per-substep velocity annihilator
+/// (dt·w·c ≈ 1.4e4, plus dt·w·kd ≈ 2.1e3), which damper-rectifies the
+/// already ~90%-attenuated kp impulse to ~0.03% command authority: 6 s
+/// covers ~0.15% of the distance to θ**, so full convergence is thousands
+/// of seconds away — the same rectification mechanism e9dda0b measured on
+/// the pinned hallux, taken to its small-inertia extreme. Because both
+/// snapshots are near zero, "lands at a DIFFERENT value at 1/3600" is
+/// asserted as a RATIO (measured 26.7× between the 6 s snapshots), not an
+/// absolute gap.
+///
+/// DO NOT LENGTHEN THE HORIZON WITHOUT REDERIVING THE RATIO BOUND: at full
+/// convergence the quasi-fixed points differ by only 0.0823/0.0243 ≈ 3.4×,
+/// so the >5× assertion below would FAIL on a converged run. The 5×
+/// discriminates the 6 s creep snapshots (whose creep RATES are strongly
+/// dt-dependent), not the stationary points.
 #[test]
 fn t1_combined_equilibrium_is_dt_independent_legacy_is_not() {
     let kp = 4.0;
@@ -115,7 +128,10 @@ fn t1_combined_equilibrium_is_dt_independent_legacy_is_not() {
             world.angular_springs.push(AngularSpring::new(p, ch, axis, k_sp, 0.0));
             world.angular_dampers.push(AngularDamper::new(p, ch, axis, c));
         }
-        let n = (6.0 / sub_dt).round() as usize; // 6 s — far past settling
+        // 6 s: far past the combined solve's settling. For the LEGACY build
+        // this is a pinned CREEP-SNAPSHOT horizon (see header) — DO NOT
+        // LENGTHEN WITHOUT REDERIVING the >5× ratio bound below.
+        let n = (6.0 / sub_dt).round() as usize;
         run_substeps(&mut world, sub_dt, n);
         joint_angle(&world, p, ch, axis)
     };
@@ -142,15 +158,16 @@ fn t1_combined_equilibrium_is_dt_independent_legacy_is_not() {
     // attenuation ~90%+ at this inertia)...
     assert!(
         (legacy_fine - analytic).abs() > 0.1,
-        "legacy @1/7200 settled at {legacy_fine} rad — unexpectedly NEAR the analytic \
-         {analytic}; the split bias this primitive exists to remove has vanished"
+        "legacy @1/7200 reached {legacy_fine} rad at the 6 s snapshot — unexpectedly NEAR \
+         the analytic {analytic}; the split bias this primitive exists to remove has vanished"
     );
-    // ...and dt-DEPENDENT (the bias scales with dt²·w·k and dt·w·c; both
-    // settles are near zero, so the dependence shows as a large ratio —
-    // measured 26.7× across the 2× substep change).
+    // ...and dt-DEPENDENT (the creep rate scales with dt²·w·k and dt·w·c;
+    // both 6 s snapshots are near zero, so the dependence shows as a large
+    // ratio — measured 26.7× across the 2× substep change; see the header's
+    // DO-NOT-LENGTHEN note before touching the horizon or this bound).
     assert!(
         legacy_fine > 5.0 * legacy_coarse,
-        "legacy settled at {legacy_fine} vs {legacy_coarse} across a 2× substep change — \
+        "legacy crept to {legacy_fine} vs {legacy_coarse} across a 2× substep change — \
          unexpectedly dt-independent"
     );
 }
@@ -663,10 +680,12 @@ fn hallux_ray_airborne(combined: bool) -> (XpbdWorld, Vec<usize>) {
 ///             the authority to push back against the (less-attenuated,
 ///             smaller-k) PD pass.
 ///   combined: MTP last-sec mean 1.2414 rad (min = max to 4 decimals),
-///             max|ω| 2.9e-12 rad/s — exactly the analytic PD-vs-limit
-///             torque balance 30·(1.5−θ) = 4θ + 8000(θ−1.22)² ⇒ θ* ≈ 1.2397
-///             (the 1.5e-3 offset is the off-axis-lock + positional-anchor
-///             coupling of the full stack), inside rom_max + 0.03.
+///             max|ω| 2.9e-12 rad/s — the analytic PD-vs-limit torque
+///             balance 30·(1.5−θ) = 4θ + 8000(θ−1.22)², i.e. 8000θ² −
+///             19486θ + 11862.2 = 0, engaged root θ* = (19486 +
+///             √113796)/16000 = 1.2390 (the 2.4e-3 offset is the
+///             off-axis-lock + positional-anchor coupling of the full
+///             stack), inside rom_max + 0.03.
 #[test]
 fn t4b_airborne_mtp_overdrive_settles_at_the_limit_on_joint_axis() {
     let sub_dt = SUB_DT_FINE;
@@ -743,7 +762,8 @@ fn t4b_airborne_mtp_overdrive_settles_at_the_limit_on_joint_axis() {
 /// smallest phalanx, at HALF the standard substep rate. The shared
 /// denominator certifies stability (≥ 1 for any gains); this asserts it:
 /// finite throughout, settled at the analytic saturated equilibrium
-/// (τ_max = K_sp·θ + K_lim·(θ − rom_max)² ⇒ θ* ≈ 0.1035), quiet at the end.
+/// (τ_max = K_sp·θ + K_lim·(θ − rom_max)²: 0.5 = 4θ + 8000(θ − 0.1)², whose
+/// engaged root is θ* = (1596 + √3216)/16000 = 0.10329), quiet at the end.
 #[test]
 fn t5_worst_case_stiffness_on_nano_inertia_stays_finite_and_settles() {
     let axis = Vec3::z();
@@ -774,10 +794,11 @@ fn t5_worst_case_stiffness_on_nano_inertia_stays_finite_and_settles() {
     let settled = joint_angle(&world, p, ch, axis);
     let final_w = world.bodies[ch].angular_velocity.norm();
     println!("T5 settled {settled:.5} rad (peak {max_theta:.5}), final |ω| {final_w:.3e} rad/s");
-    // Analytic saturated equilibrium: 0.5 = 4·θ + 8000·(θ − 0.1)² ⇒ θ* ≈ 0.1035.
+    // Analytic saturated equilibrium: 0.5 = 4·θ + 8000·(θ − 0.1)², engaged
+    // root θ* = (1596 + √3216)/16000 = 0.10329.
     assert!(
-        (settled - 0.1035).abs() < 0.01,
-        "worst-case settled at {settled} rad, analytic ≈ 0.1035 (±0.01)"
+        (settled - 0.10329).abs() < 0.01,
+        "worst-case settled at {settled} rad, analytic 0.10329 (±0.01)"
     );
     assert!(
         final_w < 0.01,
