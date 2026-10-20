@@ -48,34 +48,45 @@ pub enum Bone {
 pub const BONE_COUNT: usize = 26;
 
 /// Bone parameters, indexed by `Bone as usize`. Masses in kg
-/// (grams/1000), half_h and radius in m. Values from spec §2.
+/// (grams/1000), half_h and radius in m. Masses and radii from spec §2
+/// (masses stay literature-anchored).
+///
+/// `half_h` is the capsule SEGMENT half-length, sized so segment + end
+/// caps = anatomical bone length (half_h = length/2 − radius, floored at
+/// 1 mm). The spec's §2 derivation set half_h = length/2 directly, which
+/// ignored that a capsule's surface extends one `radius` beyond each
+/// segment end — every bone rendered/collided `2·radius` too long (~14%
+/// oversize on slender metatarsals, 55–70% on the blocky tarsals, which
+/// made the midfoot an overlapping blob). For bones where radius ≥
+/// length/2 (e.g., the intermediate cuneiform) the segment collapses
+/// toward a sphere — correct and more honest for blocky bones.
 pub const BONES: [BoneParams; BONE_COUNT] = [
-    BoneParams { name: "calcaneus",      mass: 0.247, half_h: 0.0375, radius: 0.0195 },
-    BoneParams { name: "talus",          mass: 0.162, half_h: 0.0265, radius: 0.0143 },
-    BoneParams { name: "navicular",      mass: 0.051, half_h: 0.0200, radius: 0.0110 },
-    BoneParams { name: "cuboid",         mass: 0.056, half_h: 0.0170, radius: 0.0120 },
-    BoneParams { name: "med_cuneiform",  mass: 0.043, half_h: 0.0120, radius: 0.0110 },
-    BoneParams { name: "int_cuneiform",  mass: 0.022, half_h: 0.0090, radius: 0.0095 },
-    BoneParams { name: "lat_cuneiform",  mass: 0.034, half_h: 0.0130, radius: 0.0100 },
-    BoneParams { name: "mt1",            mass: 0.094, half_h: 0.0320, radius: 0.0075 },
-    BoneParams { name: "mt2",            mass: 0.060, half_h: 0.0365, radius: 0.0053 },
-    BoneParams { name: "mt3",            mass: 0.051, half_h: 0.0345, radius: 0.0048 },
-    BoneParams { name: "mt4",            mass: 0.041, half_h: 0.0320, radius: 0.0043 },
-    BoneParams { name: "mt5",            mass: 0.044, half_h: 0.0300, radius: 0.0053 },
-    BoneParams { name: "hallux_pp",      mass: 0.031, half_h: 0.0155, radius: 0.0073 },
-    BoneParams { name: "hallux_dp",      mass: 0.015, half_h: 0.0100, radius: 0.0055 },
-    BoneParams { name: "toe2_pp",        mass: 0.0077, half_h: 0.0120, radius: 0.0040 },
-    BoneParams { name: "toe2_mp",        mass: 0.0031, half_h: 0.0045, radius: 0.0030 },
-    BoneParams { name: "toe2_dp",        mass: 0.0020, half_h: 0.0035, radius: 0.0028 },
-    BoneParams { name: "toe3_pp",        mass: 0.0071, half_h: 0.0115, radius: 0.0040 },
-    BoneParams { name: "toe3_mp",        mass: 0.0029, half_h: 0.0045, radius: 0.0030 },
-    BoneParams { name: "toe3_dp",        mass: 0.0019, half_h: 0.0030, radius: 0.0025 },
-    BoneParams { name: "toe4_pp",        mass: 0.0065, half_h: 0.0105, radius: 0.0035 },
-    BoneParams { name: "toe4_mp",        mass: 0.0026, half_h: 0.0040, radius: 0.0025 },
-    BoneParams { name: "toe4_dp",        mass: 0.0017, half_h: 0.0030, radius: 0.0025 },
-    BoneParams { name: "toe5_pp",        mass: 0.0061, half_h: 0.0100, radius: 0.0040 },
-    BoneParams { name: "toe5_mp",        mass: 0.0022, half_h: 0.0030, radius: 0.0025 },
-    BoneParams { name: "toe5_dp",        mass: 0.0024, half_h: 0.0035, radius: 0.0030 },
+    BoneParams { name: "calcaneus",      mass: 0.247, half_h: 0.0180, radius: 0.0195 },
+    BoneParams { name: "talus",          mass: 0.162, half_h: 0.0122, radius: 0.0143 },
+    BoneParams { name: "navicular",      mass: 0.051, half_h: 0.0090, radius: 0.0110 },
+    BoneParams { name: "cuboid",         mass: 0.056, half_h: 0.0050, radius: 0.0120 },
+    BoneParams { name: "med_cuneiform",  mass: 0.043, half_h: 0.0010, radius: 0.0110 },
+    BoneParams { name: "int_cuneiform",  mass: 0.022, half_h: 0.0010, radius: 0.0095 },
+    BoneParams { name: "lat_cuneiform",  mass: 0.034, half_h: 0.0030, radius: 0.0100 },
+    BoneParams { name: "mt1",            mass: 0.094, half_h: 0.0245, radius: 0.0075 },
+    BoneParams { name: "mt2",            mass: 0.060, half_h: 0.0312, radius: 0.0053 },
+    BoneParams { name: "mt3",            mass: 0.051, half_h: 0.0297, radius: 0.0048 },
+    BoneParams { name: "mt4",            mass: 0.041, half_h: 0.0277, radius: 0.0043 },
+    BoneParams { name: "mt5",            mass: 0.044, half_h: 0.0247, radius: 0.0053 },
+    BoneParams { name: "hallux_pp",      mass: 0.031, half_h: 0.0082, radius: 0.0073 },
+    BoneParams { name: "hallux_dp",      mass: 0.015, half_h: 0.0045, radius: 0.0055 },
+    BoneParams { name: "toe2_pp",        mass: 0.0077, half_h: 0.0080, radius: 0.0040 },
+    BoneParams { name: "toe2_mp",        mass: 0.0031, half_h: 0.0015, radius: 0.0030 },
+    BoneParams { name: "toe2_dp",        mass: 0.0020, half_h: 0.0010, radius: 0.0028 },
+    BoneParams { name: "toe3_pp",        mass: 0.0071, half_h: 0.0075, radius: 0.0040 },
+    BoneParams { name: "toe3_mp",        mass: 0.0029, half_h: 0.0015, radius: 0.0030 },
+    BoneParams { name: "toe3_dp",        mass: 0.0019, half_h: 0.0010, radius: 0.0025 },
+    BoneParams { name: "toe4_pp",        mass: 0.0065, half_h: 0.0070, radius: 0.0035 },
+    BoneParams { name: "toe4_mp",        mass: 0.0026, half_h: 0.0015, radius: 0.0025 },
+    BoneParams { name: "toe4_dp",        mass: 0.0017, half_h: 0.0010, radius: 0.0025 },
+    BoneParams { name: "toe5_pp",        mass: 0.0061, half_h: 0.0060, radius: 0.0040 },
+    BoneParams { name: "toe5_mp",        mass: 0.0022, half_h: 0.0010, radius: 0.0025 },
+    BoneParams { name: "toe5_dp",        mass: 0.0024, half_h: 0.0010, radius: 0.0030 },
 ];
 
 /// Map an anatomical-frame axis (+X anterior, +Z superior, +Y lateral)
@@ -346,10 +357,18 @@ const REST_POS: [Vec3; BONE_COUNT] = [
     // graded heights of the original layout (which left the heel ~1 cm
     // below the forefoot, so only the heel touched and the foot toppled).
     // Midfoot bones (navicular, cuboid, cuneiforms) stay above the sole.
-    Vec3::new( 0.005, 0.0375, -0.045), // calcaneus (heel: behind; bottom=0.018)
+    // 2026-10 compaction note: the original z-spacing was tuned while every
+    // capsule was 2·radius oversized (the spec's half_h = length/2 error).
+    // With true extents the hindfoot/midfoot chain could no longer span it —
+    // calcaneus↔cuboid↔mt4 left 13-24 mm of empty space at each joint and
+    // the subtalar pair sat 33 mm apart. The calcaneus moves 30 mm anterior
+    // and the cuboid 20 mm anterior so every JOINTS pair is again within a
+    // few mm of surface contact (joint spaces, not disarticulations). Sole
+    // plane (bottom = 0.018) and the forefoot/toe layout are unchanged.
+    Vec3::new( 0.005, 0.0375, -0.015), // calcaneus (heel: behind; bottom=0.018)
     Vec3::new( 0.000, 0.0570,  0.000), // talus (on top, at ankle)
     Vec3::new(-0.008, 0.0450,  0.030), // navicular (medial midfoot, arch apex)
-    Vec3::new( 0.022, 0.0300,  0.020), // cuboid (lateral midfoot)
+    Vec3::new( 0.022, 0.0300,  0.040), // cuboid (lateral midfoot)
     Vec3::new(-0.015, 0.0380,  0.052), // medial cuneiform
     Vec3::new(-0.002, 0.0400,  0.050), // intermediate cuneiform
     Vec3::new( 0.012, 0.0380,  0.050), // lateral cuneiform

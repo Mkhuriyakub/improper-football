@@ -101,3 +101,22 @@ stated bounds while its doc comment records that the measured 6 µm navicular
 drop is ~3 orders below the physiological ~5 mm — the midfoot is
 near-rigid in the sagittal plane until Phase 3 adds its compliance together
 with the windlass stabilizers that make that compliance survivable.
+
+## 2026-10 — Rendering exposed a geometry bug the numeric tests couldn't see
+
+Visual inspection of `foot_anatomical_demo` showed the midfoot as an
+overlapping blob. Root cause: the foot spec derived every bone's capsule
+`half_h` as anatomical length / 2, ignoring that a capsule's surface
+extends one `radius` beyond each segment end — every bone was 2·radius
+oversized (~14% on slender metatarsals, 55–70% on blocky tarsals). Every
+numeric validation passed on the wrong shapes: the flat-sole plane is
+radius-based (unaffected), masses were untouched, and the footprint was
+merely generous. Two lessons: visual inspection is a validation channel,
+not decoration; and a rest-pose layout tuned against wrong geometry stores
+the error — with true extents the hindfoot/midfoot chain could no longer
+span REST_POS's spacing (the subtalar pair sat 33 mm apart, bridged before
+by capsule fat), so the calcaneus and cuboid moved anterior to restore
+surface-contact joint spacing. A rest-pose joint-gap audit (center distance
+vs summed capsule extents, per JOINTS pair) now prints in the demo's
+`--probe-toe5` mode.
+

@@ -28,6 +28,18 @@ record of what was learned:
    sole plane — documented in `src/anatomy/foot.rs`.
 4. **§5 tests 6–8 (inversion resistance, ROM clamping, talocrural passive
    moment) are not yet implemented** — tracked as open validation work.
+5. **(2026-10) The §2 half_h derivation ignored capsule cap extension and
+   was corrected.** §2 set `half_h = length/2`, but a capsule's surface
+   extends one `radius` beyond each segment end, so every bone was
+   `2·radius` oversized (~14% on slender metatarsals, 55–70% on blocky
+   tarsals — the midfoot rendered as an overlapping blob). `half_h` is now
+   `max(length/2 − radius, 1 mm)` so segment + caps = anatomical length;
+   REST_POS's hindfoot/midfoot spacing (tuned under the oversize) was
+   compacted to match. The correction also unmasked the explicit PD
+   proportional term as unstable on true toe inertias (now implicit —
+   see `docs/findings.md`), and §5 test 5's original pass had depended on
+   the oversized geometry (see the test's re-scope note in
+   `ankle_anatomical.rs`).
 
 ## 1. Context and motivation
 
