@@ -143,7 +143,9 @@ fn a_single_substep_unsaturated_matches_apply_implicit() {
 /// impulse back out — many values (0.2, 0.3, 0.5) happen to round-trip
 /// and would let that bug through.
 ///
-/// MEASURED: |Δω| 2.4e-15, |Δτ_total| 1.9e-17. BITE-VERIFIED (2026-10-20),
+/// MEASURED: |Δω| 1.110e-15, |Δτ_total| 8.674e-18 (re-recorded at the
+/// landed commit by the adversarial review; the first-draft figures were
+/// from an earlier code iteration). BITE-VERIFIED (2026-10-20),
 /// both legs: (1) replacing the post-clamp passive re-solve with the
 /// unclamped passive delta fails this test alone; (2) making finalize
 /// divide the clamped impulse instead of assigning σ·τ_max fails the bit
