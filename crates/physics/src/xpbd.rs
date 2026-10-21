@@ -93,6 +93,19 @@ pub struct XpbdWorld {
     pub ground: Ground,
     /// Number of Gauss-Seidel sequential-impulse iterations per substep.
     pub solver_iterations: usize,
+    /// Coupled joint+contact solve (design contract:
+    /// docs/superpowers/specs/2026-10-21-coupled-joint-contact-solve.md).
+    /// When true, every `JointAxis` runs INSIDE the SI loop as an iterated
+    /// 2×2 soft constraint — `prepare` before manifold generation,
+    /// `solve_iteration` each GS sweep between the angular limits and the
+    /// contacts, `finalize` before position integration — instead of the
+    /// pre-pass `apply_implicit`, so joint and contact impulses couple
+    /// within each sweep and a joint transmits its full static demand
+    /// through a blocked axis. False (the default): the substep is exactly
+    /// the legacy pipeline, whose pre-pass keeps the documented
+    /// force-transmission gap under contact (torque throttled by the
+    /// joint's own denominator — the 1/1880 receipt, design §1).
+    pub coupled_joint_solve: bool,
     /// Substep dt of the most recent `substep` call. Lets the read-only
     /// `engaged_endpoints` convert a converged manifold impulse
     /// (`lambda_normal`) into a normal force (`lambda_normal / last_sub_dt`).
@@ -118,6 +131,7 @@ impl XpbdWorld {
             ground_manifold: Vec::new(),
             ground: Ground::at_y(0.0),
             solver_iterations: DEFAULT_SI_ITERATIONS,
+            coupled_joint_solve: false,
             last_sub_dt: 0.0,
         }
     }
@@ -253,6 +267,17 @@ impl XpbdWorld {
         self.apply_torque_dispatchers();
         self.apply_tendons();
         self.integrate_velocities(sub_dt);
+        // In-loop joint prepare runs BEFORE manifold generation so that a
+        // future warm-start's velocity change is visible to speculative-
+        // contact admission; with the baseline cold start nothing yet
+        // depends on the slot (prepare is read-only on the bodies). It
+        // consumes each joint's ext_* injections and runs its tear latch —
+        // the same per-substep semantics the pre-pass has below.
+        if self.coupled_joint_solve {
+            for ja in &mut self.joint_axes {
+                ja.prepare(&self.bodies, sub_dt);
+            }
+        }
         // Ground contact is now a multi-point manifold of unilateral SI
         // non-penetration constraints (one per penetrating capsule endpoint),
         // solved together in the SI loop below. This replaces the old
@@ -286,13 +311,20 @@ impl XpbdWorld {
         // velocity excursion reach the SI loop undamped on small-inertia
         // bodies and detonates the foot's toe chains.
         //
-        // The combined JointAxis pass runs FIRST in this slot. A joint
-        // migrated to JointAxis is ordering-free by construction: all of
-        // its coaxial terms (KP, spring, limit, dampers) share one solve
-        // and one denominator, so there is no intra-joint stiff-vs-damper
-        // sequence left to get wrong. The legacy pass ordering below is
-        // unchanged and still load-bearing for the legacy primitives.
-        self.apply_joint_axes(sub_dt);
+        // The combined JointAxis pre-pass runs FIRST in this slot (flag
+        // off). With `coupled_joint_solve` the joints move INTO the SI
+        // loop instead (prepared above, iterated in `solve_constraints`,
+        // finalized after the loop) — the pre-pass's one-shot booking is
+        // exactly what throttles transmitted torque under contact. Either
+        // way a joint migrated to JointAxis is ordering-free by
+        // construction: all of its coaxial terms (KP, spring, limit,
+        // dampers) share one solve and one denominator, so there is no
+        // intra-joint stiff-vs-damper sequence left to get wrong. The
+        // legacy pass ordering below is unchanged and still load-bearing
+        // for the legacy primitives.
+        if !self.coupled_joint_solve {
+            self.apply_joint_axes(sub_dt);
+        }
         self.apply_pd_kp_implicit(sub_dt);
         self.apply_positional_springs_implicit(sub_dt);
         self.apply_springs_implicit(sub_dt);
@@ -309,6 +341,13 @@ impl XpbdWorld {
         }
         for _ in 0..self.solver_iterations {
             self.solve_constraints(sub_dt);
+        }
+        // In-loop joint finalize: diagnostics from the accumulated
+        // impulses, written before positions integrate.
+        if self.coupled_joint_solve {
+            for ja in &mut self.joint_axes {
+                ja.finalize(sub_dt);
+            }
         }
         self.integrate_positions(sub_dt);
         self.clear_accumulators();
@@ -612,6 +651,15 @@ impl XpbdWorld {
             );
             constraint.solve(&mut self.bodies, dt);
             self.angular_constraints[i] = constraint;
+        }
+        // In-loop JointAxis rows (coupled_joint_solve): after the angular
+        // limits, before the contacts — contacts keep the last word on
+        // non-penetration within each sweep (ground_manifold already runs
+        // last for the same reason).
+        if self.coupled_joint_solve {
+            for ja in &mut self.joint_axes {
+                ja.solve_iteration(&mut self.bodies, dt);
+            }
         }
         for i in 0..self.contact_constraints.len() {
             let mut cc = std::mem::replace(

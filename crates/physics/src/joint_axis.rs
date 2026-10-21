@@ -136,6 +136,20 @@ impl SoftLimit {
 ///   zero at the ROM boundary, so there is no jump). A predictor-corrector
 ///   (re-linearizing at the predicted θ⁺) is deliberately deferred.
 ///
+/// TWO EXECUTION MODES, one free-space fixed point: the pre-pass
+/// `apply_implicit` below (the executable spec — runs when
+/// `XpbdWorld::coupled_joint_solve` is false, the default) solves the
+/// joint once per substep before the SI loop; the in-loop lifecycle
+/// (`prepare`/`solve_iteration`/`finalize`, flag true) runs the SAME
+/// backward-Euler solve as an iterated soft constraint inside the SI loop,
+/// so joint and contact impulses couple within each sweep. In free space
+/// the two are algebraically identical (the in-loop form lands on the
+/// pre-pass fixed point on iteration 1); they differ exactly where the
+/// pre-pass is wrong — under contact, where the pre-pass books velocity
+/// feedback against motion the contacts then annihilate (the measured
+/// 1/1880 force-transmission gap). See the design contract:
+/// docs/superpowers/specs/2026-10-21-coupled-joint-contact-solve.md.
+///
 /// `enabled` gates only the ACTIVE terms (kp, kd, feedforward, torque
 /// limit) — muscle deactivation. The passive structures (spring, damper,
 /// limit) are properties of the joint and stay on.
@@ -194,6 +208,117 @@ pub struct JointAxis {
     /// Total torque (active + passive + ext) actually applied last substep
     /// (= J/dt of the combined impulse).
     pub applied_total_torque: f64,
+
+    // ── In-loop coupled-solve state (XpbdWorld::coupled_joint_solve) ──
+    /// Accumulated ACTIVE impulse (N·m·s) this substep, built up by
+    /// `solve_iteration` inside the SI loop. The torque budget lives here:
+    /// |lambda_a| ≤ dt·torque_limit, enforced on the ACCUMULATED value, so
+    /// sustained saturated output is exactly ±torque_limit — dt-independent
+    /// (the impulse cap scales with dt, the torque cap does not). Reset by
+    /// `prepare` every substep (cold start; the design's L2 warm-start
+    /// lever would seed it instead).
+    pub lambda_a: f64,
+    /// Accumulated PASSIVE impulse (N·m·s) this substep. Never clamped —
+    /// the muscle saturates, the ligaments don't.
+    pub lambda_p: f64,
+    /// Per-substep cache built by `prepare`. Positions are frozen during
+    /// the SI loop, so everything except ω is constant for the substep.
+    cache: SolveCache,
+}
+
+/// One row of the in-loop 2×2 active/passive mini-block, classified once
+/// per substep by `prepare` from the row's stiffness content d + dt·k.
+#[derive(Clone, Copy)]
+enum Row {
+    /// Nothing on this row (active disabled / no passive structures and no
+    /// ext injection): contributes nothing to the block.
+    Absent,
+    /// Finite-γ soft constraint: residual ω⁺ + γ·λ + b = 0 with
+    /// γ = 1/(dt·(d + dt·k)) and b = −γ·dt·τ₀ — the exact constraint-space
+    /// re-parameterization of the backward-Euler row (its fixed point IS
+    /// `apply_implicit`'s impulse; design §2.1).
+    Soft { gamma: f64, bias: f64 },
+    /// d + dt·k admits no finite γ (pure feedforward / pure ext_torque):
+    /// the γ→∞ limit is a CONSTANT impulse dt·τ₀, booked once on the first
+    /// iteration and excluded from every later solve — "constant torque
+    /// rides outside the denominator".
+    Constant { impulse: f64 },
+}
+
+/// Per-substep cache for the in-loop solve. Caching the axis, the inertia
+/// projections and the row coefficients once per substep (instead of per
+/// iteration) is what keeps a block iteration at ~30 flops — no
+/// `world_inv_inertia` and no quaternion swing-twist inside the SI loop.
+struct SolveCache {
+    /// World-frame joint axis n = q_a·axis_local_a at θₙ.
+    n: Vec3,
+    /// Joint angle at the linearization point (positions are frozen in the
+    /// loop, so the linearization is exact for the whole substep).
+    #[allow(dead_code)] // diagnostic; the biases already encode it
+    theta_n: f64,
+    /// Cached I_a⁻¹·n / I_b⁻¹·n (zero for pinned bodies): one body write
+    /// per iteration instead of two inertia solves.
+    i_inv_a_n: Vec3,
+    i_inv_b_n: Vec3,
+    /// Reduced inverse inertia along the axis.
+    w: f64,
+    active: Row,
+    passive: Row,
+    /// Impulse cap dt·torque_limit on the ACCUMULATED active impulse.
+    cap: f64,
+    /// Both bodies pinned, or both rows absent: iterations are no-ops.
+    skip: bool,
+    /// Constant (γ→∞) rows still awaiting their one-time application.
+    constants_pending: bool,
+    /// Saturation state of the most recent applied solve, read by
+    /// `finalize`: when the loop ENDS clamped, the active diagnostic is
+    /// σ·torque_limit assigned directly — dividing the clamped impulse by
+    /// dt is not guaranteed bit-exact in f64, and the contract (T3) is bit
+    /// equality with ±torque_limit.
+    clamped: bool,
+    sigma: f64,
+}
+
+impl SolveCache {
+    /// The state of a joint whose `prepare` has not run: every
+    /// `solve_iteration` and `finalize` is a no-op on zeros.
+    fn inert() -> Self {
+        Self {
+            n: Vec3::zeros(),
+            theta_n: 0.0,
+            i_inv_a_n: Vec3::zeros(),
+            i_inv_b_n: Vec3::zeros(),
+            w: 0.0,
+            active: Row::Absent,
+            passive: Row::Absent,
+            cap: f64::INFINITY,
+            skip: true,
+            constants_pending: false,
+            clamped: false,
+            sigma: 0.0,
+        }
+    }
+}
+
+/// Axis kinematics shared by the pre-pass solve and `prepare`.
+struct AxisState {
+    n: Vec3,
+    theta: f64,
+    i_inv_a_n: Vec3,
+    i_inv_b_n: Vec3,
+    w: f64,
+}
+
+/// The coaxial torques and local stiffness/damping content at θₙ — ONE
+/// definition shared by `apply_implicit` and `prepare`, so the two
+/// execution modes cannot drift semantically.
+struct CoaxialTerms {
+    tau_act0: f64,
+    tau_pas0: f64,
+    k_act: f64,
+    k_pas: f64,
+    d_act: f64,
+    d_pas: f64,
 }
 
 impl JointAxis {
@@ -221,6 +346,9 @@ impl JointAxis {
             ext_damping: 0.0,
             applied_active_torque: 0.0,
             applied_total_torque: 0.0,
+            lambda_a: 0.0,
+            lambda_p: 0.0,
+            cache: SolveCache::inert(),
         }
     }
 
@@ -357,8 +485,64 @@ impl JointAxis {
     /// 6. Apply the single impulse J = (ω⁺ − ω)/w to both bodies; record
     ///    `applied_total_torque = J/dt`; clear the ext_* injections.
     pub fn apply_implicit(&mut self, bodies: &mut Vec<RigidBody>, dt: f64) {
-        // Consume the per-substep external injections whether or not the
-        // solve early-outs — they are per-substep quantities.
+        let (ext_torque, ext_stiffness, ext_damping) = self.consume_ext();
+        self.applied_active_torque = 0.0;
+        self.applied_total_torque = 0.0;
+
+        let st = self.axis_state(bodies);
+
+        // 1. Tear latch first, from θₙ — the failure mode fires on the same
+        // substep the threshold is crossed, exactly like AngularSoftLimit.
+        if let Some(lim) = &mut self.limit {
+            lim.update_torn(st.theta);
+        }
+
+        // 2. Shared reduced-inertia state (see `axis_state`).
+        if st.w < 1e-15 {
+            return; // both bodies pinned
+        }
+
+        let omega_rel = bodies[self.body_b].angular_velocity
+            - bodies[self.body_a].angular_velocity;
+        let omega = omega_rel.dot(&st.n);
+
+        // 3. Torques and local stiffnesses at the linearization point θₙ
+        // (shared with `prepare` — see `coaxial_terms`).
+        let t = self.coaxial_terms(st.theta, ext_torque, ext_stiffness, ext_damping);
+
+        // 4. Unsaturated combined solve — ONE shared denominator (≥ 1, the
+        // A-stability certificate: every k and d above is ≥ 0).
+        let mut omega_new = (omega + dt * st.w * (t.tau_act0 + t.tau_pas0))
+            / (1.0 + dt * st.w * (t.d_act + t.d_pas) + dt * dt * st.w * (t.k_act + t.k_pas));
+
+        // 5. Saturation check on the ACTIVE output at the end-of-substep
+        // state (θ⁺ = θ + dt·ω⁺).
+        if self.enabled {
+            let tau_act_plus = self.kp * (self.target_angle - st.theta - dt * omega_new)
+                + self.feedforward_torque
+                - self.kd * omega_new;
+            if self.torque_limit.is_finite() && tau_act_plus.abs() > self.torque_limit {
+                let sigma = tau_act_plus.signum();
+                omega_new = (omega + dt * st.w * (sigma * self.torque_limit + t.tau_pas0))
+                    / (1.0 + dt * st.w * t.d_pas + dt * dt * st.w * t.k_pas);
+                self.applied_active_torque = sigma * self.torque_limit;
+            } else {
+                self.applied_active_torque = tau_act_plus;
+            }
+        }
+
+        // 6. Apply the single combined impulse.
+        let j = (omega_new - omega) / st.w;
+        self.applied_total_torque = j / dt;
+
+        bodies[self.body_a].angular_velocity -= st.i_inv_a_n * j;
+        bodies[self.body_b].angular_velocity += st.i_inv_b_n * j;
+    }
+
+    /// Consume the per-substep external injections — they are per-substep
+    /// quantities, taken whether or not the solve early-outs — and enforce
+    /// their sign invariant. Shared by `apply_implicit` and `prepare`.
+    fn consume_ext(&mut self) -> (f64, f64, f64) {
         let ext_torque = self.ext_torque;
         let ext_stiffness = self.ext_stiffness;
         let ext_damping = self.ext_damping;
@@ -374,35 +558,37 @@ impl JointAxis {
             "JointAxis ext_stiffness ({ext_stiffness}) and ext_damping ({ext_damping}) must \
              be >= 0: a negative injection voids the denominator->=-1 A-stability certificate"
         );
-        self.applied_active_torque = 0.0;
-        self.applied_total_torque = 0.0;
+        (ext_torque, ext_stiffness, ext_damping)
+    }
 
+    /// Axis kinematics shared by `apply_implicit` and `prepare`: the world
+    /// axis n, the angle θₙ, the inertia projections I⁻¹·n — zero for
+    /// pinned bodies (post-f11d73f convention of all primitives) — and the
+    /// reduced inverse inertia w along the axis.
+    fn axis_state(&self, bodies: &[RigidBody]) -> AxisState {
         let n = bodies[self.body_a].orientation * self.axis_local_a;
         let theta = self.angle(bodies);
-
-        // 1. Tear latch first, from θₙ — the failure mode fires on the same
-        // substep the threshold is crossed, exactly like AngularSoftLimit.
-        if let Some(lim) = &mut self.limit {
-            lim.update_torn(theta);
-        }
-
-        // 2. Shared reduced-inertia state. Pinned bodies contribute zero
-        // inverse inertia (post-f11d73f convention of all primitives).
         let zero = Mat3::zeros();
         let i_inv_a = if bodies[self.body_a].inv_mass == 0.0 { zero }
                       else { bodies[self.body_a].world_inv_inertia() };
         let i_inv_b = if bodies[self.body_b].inv_mass == 0.0 { zero }
                       else { bodies[self.body_b].world_inv_inertia() };
-        let w = n.dot(&(i_inv_a * n)) + n.dot(&(i_inv_b * n));
-        if w < 1e-15 {
-            return; // both bodies pinned
-        }
+        let i_inv_a_n = i_inv_a * n;
+        let i_inv_b_n = i_inv_b * n;
+        let w = n.dot(&i_inv_a_n) + n.dot(&i_inv_b_n);
+        AxisState { n, theta, i_inv_a_n, i_inv_b_n, w }
+    }
 
-        let omega_rel = bodies[self.body_b].angular_velocity
-            - bodies[self.body_a].angular_velocity;
-        let omega = omega_rel.dot(&n);
-
-        // 3. Torques and local stiffnesses at the linearization point θₙ.
+    /// Torques and local stiffness/damping content at the linearization
+    /// point θₙ. Shared by `apply_implicit` and `prepare` so the two
+    /// execution modes read the identical physics.
+    fn coaxial_terms(
+        &self,
+        theta: f64,
+        ext_torque: f64,
+        ext_stiffness: f64,
+        ext_damping: f64,
+    ) -> CoaxialTerms {
         let active = self.enabled;
         let tau_act0 = if active {
             self.kp * (self.target_angle - theta) + self.feedforward_torque
@@ -417,37 +603,261 @@ impl JointAxis {
         let tau_pas0 = -self.passive_stiffness * (theta - self.passive_rest_angle)
             + s_lim
             + ext_torque;
-        let k_act = if active { self.kp } else { 0.0 };
-        let k_pas = self.passive_stiffness + k_lim + ext_stiffness;
-        let d_act = if active { self.kd } else { 0.0 };
-        let d_pas = self.passive_damping + ext_damping;
+        CoaxialTerms {
+            tau_act0,
+            tau_pas0,
+            k_act: if active { self.kp } else { 0.0 },
+            k_pas: self.passive_stiffness + k_lim + ext_stiffness,
+            d_act: if active { self.kd } else { 0.0 },
+            d_pas: self.passive_damping + ext_damping,
+        }
+    }
 
-        // 4. Unsaturated combined solve — ONE shared denominator (≥ 1, the
-        // A-stability certificate: every k and d above is ≥ 0).
-        let mut omega_new = (omega + dt * w * (tau_act0 + tau_pas0))
-            / (1.0 + dt * w * (d_act + d_pas) + dt * dt * w * (k_act + k_pas));
+    // ─── In-loop coupled solve (XpbdWorld::coupled_joint_solve) ─────────
+    //
+    // The pre-pass above models ITS OWN impulse as the sole determinant of
+    // the end-of-substep velocity. When the SI contact loop afterwards
+    // annihilates that velocity (a wedged toe), the booked velocity-
+    // feedback terms were charged against motion that never happened and
+    // the transmitted torque collapses to τ₀/D — the measured 1/1880
+    // force-transmission gap (design contract §1). The in-loop form
+    // re-parameterizes the SAME backward-Euler solve as an iterated soft
+    // constraint inside the SI Gauss-Seidel loop (§2.1), split into an
+    // active/passive 2×2 mini-block so the torque budget clamps the
+    // ACCUMULATED active impulse (§2.2). In free space, iteration 1 lands
+    // exactly on the pre-pass fixed point (GS is exact in one step for an
+    // isolated linear constraint) and the convergence skip makes later
+    // iterations no-ops; under contact, the block and the contacts
+    // exchange impulses within each sweep and the coupled fixed point
+    // transmits the full static demand, dt-independently (§2.5).
 
-        // 5. Saturation check on the ACTIVE output at the end-of-substep
-        // state (θ⁺ = θ + dt·ω⁺).
-        if active {
-            let tau_act_plus = self.kp * (self.target_angle - theta - dt * omega_new)
-                + self.feedforward_torque
-                - self.kd * omega_new;
-            if self.torque_limit.is_finite() && tau_act_plus.abs() > self.torque_limit {
-                let sigma = tau_act_plus.signum();
-                omega_new = (omega + dt * w * (sigma * self.torque_limit + tau_pas0))
-                    / (1.0 + dt * w * d_pas + dt * dt * w * k_pas);
-                self.applied_active_torque = sigma * self.torque_limit;
-            } else {
-                self.applied_active_torque = tau_act_plus;
-            }
+    /// In-loop step 1/3: once per substep, in the slot BEFORE
+    /// `generate_ground_manifold` (so a future warm-start's velocity
+    /// change would be visible to speculative-contact admission; the cold
+    /// start applies no impulse, so today nothing depends on the slot).
+    /// Consumes the ext_* injections and runs the tear latch at θₙ — the
+    /// identical per-substep semantics as `apply_implicit`, through the
+    /// same shared helpers — then caches everything the iterations need
+    /// and cold-starts the lambdas (design §2.3 baseline).
+    pub fn prepare(&mut self, bodies: &[RigidBody], dt: f64) {
+        let (ext_torque, ext_stiffness, ext_damping) = self.consume_ext();
+        self.lambda_a = 0.0;
+        self.lambda_p = 0.0;
+
+        let st = self.axis_state(bodies);
+
+        // Tear latch at θₙ, on the same substep the threshold is crossed —
+        // and, like the ext_* consumption above, it runs even when both
+        // bodies are pinned (same order as `apply_implicit`).
+        if let Some(lim) = &mut self.limit {
+            lim.update_torn(st.theta);
         }
 
-        // 6. Apply the single combined impulse.
-        let j = (omega_new - omega) / w;
-        self.applied_total_torque = j / dt;
+        let mut cache = SolveCache {
+            n: st.n,
+            theta_n: st.theta,
+            i_inv_a_n: st.i_inv_a_n,
+            i_inv_b_n: st.i_inv_b_n,
+            w: st.w,
+            active: Row::Absent,
+            passive: Row::Absent,
+            // The budget clamps the ACCUMULATED impulse: the cap scales
+            // with dt so the sustained torque cap does not.
+            cap: dt * self.torque_limit,
+            skip: true,
+            constants_pending: false,
+            clamped: false,
+            sigma: 0.0,
+        };
 
-        bodies[self.body_a].angular_velocity -= i_inv_a * n * j;
-        bodies[self.body_b].angular_velocity += i_inv_b * n * j;
+        if st.w < 1e-15 {
+            // Both bodies pinned: iterations skip, ext_* already consumed.
+            self.cache = cache;
+            return;
+        }
+
+        let t = self.coaxial_terms(st.theta, ext_torque, ext_stiffness, ext_damping);
+
+        // Row classification. γ = 1/(dt·(d + dt·k)) is the exact
+        // constraint-space form of the row's backward-Euler solve (§2.1).
+        // A row whose γ has no finite value (d + dt·k = 0, or small enough
+        // that the division overflows) is the γ→∞ limit: a constant
+        // impulse dt·τ₀ — or nothing at all when τ₀ is also zero.
+        let stiff_a = t.d_act + dt * t.k_act;
+        let gamma_a = 1.0 / (dt * stiff_a);
+        cache.active = if gamma_a.is_finite() {
+            Row::Soft { gamma: gamma_a, bias: -gamma_a * dt * t.tau_act0 }
+        } else if t.tau_act0 != 0.0 {
+            // Pure feedforward. The budget still applies: a constant
+            // demand past the cap clamps at classification time (σ is the
+            // demand's own sign — a constant torque has no velocity
+            // feedback to flip it), and `finalize` reports σ·torque_limit.
+            let mut impulse = dt * t.tau_act0;
+            if self.torque_limit.is_finite() && t.tau_act0.abs() > self.torque_limit {
+                cache.sigma = t.tau_act0.signum();
+                cache.clamped = true;
+                impulse = cache.sigma * cache.cap;
+            }
+            Row::Constant { impulse }
+        } else {
+            Row::Absent
+        };
+
+        let stiff_p = t.d_pas + dt * t.k_pas;
+        let gamma_p = 1.0 / (dt * stiff_p);
+        cache.passive = if gamma_p.is_finite() {
+            Row::Soft { gamma: gamma_p, bias: -gamma_p * dt * t.tau_pas0 }
+        } else if t.tau_pas0 != 0.0 {
+            // Pure ext_torque with no passive structures: constant and
+            // unclamped — neither ligaments nor an injected tendon torque
+            // saturate on this joint's budget.
+            Row::Constant { impulse: dt * t.tau_pas0 }
+        } else {
+            Row::Absent
+        };
+
+        cache.skip = matches!(cache.active, Row::Absent)
+            && matches!(cache.passive, Row::Absent);
+        cache.constants_pending = matches!(cache.active, Row::Constant { .. })
+            || matches!(cache.passive, Row::Constant { .. });
+        self.cache = cache;
+    }
+
+    /// In-loop step 2/3: one Gauss-Seidel iteration of the joint's
+    /// active/passive mini-block. Called from `solve_constraints` after
+    /// the `AngularLimitConstraint`s and before the contacts (contacts
+    /// keep the last word on non-penetration within each sweep). Reads the
+    /// relative velocity fresh from the bodies: it now includes every
+    /// contact impulse applied so far this sweep — which is the point.
+    ///
+    /// The two rows are solved as a DIRECT 2×2 block, never as two
+    /// independent GS rows: two near-hard constraints on the identical
+    /// axis Gauss-Seidel against each other at ρ = w²/((w+γ_a)(w+γ_p)) ≈ 1
+    /// — the SPLIT converges glacially even though the total converges
+    /// fast, and the clamp and the diagnostics read the split (§2.2).
+    /// det = w·(γ_a + γ_p) + γ_a·γ_p > 0 is the translated A-stability
+    /// certificate: every k and d ≥ 0 ⇒ γ > 0 ⇒ det > 0.
+    pub fn solve_iteration(&mut self, bodies: &mut Vec<RigidBody>, _dt: f64) {
+        if self.cache.skip {
+            return;
+        }
+        let w = self.cache.w;
+        let omega_rel = bodies[self.body_b].angular_velocity
+            - bodies[self.body_a].angular_velocity;
+        let u = omega_rel.dot(&self.cache.n);
+
+        // γ→∞ rows: book the constant impulse on the first iteration only,
+        // folded into the velocity the soft rows read below so the whole
+        // iteration stays ONE body write.
+        let mut j_const = 0.0;
+        if self.cache.constants_pending {
+            if let Row::Constant { impulse } = self.cache.active {
+                self.lambda_a += impulse;
+                j_const += impulse;
+            }
+            if let Row::Constant { impulse } = self.cache.passive {
+                self.lambda_p += impulse;
+                j_const += impulse;
+            }
+            self.cache.constants_pending = false;
+        }
+        let u_eff = u + w * j_const;
+
+        // Convergence skip (§2.3): below 1e-13 RELATIVE to the accumulated
+        // impulses, the deltas are roundoff, not physics — skipping them
+        // makes free-space iterations 2..n true no-ops (bit-stability for
+        // the trajectory equivalences) and cannot mask real coupling,
+        // which sits far above 1e-13 relative. The additive tiny keeps the
+        // test meaningful at λ = 0 (an exactly-zero delta still skips).
+        let converged = |d: f64, lambda_a: f64, lambda_p: f64| -> bool {
+            d <= 1e-13 * (lambda_a.abs() + lambda_p.abs() + 1e-300)
+        };
+
+        let mut j_soft = 0.0;
+        match (self.cache.active, self.cache.passive) {
+            (Row::Soft { gamma: ga, bias: ba }, Row::Soft { gamma: gp, bias: bp }) => {
+                let r_a = -(u_eff + ga * self.lambda_a + ba);
+                let r_p = -(u_eff + gp * self.lambda_p + bp);
+                let det = w * (ga + gp) + ga * gp;
+                let d_a_unc = ((w + gp) * r_a - w * r_p) / det;
+                // The clamp (the torque budget): on the ACCUMULATED active
+                // impulse, with σ from the UNCLAMPED end-state demand —
+                // λ_a + Δ_a IS dt·τ_act⁺, so this preserves the pre-pass's
+                // σ-sign-flip semantics. After clamping, the passive row
+                // re-solves alone against the clamped active delta: the
+                // muscle saturates, the ligaments don't.
+                let la_unc = self.lambda_a + d_a_unc;
+                let (d_a, d_p, clamped, sigma);
+                if la_unc.abs() > self.cache.cap {
+                    sigma = la_unc.signum();
+                    d_a = sigma * self.cache.cap - self.lambda_a;
+                    d_p = -(u_eff + w * d_a + gp * self.lambda_p + bp) / (w + gp);
+                    clamped = true;
+                } else {
+                    d_a = d_a_unc;
+                    d_p = ((w + ga) * r_p - w * r_a) / det;
+                    clamped = false;
+                    sigma = 0.0;
+                }
+                if !converged(d_a.abs() + d_p.abs(), self.lambda_a, self.lambda_p) {
+                    self.lambda_a += d_a;
+                    self.lambda_p += d_p;
+                    self.cache.clamped = clamped;
+                    self.cache.sigma = sigma;
+                    j_soft = d_a + d_p;
+                }
+            }
+            (Row::Soft { gamma: ga, bias: ba }, _) => {
+                // 1-D active with the clamp (passive absent, or a constant
+                // already booked above — nothing left to re-solve).
+                let d_unc = -(u_eff + ga * self.lambda_a + ba) / (w + ga);
+                let la_unc = self.lambda_a + d_unc;
+                let (d_a, clamped, sigma) = if la_unc.abs() > self.cache.cap {
+                    let s = la_unc.signum();
+                    (s * self.cache.cap - self.lambda_a, true, s)
+                } else {
+                    (d_unc, false, 0.0)
+                };
+                if !converged(d_a.abs(), self.lambda_a, self.lambda_p) {
+                    self.lambda_a += d_a;
+                    self.cache.clamped = clamped;
+                    self.cache.sigma = sigma;
+                    j_soft = d_a;
+                }
+            }
+            (_, Row::Soft { gamma: gp, bias: bp }) => {
+                // 1-D passive (active absent or constant). Never clamped.
+                let d_p = -(u_eff + gp * self.lambda_p + bp) / (w + gp);
+                if !converged(d_p.abs(), self.lambda_a, self.lambda_p) {
+                    self.lambda_p += d_p;
+                    j_soft = d_p;
+                }
+            }
+            // Constant-only (or empty) block: nothing soft to iterate.
+            _ => {}
+        }
+
+        let j = j_const + j_soft;
+        if j != 0.0 {
+            bodies[self.body_a].angular_velocity -= self.cache.i_inv_a_n * j;
+            bodies[self.body_b].angular_velocity += self.cache.i_inv_b_n * j;
+        }
+    }
+
+    /// In-loop step 3/3: after the SI loop, before `integrate_positions` —
+    /// write the diagnostics from the accumulated impulses. Under the flag
+    /// these report the REALIZED transmitted torque including contact
+    /// coupling (what the design's receipt experiments read), not the
+    /// free-space booking.
+    pub fn finalize(&mut self, dt: f64) {
+        self.applied_total_torque = (self.lambda_a + self.lambda_p) / dt;
+        self.applied_active_torque = if self.cache.clamped {
+            // Assigned DIRECTLY, never λ_a/dt: the saturation diagnostic's
+            // contract is bit equality with ±torque_limit (T3 asserts it),
+            // and (σ·dt·τ_max)/dt is not guaranteed bit-exact in f64.
+            self.cache.sigma * self.torque_limit
+        } else {
+            self.lambda_a / dt
+        };
     }
 }
