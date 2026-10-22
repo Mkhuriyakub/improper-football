@@ -165,9 +165,17 @@ negligible on kg-scale segments but ~94% attenuation on gram-scale toe
 joints at the current substep rate (dt²·w·kp ≈ 19: w ≈ 2.5·10⁸, kp = 4,
 sub_dt = 1/7200). Equilibria therefore do NOT follow the rigid split
 kp/(kp+K)·target at toe scale, and command flips barely move through the
-~90×-supracritical shared c = 1.0 dampers. A known, documented bias — to be
-removed by a combined coaxial-stiffness solve (all same-axis stiff terms in
-one linearized solve) when Phase 3 needs accurate toe tracking.
+~90×-supracritical shared c = 1.0 dampers. A known, documented bias.
+[Amended 2026-10-21: the removal path promised here — a combined
+coaxial-stiffness solve, all same-axis stiff terms in one linearized
+pre-pass — was built as `JointAxis::apply_implicit` and measured: it
+preserves free-space behavior but still throttles under a blocking
+contact (the ω⁺ booking, same class of error one level up). The actual
+removal is migration onto JointAxis under the coupled IN-LOOP solve plus
+the warm-start pair (see the 2026-10-21 entry): one solve, one
+denominator, inside the SI loop, transmitting the full static demand
+through contact dt-independently. Un-migrated legacy stacks keep this
+bias until they migrate.]
 
 ## 2026-10-19 — Joint Baumgarte β = 0.2 acquitted; the May 0.024 J/s artifact is gone
 

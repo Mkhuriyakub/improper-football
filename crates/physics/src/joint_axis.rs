@@ -732,13 +732,19 @@ impl JointAxis {
         // on a two-row config at d = 1e-280 each) while the pre-pass
         // D-form, whose denominator is 1 + dt·w·(d + dt·k) ≈ 1, stays
         // exact. Any γ > 1e100 is therefore classified as the γ→∞
-        // constant-impulse limit instead: every surviving product is then
-        // finite (γ_a·γ_p ≤ 1e200, w·γ ≤ ~1e115 at any physical inertia,
-        // bias finite for all |τ₀| < ~1e204), and the classification error
-        // is unmeasurable — a row with γ > 1e100 has stiffness content
-        // d + dt·k < 1/(dt·1e100) ≈ 7e-93 N·m·s/rad, whose per-substep
-        // torque at any representable state is below one ulp of the
-        // constant term dt·τ₀.
+        // constant-impulse limit instead. The guard's working range is
+        // finite, not universal, but sits ~100 orders past any physical
+        // state in both directions: the surviving products (γ_a·γ_p ≤
+        // 1e200, w·γ ≤ ~1e115 at any physical inertia) stay finite, while
+        // the 2×2 numerator (w+γ)·r — whose residual carries the
+        // O(γ·dt·τ₀) bias — overflows first, at |τ₀| ≳ 1.3e112 with both
+        // surviving rows near GAMMA_MAX (self-healing via the clamp only
+        // when torque_limit is finite); and the classification error (the
+        // dropped soft term, stiffness content d + dt·k < 1/(dt·1e100) ≈
+        // 7e-93 N·m·s/rad) stays below one ulp of the constant impulse
+        // dt·τ₀ for |ω| up to ~1e75 rad/s, growing only linearly in ω
+        // beyond. Within everything a simulation can physically reach,
+        // the degraded row is exact to roundoff.
         const GAMMA_MAX: f64 = 1e100;
         let stiff_a = t.d_act + dt * t.k_act;
         let gamma_a = 1.0 / (dt * stiff_a);
@@ -955,6 +961,16 @@ impl JointAxis {
             // contract is bit equality with ±torque_limit (T3 asserts it),
             // and (σ·dt·τ_max)/dt is not guaranteed bit-exact in f64.
             self.cache.sigma * self.torque_limit
+        } else if self.lambda_a != 0.0 && self.lambda_a.abs() == self.cache.cap {
+            // Saturated steady state reached through the convergence skip:
+            // the warm seed re-enters at exactly ±cap, the clamped branch's
+            // delta is exactly 0, and the skip never writes clamped/sigma —
+            // but λ_a sitting bit-exactly at the cap IS saturation, so the
+            // report is derived from the lambda itself (the contract's bit
+            // equality; λ_a/dt would be up to 1 ulp off). An infinite
+            // torque_limit can never match (λ_a is finite), and cap = 0
+            // is excluded by λ_a ≠ 0 (the λ_a/dt branch reports 0 exactly).
+            self.lambda_a.signum() * self.torque_limit
         } else {
             self.lambda_a / dt
         };

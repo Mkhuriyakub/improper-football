@@ -1341,6 +1341,99 @@ fn carried_friction_seed_is_cone_projected_when_mu_drops() {
     );
 }
 
+/// Saturation diagnostic under the convergence skip: `applied_active_torque`
+/// must equal ±torque_limit BIT-EXACTLY on every substep of a wedged
+/// saturated steady state (the T3/§2.3 contract), including the substeps
+/// where the solve converges by skipping.
+///
+/// THE HOLE THIS PINS: `solve_iteration`'s convergence skip does not write
+/// `cache.clamped`/`sigma`. In a contact-wedged saturated steady state with
+/// an exact warm seed the active lambda sits bit-exactly at the cap
+/// (prepare's clamp re-seeds it to ±cap), so the clamped branch computes
+/// d_a = σ·cap − λ_a = 0 exactly; with no passive row (d_p absent) the
+/// total delta is 0, the skip fires, `clamped` keeps prepare's false, and
+/// `finalize` falls through to λ_a/dt — up to 1 ulp off τ_max, because
+/// (τ_max·dt)/dt does not round-trip in f64 (τ_max = 0.11 here, the same
+/// deliberately non-round-tripping value as test B). `finalize` now derives
+/// the saturated report from the lambda itself: |λ_a| at the cap reports
+/// sign(λ_a)·torque_limit directly.
+///
+/// Rig: E6's wedged geometry (pinned parent, toe capsule tip on the
+/// ground) with an ACTIVE-ONLY JointAxis (kp = 2 / kd = 0.05, no passive
+/// structures ⇒ the passive row is Absent and the skip is reached whenever
+/// d_a = 0) and τ_max = 0.11 ≪ the ~1.2 N·m demand. 0.5 s settle, then
+/// every substep of the next 0.5 s asserts bit equality.
+///
+/// MEASURED AT THE UNFIXED HEAD (2026-10-21): the diagnostic reads
+/// 0.10999999999999999 (λ_a/dt, 1 ulp low) on the steady-state substeps —
+/// red. BITE-VERIFIED (2026-10-21): with finalize's at-cap branch removed
+/// the test fails on the first post-settle substep; restored, 3600/3600
+/// substeps bit-equal.
+#[test]
+fn saturated_diagnostic_is_bit_exact_through_convergence_skips() {
+    let tau_max = 0.11;
+    let kp = 2.0;
+    let target = 0.6;
+
+    let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
+
+    // E6's wedged rig, active-only joint.
+    let r = 0.004;
+    let half_h = 0.008;
+    let along_z = Quat::from_scaled_axis(Vec3::new(std::f64::consts::FRAC_PI_2, 0.0, 0.0));
+    let mut parent = RigidBody::new(0.0, Mat3::identity());
+    parent.orientation = along_z;
+    parent.position = Vec3::new(0.0, r, -0.03);
+    let p = world.add_body(parent);
+    let mut child = RigidBody::new_capsule(0.003, half_h, r);
+    child.orientation = along_z;
+    child.position = Vec3::new(0.0, r, 0.0);
+    let ch = world.add_body(child);
+
+    let joint_world = Vec3::new(0.0, r, -half_h);
+    let mut c = PositionalConstraint::new(p, ch, 0.0, 1.0 / 60_000.0);
+    c.local_anchor_a =
+        world.bodies[p].orientation.inverse() * (joint_world - world.bodies[p].position);
+    c.local_anchor_b =
+        world.bodies[ch].orientation.inverse() * (joint_world - world.bodies[ch].position);
+    world.constraints.push(c);
+
+    world.joint_axes.push(
+        JointAxis::new(p, ch, Vec3::x())
+            .with_pd(kp, 0.05)
+            .with_target(target)
+            .with_torque_limit(tau_max),
+    );
+
+    let settle = (0.5 / SUB_DT_FINE).round() as usize;
+    for _ in 0..settle {
+        world.substep(SUB_DT_FINE);
+    }
+    // The rig really is wedged and saturated: tip loaded, demand ≫ τ_max.
+    let theta = joint_angle(&world, p, ch, Vec3::x());
+    assert!(
+        world.total_normal_force(ch) > 0.0 && kp * (target - theta) > 2.0 * tau_max,
+        "rig broken: not a wedged saturated press (θ {theta}, F_n {})",
+        world.total_normal_force(ch)
+    );
+
+    let total = (0.5 / SUB_DT_FINE).round() as usize;
+    let mut exact = 0usize;
+    for i in 0..total {
+        world.substep(SUB_DT_FINE);
+        let a = world.joint_axes[0].applied_active_torque;
+        assert!(
+            a == tau_max,
+            "substep {i}: saturated active diagnostic {a:.17} is not bit-equal to \
+             τ_max {tau_max:.17} — the convergence skip left the clamped state stale \
+             and finalize divided the impulse back out"
+        );
+        exact += 1;
+    }
+    println!("saturation diagnostic bit-equal on {exact}/{total} steady-state substeps");
+}
+
 /// DIAGNOSTIC harness for the E1/E2 receipts and the L1 iteration sweep —
 /// run with `cargo test -p physics --test coupled_joint -- --ignored
 /// --nocapture`. Prints E1 and E2 at flag off/on × solver_iterations

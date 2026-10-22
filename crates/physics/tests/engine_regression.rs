@@ -987,9 +987,13 @@ fn run_chain_measured(world: &mut XpbdWorld, idxs: &[usize], seconds: f64) -> Ch
 /// (w ≈ 2.5·10⁸, kp = 4, sub_dt = 1/7200) that is ≈ 95% attenuation, so the
 /// classic rigid-split prediction kp/(kp + K_spring)·target does NOT hold and
 /// the settle also includes manifold support. This dt-dependent effective-gain
-/// bias is a KNOWN, documented limitation (docs/findings.md 2026-10), to be
-/// removed by a combined coaxial-stiffness solve when Phase 3 needs accurate
-/// toe tracking.
+/// bias is a KNOWN, documented limitation of the LEGACY sequential passes
+/// this ray is built from; its removal is migration onto JointAxis under the
+/// coupled in-loop solve + warm-start pair (docs/findings.md 2026-10-21 — the
+/// pass-based combined solve preserved free space but throttled under
+/// contact, so the fix had to move into the SI loop). This legacy ray keeps
+/// the bias, and this band stays calibrated to it, until Commit C migrates
+/// the foot.
 ///
 /// BITE-VERIFIED against the pre-fix explicit-kp engine (checkout of
 /// e9dda0b~1 angular_pd_controller.rs + xpbd.rs): P1 DIP mean 0.0141 rad and
