@@ -5,14 +5,27 @@
 //! Every bone is a RigidBody::new_capsule; joints are data-driven
 //! from the tables below. Masses are soft-tissue-scaled (x1.70) so
 //! the foot segment totals ~1.0 kg; dimensions are osteometric.
+//!
+//! Coaxial solve (Stage 2, re-landed 2026-10-21 on the coupled in-loop
+//! engine): every articulated joint's PRIMARY axis is ONE `JointAxis` —
+//! active PD + passive spring + passive damper + nonlinear ROM soft-limit
+//! solved together inside the SI Gauss-Seidel loop with a shared
+//! denominator and the L2 warm-start pair. The legacy sequential passes
+//! attenuated each term's gain by 1/(1 + dt²·w·k) (~94% on gram-scale toe
+//! joints, docs/findings.md 2026-10) and transmitted only 1/D of the
+//! demanded torque through a blocking contact (docs/findings.md
+//! 2026-10-21); the in-loop JointAxis removes both. This module pushes NO
+//! angular_springs, angular_soft_limits, or angular_pd_controllers on
+//! primary axes anymore. Off-axis locks stay SI `AngularLimitConstraint`s
+//! with `AngularDamper`s (different axes — not coaxial, so nothing for the
+//! combined solve to combine), so every joint keeps constraints on every
+//! anatomical axis.
 
 use physics::math::{Vec3, Quat};
 use physics::xpbd::XpbdWorld;
 use physics::rigid_body::RigidBody;
-use physics::angular_spring::AngularSpring;
 use physics::angular_damper::AngularDamper;
-use physics::angular_soft_limit::AngularSoftLimit;
-use physics::angular_pd_controller::AngularPDController;
+use physics::joint_axis::JointAxis;
 use physics::constraints::PositionalConstraint;
 use physics::angular_constraint::AngularLimitConstraint;
 
@@ -240,13 +253,14 @@ pub fn subtalar_axis_anat() -> Vec3 {
     Vec3::new(x, y, z).normalize()
 }
 
-/// Body indices and PD-controller indices for the assembled foot.
+/// Body indices and JointAxis indices for the assembled foot.
 pub struct FootHandles {
     /// World body index for each Bone (index by `bone as usize`).
     pub bodies: [usize; BONE_COUNT],
-    /// PD controller index for each articulated joint, keyed by child Bone.
-    /// `usize::MAX` for welded children (no PD).
-    pub pd_by_child: [usize; BONE_COUNT],
+    /// `world.joint_axes` index of each articulated joint's primary-axis
+    /// combined solve (PD + spring + damper + ROM limit), keyed by child
+    /// Bone. `usize::MAX` for welded children (no articulated joint).
+    pub ja_by_child: [usize; BONE_COUNT],
 }
 
 impl FootHandles {
@@ -291,11 +305,15 @@ pub fn weld(
     }
 }
 
-/// Adds an articulated joint: positional anchor, primary-axis ROM
-/// soft-limit + passive spring/damper + PD controller, and two locked
-/// off-axes. `axis_world` is the primary axis already mapped to world.
-/// `baseline` is the child's rest orientation relative to the parent
-/// (identity if both share orientation). Returns the PD index.
+/// Adds an articulated joint: positional anchor, ONE primary-axis
+/// `JointAxis` (combined ROM soft-limit + passive spring/damper + active
+/// PD — one backward-Euler solve inside the SI loop, one shared
+/// denominator; no split-pass gain attenuation, no intra-joint ordering
+/// sensitivity, full force transmission through blocking contacts), and
+/// two locked off-axes. `axis_world` is the primary axis already mapped to
+/// world. `baseline` is the child's rest orientation relative to the
+/// parent (identity if both share orientation). Returns the joint_axes
+/// index.
 fn add_articulated(
     world: &mut XpbdWorld, parent: usize, child: usize,
     anchor_parent: Vec3, anchor_child: Vec3,
@@ -305,15 +323,14 @@ fn add_articulated(
     add_elastic_joint(world, parent, child, anchor_parent, anchor_child, JOINT_POS_K, JOINT_POS_C);
 
     let primary = axis_world.normalize();
-    world.angular_soft_limits.push(
-        AngularSoftLimit::new(parent, child, primary, rom_min, rom_max, ARTIC_LIMIT_K, ARTIC_LIMIT_EXP)
-            .with_baseline(baseline));
-    world.angular_dampers.push(AngularDamper::new(parent, child, primary, ARTIC_PASSIVE_C));
-    world.angular_springs.push(
-        AngularSpring::new(parent, child, primary, ARTIC_PASSIVE_K, 0.0).with_baseline(baseline));
-    let pd_idx = world.angular_pd_controllers.len();
-    world.angular_pd_controllers.push(
-        AngularPDController::new(parent, child, primary, kp, kd).with_baseline(baseline));
+    let ja_idx = world.joint_axes.len();
+    world.joint_axes.push(
+        JointAxis::new(parent, child, primary)
+            .with_baseline(baseline)
+            .with_soft_limit(rom_min, rom_max, ARTIC_LIMIT_K, ARTIC_LIMIT_EXP)
+            .with_passive_spring(ARTIC_PASSIVE_K, 0.0)
+            .with_passive_damping(ARTIC_PASSIVE_C)
+            .with_pd(kp, kd));
 
     // Two off-axes orthogonal to the primary, locked. Pick a helper axis
     // not near-parallel to the primary (|x| < 0.9) so the first cross
@@ -331,7 +348,7 @@ fn add_articulated(
             AngularLimitConstraint::new(parent, child, off, -OFF_AXIS_LIM, OFF_AXIS_LIM));
         world.angular_dampers.push(AngularDamper::new(parent, child, off, ARTIC_PASSIVE_C));
     }
-    pd_idx
+    ja_idx
 }
 
 /// Anterior-posterior shift of the whole foot (every bone except the
@@ -423,12 +440,17 @@ pub fn anchor_at(world: &XpbdWorld, bone_idx: usize, joint_world: Vec3) -> Vec3 
 /// talus carries `bone_baseline()`, so the joint's rest offset is
 /// `bone_baseline()` and all angular primitives are baseline-aware.
 ///
-/// Unlike the foot's internal joints (which use baseline-free
+/// Unlike the foot's internal joints (whose off-axes use baseline-free
 /// AngularLimitConstraints, valid only when both bones share orientation),
-/// this joint crosses the identity→baseline boundary, so it uses
-/// baseline-aware penalty soft-limits. Those are stable here because the
-/// shin/talus are kg-scale (the constraint treatment was only needed for
-/// the few-gram foot bones). Returns the talocrural PD index.
+/// this joint crosses the identity→baseline boundary, so EVERY axis here
+/// is a baseline-aware `JointAxis`: the primary carries the full combined
+/// stack (limit + spring + damper + PD), and each off-axis is a combined
+/// two-term solve of its penalty lock (soft-limit ±OFF_AXIS_LIM) with its
+/// damper — the same coaxial pair the legacy build ran as two sequential
+/// passes, now sharing one denominator. Penalty locks are stable here
+/// because the shin/talus are kg-scale (the SI-constraint treatment was
+/// only needed for the few-gram foot bones). Every anatomical axis keeps
+/// its constraint. Returns the talocrural's joint_axes index.
 pub fn attach_talocrural(
     world: &mut XpbdWorld, seg_idx: usize, foot: &FootHandles,
     rom_min: f64, rom_max: f64, kp: f64, kd: f64,
@@ -441,32 +463,49 @@ pub fn attach_talocrural(
 
     let baseline = bone_baseline();
     let primary = Vec3::new(1.0, 0.0, 0.0); // DF/PF
-    world.angular_soft_limits.push(
-        AngularSoftLimit::new(seg_idx, talus_idx, primary, rom_min, rom_max, ARTIC_LIMIT_K, ARTIC_LIMIT_EXP)
-            .with_baseline(baseline));
-    world.angular_dampers.push(AngularDamper::new(seg_idx, talus_idx, primary, ARTIC_PASSIVE_C));
-    world.angular_springs.push(
-        AngularSpring::new(seg_idx, talus_idx, primary, ARTIC_PASSIVE_K, 0.0).with_baseline(baseline));
-    let pd_idx = world.angular_pd_controllers.len();
-    world.angular_pd_controllers.push(
-        AngularPDController::new(seg_idx, talus_idx, primary, kp, kd).with_baseline(baseline));
+    let ja_idx = world.joint_axes.len();
+    world.joint_axes.push(
+        JointAxis::new(seg_idx, talus_idx, primary)
+            .with_baseline(baseline)
+            .with_soft_limit(rom_min, rom_max, ARTIC_LIMIT_K, ARTIC_LIMIT_EXP)
+            .with_passive_spring(ARTIC_PASSIVE_K, 0.0)
+            .with_passive_damping(ARTIC_PASSIVE_C)
+            .with_pd(kp, kd));
 
-    // Y and Z off-axes locked with baseline-aware penalty soft-limits.
+    // Y and Z off-axes: baseline-aware penalty lock + damper, combined.
     for off in [Vec3::y(), Vec3::z()] {
-        world.angular_soft_limits.push(
-            AngularSoftLimit::new(seg_idx, talus_idx, off, -OFF_AXIS_LIM, OFF_AXIS_LIM, ARTIC_LIMIT_K, ARTIC_LIMIT_EXP)
-                .with_baseline(baseline));
-        world.angular_dampers.push(AngularDamper::new(seg_idx, talus_idx, off, ARTIC_PASSIVE_C));
+        world.joint_axes.push(
+            JointAxis::new(seg_idx, talus_idx, off)
+                .with_baseline(baseline)
+                .with_soft_limit(-OFF_AXIS_LIM, OFF_AXIS_LIM, ARTIC_LIMIT_K, 2.0)
+                .with_passive_damping(ARTIC_PASSIVE_C));
     }
-    pd_idx
+    ja_idx
 }
 
 /// Build the 26-bone foot into `world`. `attach` is the world position
 /// of the talus center (the host places it at the shin's distal end).
 /// The talocrural joint (shin↔talus) is created by the HOST, not here.
-/// Returns FootHandles with all 26 body indices and the per-child PD
-/// indices for the 21 articulated joints (welded children stay usize::MAX).
+/// Returns FootHandles with all 26 body indices and the per-child
+/// JointAxis indices for the 21 articulated joints (welded children stay
+/// usize::MAX).
 pub fn build_foot(world: &mut XpbdWorld, attach: Vec3) -> FootHandles {
+    // The design's L1 convergence lever, scoped to this assembly (spec
+    // §2.6; measured in Commit C): chained JointAxes under ground contact
+    // need SI sweeps proportional to the L2 warm seeds' velocity
+    // injection (w·λ ≈ 10³ rad/s at toe scale, ∝ sub_dt). At the engine
+    // default of 8 the residual seed velocity reaches integrate_positions
+    // and the toe chains detonate (toe-ray reproducer: DIP swings ±2.4 rad
+    // past its ROM, |ω| spikes 4.8e4 rad/s); at 16 they are bounded but
+    // sustain episodic 20–230 rad/s chatter (lift phases, grazing
+    // contacts); at 32 the ray is clean in every phase at sub_dt 1/7200
+    // and the demo foot's toe curl goes fully quiet (0 sign flips above
+    // the 0.5 rad/s judder floor vs the legacy 76.6/s). Hosts running a
+    // COARSER substep need proportionally more sweeps (the dual-rate test
+    // below matches 1/3600 with 64). The global default stays 8 so legacy
+    // (non-JointAxis) worlds remain bit-identical (docs/findings.md,
+    // Stage-2 re-land entry). max(): never LOWER a host's own setting.
+    world.solver_iterations = world.solver_iterations.max(32);
     let baseline = bone_baseline();
     // Foot origin = ground point below the talus. talus REST_POS.y is its
     // height above origin, so origin = attach - (0, talus.y, 0).
@@ -484,7 +523,7 @@ pub fn build_foot(world: &mut XpbdWorld, attach: Vec3) -> FootHandles {
         bodies[i] = world.add_body(body);
     }
 
-    let mut pd_by_child = [usize::MAX; BONE_COUNT];
+    let mut ja_by_child = [usize::MAX; BONE_COUNT];
 
     for spec in JOINTS.iter() {
         let parent_idx = bodies[spec.parent as usize];
@@ -513,16 +552,16 @@ pub fn build_foot(world: &mut XpbdWorld, attach: Vec3) -> FootHandles {
                 let axis_world = anat_to_world(axis_a);
                 // Both bones share bone_baseline(), so child-relative-to-parent
                 // rest orientation is identity.
-                let pd = add_articulated(
+                let ja = add_articulated(
                     world, parent_idx, child_idx, anchor_p, anchor_c,
                     axis_world, rom_min, rom_max, kp, kd,
                     Quat::identity());
-                pd_by_child[spec.child as usize] = pd;
+                ja_by_child[spec.child as usize] = ja;
             }
         }
     }
 
-    FootHandles { bodies, pd_by_child }
+    FootHandles { bodies, ja_by_child }
 }
 
 #[cfg(test)]
@@ -605,14 +644,99 @@ mod tests {
         assert!(heel.y < 0.10 && heel.y > -0.02, "heel y={} after settle", heel.y);
     }
 
+    /// E4e (Commit C): the coupled solve's dt-independence claim (design
+    /// §2.5), asserted at ASSEMBLY level on a grounded toe press (anchored
+    /// talus, hallux MTP ramped to +0.3 rad at the demo's
+    /// muscles-don't-step 0.2 rad/s, 1 s settle + 2.5 s run), at
+    /// sub_dt = 1/7200 vs 1/3600 — compared at MATCHED CONVERGENCE
+    /// EFFORT: 32 sweeps @1/7200 vs 64 @1/3600, i.e. the same 230k SI
+    /// sweeps per simulated second. The L2 warm seeds re-inject w·λ ∝ dt
+    /// of velocity every substep, so the per-substep sweep demand scales
+    /// with dt: at FIXED 32 sweeps the coarse rate under-converges and
+    /// the settled angle drops to +0.1704 (measured — the honest
+    /// assembly-level limitation, recorded in docs/findings.md
+    /// 2026-10-21; single joints are exact at any count per E1/E6).
+    /// Matching sweeps-per-second is the apples-to-apples comparison of
+    /// the COUPLED FIXED POINT itself, which is what §2.5 claims is
+    /// dt-independent.
+    ///
+    /// BAND DERIVATION (measured 2026-10-21): θ = +0.2347 @1/7200×32 vs
+    /// +0.2343 @1/3600×64 — 0.17% apart; band 2% = E1(iii)'s cross-rate
+    /// band applied to the settled pose (12× margin). The pp LIFT is NOT
+    /// banded across rates: measured 2.41 vs 1.79 mm (±40% scatter across
+    /// the sweep grid at fixed physics — the mm-scale lift rides on the
+    /// statically indeterminate contact/weld preload split documented at
+    /// xpbd.rs's KNOWN LIMITATION), so it is asserted qualitatively only:
+    /// the press genuinely lifts the pp (≥ 0.8 mm; grid minimum 0.90 mm,
+    /// and the BLOCKED Stage-2 branch measured 0.6 mm — this bites the
+    /// transmission gap). The legacy pipeline flipped grounded outcomes
+    /// qualitatively with sub_dt (E2's flag-off receipt), so the angle
+    /// band is a real discriminator. BITE-VERIFIED: asserting the naive
+    /// fixed-sweeps pair (32/32) fails the 2% angle band at 27% — the
+    /// matched-effort comparison is load-bearing, not cosmetic.
+    #[test]
+    fn grounded_toe_press_is_substep_rate_independent() {
+        let run = |sub_dt: f64, iters: usize| -> (f64, f64) {
+            let mut world = XpbdWorld::new();
+            world.set_ground(0.0);
+            let foot = build_foot(&mut world, Vec3::new(0.0, 0.039, 0.0));
+            world.solver_iterations = iters;
+            world.bodies[foot.body(Bone::Talus)].pin();
+            let ja_idx = foot.ja_by_child[Bone::HalluxPp as usize];
+            let pp_idx = foot.body(Bone::HalluxPp);
+            let steps_per_s = (1.0 / sub_dt).round() as usize;
+            for _ in 0..steps_per_s {
+                world.substep(sub_dt); // settle
+            }
+            let pp_y0 = world.bodies[pp_idx].position.y;
+            let total = (2.5 * steps_per_s as f64) as usize;
+            for i in 0..total {
+                let t = i as f64 * sub_dt;
+                world.joint_axes[ja_idx].target_angle = (0.2 * t).min(0.3);
+                world.substep(sub_dt);
+            }
+            let theta = world.joint_axes[ja_idx].angle(&world.bodies);
+            let lift = world.bodies[pp_idx].position.y - pp_y0;
+            (theta, lift)
+        };
+        let (th_f, lift_f) = run(1.0 / 7200.0, 32);
+        let (th_c, lift_c) = run(1.0 / 3600.0, 64);
+        println!(
+            "dual-rate toe press: θ {th_f:+.4} / {th_c:+.4} rad, lift {:.2} / {:.2} mm",
+            lift_f * 1000.0, lift_c * 1000.0
+        );
+        assert!(
+            th_f > 0.1,
+            "rig broken: grounded press did not dorsiflex (θ = {th_f})"
+        );
+        assert!(
+            (th_f - th_c).abs() <= 0.02 * th_f.abs(),
+            "settled MTP angle differs across substep rates at matched convergence \
+             effort: {th_f} vs {th_c} rad (> 2%)"
+        );
+        assert!(
+            lift_f >= 0.0008 && lift_c >= 0.0008,
+            "grounded press failed to lift the pp at one rate: {lift_f} / {lift_c} m \
+             (≥ 0.8 mm; the blocked force-transmission branch measured 0.6 mm)"
+        );
+    }
+
     #[test]
     fn build_foot_creates_expected_joint_counts() {
         let mut world = XpbdWorld::new();
         let h = build_foot(&mut world, Vec3::new(0.0, 0.30, 0.0));
-        // 21 articulated joints in the foot module → 21 PD controllers.
-        // (The 22nd articulated joint, talocrural, is host-created.)
-        let pd_count = h.pd_by_child.iter().filter(|&&x| x != usize::MAX).count();
-        assert_eq!(pd_count, 21, "expected 21 articulated PDs in the foot module");
-        assert_eq!(world.angular_pd_controllers.len(), 21);
+        // 21 articulated joints in the foot module → 21 primary-axis
+        // JointAxes. (The 22nd articulated joint, talocrural, is
+        // host-created.)
+        let ja_count = h.ja_by_child.iter().filter(|&&x| x != usize::MAX).count();
+        assert_eq!(ja_count, 21, "expected 21 articulated JointAxes in the foot module");
+        assert_eq!(world.joint_axes.len(), 21);
+        // Stage-2 invariant: the module composes NO legacy coaxial
+        // primitives on primary axes anymore (off-axis dampers are the
+        // only legacy angular primitives left: 2 per articulated joint).
+        assert_eq!(world.angular_springs.len(), 0);
+        assert_eq!(world.angular_soft_limits.len(), 0);
+        assert_eq!(world.angular_pd_controllers.len(), 0);
+        assert_eq!(world.angular_dampers.len(), 42);
     }
 }

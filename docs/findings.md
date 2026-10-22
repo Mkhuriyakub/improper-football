@@ -101,6 +101,14 @@ stated bounds while its doc comment records that the measured 6 µm navicular
 drop is ~3 orders below the physiological ~5 mm — the midfoot is
 near-rigid in the sagittal plane until Phase 3 adds its compliance together
 with the windlass stabilizers that make that compliance survivable.
+[Amended 2026-10-21: the +124 mm was an ARTIFACT-ERA number — produced by
+the legacy sequential passes' 41–207 rad/s burst transients ratcheting the
+heel up, not by transmitted torque (the passes transmit ~1/D of their
+demand through a blocking contact; the honest-solve-but-blocked-transmission
+Stage-2 branch measured +3.3 mm). The re-derived honest value on the
+migrated foot is +112.1 mm — the artifact had the right magnitude for the
+wrong reason, because ~24 N·m of commanded ankle torque genuinely unloads
+the heel and walks the CoP onto the forefoot. See the Commit C entry.]
 
 ## 2026-10 — Rendering exposed a geometry bug the numeric tests couldn't see
 
@@ -331,3 +339,113 @@ cone (μ ≤ 0 zeroes it) — un-projected, a friction impulse carried onto a
 μ = 0 ground re-applies every substep and never unwinds (measured: a
 coasting capsule reverses and gains speed without bound,
 carried_friction_seed_is_cone_projected_when_mu_drops).
+
+## 2026-10-21 — Stage-2 re-land (Commit C): the foot on the coupled solve; chain convergence, the preload valve, and the honest numbers
+
+The 26-bone foot's 21+3 articulated joints re-landed on `JointAxis` (the
+7dae7e0 migration, cherry-picked onto the fixed engine): every primary
+axis is one in-loop combined solve; off-axis locks stay SI constraints
+with dampers, so every joint keeps constraints on every anatomical axis.
+Gates green: physics suite (both pump canaries, both mixed canaries,
+E1/E2/E5, T1–T5), ankle_anatomical, foot_anatomical_demo --probe ALL
+PASS. Four findings came out of the re-derivation.
+
+**1. Chained JointAxes under contact need SI sweeps proportional to the
+warm-seed size — L1 landed PER-ASSEMBLY, not as the global default.** The
+L2 seeds re-inject Δω = w·λ ≈ 10³ rad/s (toe scale) of velocity every
+substep, and on a CHAIN of gram-scale joints through ground contact the
+sweeps must re-absorb all of it against near-degenerate alignments: at
+the default 8 sweeps the residual reaches integrate_positions and the
+toe-ray reproducer detonates (DIP ±2.4 rad past ROM, |ω| spikes 4.8e4
+rad/s); at 16 it is bounded with episodic bursts; at 32 it is clean at
+sub_dt 1/7200 (`ja_ray_press_dip_velocity_diagnostic`). Because the seed
+scales with dt, the demand DOUBLES at 1/3600 — within-substep convergence
+is dt-dependent, which the design's §2.6 single-joint analysis did not
+cover. Assembly-level dt-independence therefore holds at MATCHED
+CONVERGENCE EFFORT (sweeps × rate ≈ const): the grounded toe press
+settles at θ = +0.2347 (1/7200×32) vs +0.2343 (1/3600×64) — 0.17% — but
++0.1704 at a naive fixed 32/32 (the measured limitation;
+`foot.rs::grounded_toe_press_is_substep_rate_independent`). The global
+default STAYS 8: flipping it to 16 breaks the legacy pipeline's
+bit-identity promise (§5) — the legacy pump canary's lift phase
+limit-cycles at 20.9 rad/s under 16 default sweeps (the valve below
+discharging) — so `build_foot` raises its own world to ≥ 32 and the
+legacy worlds stay untouched.
+
+**2. STEP commands sit on a buckling knife edge; the canary protocol is
+RAMPED.** With honest full transmission, a stepped 2.4 N·m press rams the
+toe chain onto contacts millimetres from the hinge; the chain has two
+basins — flat-press and claw-jam — and which one a STEP lands in varies
+non-monotonically with sweeps × sub_dt (measured: clean at 32/7200 and
+64/3600, detonated at 32/3600 and 128/7200). RAMPED commands (0.3 rad/s,
+the demo's muscles-don't-step protocol) are clean and reproducible across
+the whole {16,32,64,128} × {1/7200,1/3600} grid, transmitting the full
+static demand everywhere (τ_tx/demand = 1.000 ± 0.005). The migrated pump
+canary (`ja_toe_ray_press_canary`) therefore ramps, and its bands are the
+wedge statics: all joints at rest angle (the flat chain is kinematically
+wedged), τ_tx = kp·target = 2.4 N·m within E1's 10%, ΣF_n ≥ the moment-
+balance floor τ/l_max ≈ 53 N, the legacy canary's own quiet bounds, E5's
+energy form, and the matched-effort dual-rate check. Residual artifact,
+documented not banded: contact RELEASE under carried seeds fires a
+self-healing one-substep velocity burst up to the full seed scale
+(w·dt·τ ≈ 8e4 rad/s at toe scale; measured 1e2–3.3e5 across the grid with
+clean end states every time) — the designed L3 escalation (joint+contact
+mini-block) is the known answer if it ever needs to go.
+
+**3. The partial-warm-start preload valve (pre-existing engine
+limitation, now documented).** The warm carry is asymmetric: manifold and
+JointAxis rows carry λ across substeps, bilateral rows (positional,
+angular locks) do not. On a REDUNDANTLY supported body — the legacy toe
+ray's root is welded to a pinned anchor WHILE resting on the ground — the
+contact accumulator becomes a one-way integrator (the seedless weld rows,
+earlier in each sweep, eat the contact seed's up-kick before the manifold
+row can see the separating velocity that would unwind λ; every downward
+residual reaching the last row becomes +Δλ), and the stored contact force
+ratchets toward the WELD-ELASTIC scale instead of the physical share:
+measured 46 → 117 N over 3 s on the 0.30 N root, kinematically silent, at
+the engine state that has been green for weeks
+(`legacy_ray_welded_root_preload_valve`). Carrying the positional rows
+symmetrically was tried and measured WORSE on loop topologies — the
+foot's weld loops co-inflate through the still-uncarried angular locks
+without bound (ΣF_n → 2e5 N on the demo foot) — so the complete fix is
+UNIFORM warm start across every row family (angular locks included, with
+unwind-capable accumulation for ranged limits): deferred, reproducer
+preserved. Consequences now: JointAxis assemblies must not compose rigid
+weld-to-pin supports with ground contact on one body (the foot's pinned
+talus behind compliant joints does not; the migrated canary pins its
+root); mm-scale grounded observables that ride on an indeterminate
+contact/weld split (pp lift, per-contact force splits) carry ±40%
+engine-knob scatter and are asserted qualitatively, while angles and
+transmitted torques are solver-robust and carry the tight bands.
+
+**4. The re-derived honest numbers (burst artifacts out, real statics
+in).** Airborne MTP tracking settles at the ANALYTIC kp/(kp+K)·0.8 =
+0.70588 (measured 0.7059; the legacy stack settled at 0.6501). Ankle CoP
+migration under the 0.2 rad PF command: **+112.1 mm** — the artifact-era
++124 mm (re-measured +114.8 at the current engine) had the right
+magnitude for the wrong reason (burst-ratcheted heel), the blocked branch
+measured +3.3 mm, and the honest value is the full heel-to-toe migration
+because the transmitted ~24 N·m genuinely lifts the heel; the ≥ 5 mm band
+is untouched. MTP Part B grounded lift: **5.33 mm** at pose 0.505 rad —
+exceeding the legacy 2.30 mm at 0.331 rad as predicted (blocked branch:
+0.6 mm); threshold tightened 1 → 2 mm (geometric floor of a ≥ 0.25 rad
+dorsiflexion about the ~8 mm MTP lever). Demo scenario responses, legacy →
+migrated (targets re-derived at 70%): push-off lesser-MTP rise +0.0775 →
+**+0.2297** and CoP +104.9 → **+144.0 mm**; curl MTP flex −0.0149 →
+**−0.1471** (the "ground-pressed MTPs barely flex" conclusion was the
+transmission gap) and PIP/DIP −0.1548 → **−0.1976**; inversion subtalar
++0.0792 → +0.0754 with CoP x +21.3 → **+12.6 mm** (the one response that
+SHRANK — the honest roll moves the CoP less than the artifact did);
+eversion subtalar −0.0016 → **−0.1052** (58×: "eversion-locked stance"
+was mostly the transmission gap) with the heel-ward CoP shift kept
+(−47.5 → −30.0 mm). Demo smoothness receipt (toe4 DIP, per-substep sign
+flips above a 0.5 rad/s judder floor / max |ω_rel|, legacy → migrated):
+neutral 0/0.065 → 0/0.22; toe curl **76.6/20.2 → 0/0.10** — the judder is
+gone while the response tripled; inversion 349/16.1 → 64/1.6; eversion
+0/0.26 → 34/2.1 (a real 58× response where legacy had none); push-off
+28.2/2.9 → 349/8.0 — the one scenario trading more sign flips at 3× the
+response amplitude: held-up toes graze the plane under carried seeds (the
+release-transient artifact above), mean |ω_rel| unchanged (0.21 → 0.20
+rad/s), invisible at render scale. (At a 1e-6 floor the LEGACY engine
+flips sign 2200–2700 times/s in every scenario including quiet neutral —
+micro-noise, which is why the receipt carries an amplitude floor.)

@@ -10,8 +10,8 @@
 //   3. Toe curl (MTP + IP/PIP/DIP flexion)
 //   4. Subtalar inversion (+0.15 rad about the oblique Manter/Inman axis —
 //      the ankle-sprain mechanism axis)
-//   5. Subtalar eversion (-0.15 rad command; see the measured stance
-//      asymmetry note in Commander::set_scenario)
+//   5. Subtalar eversion (-0.15 rad command; the CoP moves heel-ward
+//      rather than medially — see Commander::set_scenario)
 //
 // Fresh-stance resets: the free foot has one absorbing rolled pose
 // (friction-locked ~5.4° lateral tilt) that the first disturbing scenario
@@ -56,7 +56,7 @@ use std::collections::VecDeque;
 
 use physics::xpbd::XpbdWorld;
 use physics::rigid_body::RigidBody;
-use physics::math::{swing_twist_angle, Vec3 as NaVec3};
+use physics::math::Vec3 as NaVec3;
 
 use improper_football::anatomy::foot::{self, Bone, FootHandles, JointKind, BONES, BONE_COUNT, JOINTS};
 use improper_football::render_util::{nalgebra_vec3_to_bevy, rigid_body_to_transform};
@@ -112,7 +112,7 @@ fn scenario_goal(i: usize) -> &'static str {
         1 => "GOAL: lesser toes dorsiflex toward command; weight shifts to the\n      forefoot (the load-bearing hallux stays planted)",
         2 => "GOAL: lesser-toe chains flex (curl under) at the MTP and PIP/DIP\n      rows; toe-tip contacts release/migrate",
         3 => "GOAL: foot rolls about the oblique subtalar (sprain) axis - sole\n      turns inward, weight rolls ONTO the lateral (+x) edge\n      (the drawn line is the sprain axis)",
-        4 => "GOAL: mirror command of inversion. Measured: flat stance is\n      eversion-LOCKED (friction + tall medial column), so the command\n      expresses as a heel-ward CoP shift (drawn line = sprain axis)",
+        4 => "GOAL: mirror command of inversion - the foot everts about the\n      sprain axis; measured: the roll expresses with a heel-ward CoP\n      shift rather than a medial one (drawn line = sprain axis)",
         _ => unreachable!(),
     }
 }
@@ -120,12 +120,19 @@ fn scenario_goal(i: usize) -> &'static str {
 // ─── Scenario verification: targets, criteria, trackers ─────────────────
 //
 // TARGETS. Every target is derived from headless measurement: two full
-// scenario cycles of `--probe` on this exact world (2026-10-20, HEAD of
-// feature/rendering), reading each criterion's achieved extreme per cycle
-// and setting the target at ~70% of the WEAKER cycle's value — the check
-// fires decisively mid-scenario, honest but not fragile to the slight
-// cycle-over-cycle hindfoot settling. Each constant quotes its measured
-// basis (cycle 1 / cycle 2 achieved values).
+// scenario cycles of `--probe` on this exact world, reading each
+// criterion's achieved extreme per cycle and setting the target at ~70% of
+// the WEAKER cycle's value — the check fires decisively mid-scenario,
+// honest but not fragile. RE-DERIVED 2026-10-21 on the MIGRATED foot
+// (every primary axis one JointAxis under the coupled in-loop solve + warm
+// pair, 32 SI sweeps — Commit C): with full torque transmission the
+// grounded responses grew 2–65× over the legacy-era measurements (which
+// rode on the burst-transient artifacts of the throttled sequential
+// passes — docs/findings.md 2026-10-21), so most targets TIGHTEN; the
+// inversion CoP-x response is the one that shrank (the legacy +21.3 mm
+// included artifact dynamics; honest is +12.6). Under the fresh-stance
+// resets both cycles measure identical, so "weaker cycle" is degenerate.
+// Each constant quotes its measured basis (legacy-era → migrated).
 //
 // These are the demo's acceptance criteria — including the project's
 // FIRST asserted inversion/eversion criteria. They are presentation-grade
@@ -143,69 +150,71 @@ const FN_SMOOTH_TAU: f64 = 0.25;
 // threshold either passes at scenario start or can never pass. A delta
 // measures what THIS scenario's command accomplished.
 
-// Neutral stance. Measured (both cycles identical under the fresh-stance
-// resets): contacts [33, 42], smoothed Fn 6.1–6.7 N, CoP margin
-// [21.4, 24.5] mm.
-const NEUTRAL_MIN_CONTACTS: f64 = 23.0; // 70% of the measured min 33
+// Neutral stance. Measured on the migrated foot: contacts 28 achieved
+// (transient dips to 12 during the settle-adjacent window), smoothed Fn
+// settling to |err| ≈ 0.5 N of the 6.4 N expectation, CoP margin 24.5 mm.
+const NEUTRAL_MIN_CONTACTS: f64 = 19.0; // 70% of the measured 28 (legacy 33)
 /// The ground bears ~6.4 N of the 9.81 N foot weight in neutral stance:
 /// the PINNED talus absorbs the rest (~3.4 N) through the joint tree —
 /// more than the talus's own 1.6 N weight, because the stiff subtalar/
 /// talonavicular couplings route part of the hindfoot load up into the
-/// anchor. Measured smoothed Fn 6.1–6.7 N.
+/// anchor. Re-measured on the migrated foot: smoothed Fn settles 0.5 N
+/// from 6.4 (band unchanged); brief ~20 N excursions during the
+/// fresh-stance settle are preload transients of the partial-warm-start
+/// carry (xpbd.rs KNOWN LIMITATION) and are latched over.
 const NEUTRAL_EXPECTED_FN: f64 = 6.4;
-const NEUTRAL_FN_BAND: f64 = 1.0; // measured |err| <= 0.3; band catches no-contact and bounce limit cycles
-const NEUTRAL_COP_MARGIN_MM: f64 = 15.0; // 70% of the measured min 21.4
+const NEUTRAL_FN_BAND: f64 = 1.0; // measured |err| <= 0.5; band catches no-contact and bounce limit cycles
+const NEUTRAL_COP_MARGIN_MM: f64 = 17.0; // 70% of the measured 24.5 (legacy target 15)
 
-// Toe push-off. Measured: lesser MTP rise peaks +0.0515 rad, CoP shifts
-// +88.9 mm anterior (both cycles identical). The commanded hallux MTP is
-// intentionally NOT a criterion: measured, the load-bearing hallux stays
-// planted (rise +0.0001 rad — it actually dips -0.028 as weight comes
-// forward); full hallux tracking is asserted by the validation suite's
-// stabilized-shin MTP test, not by free stance.
-const PUSHOFF_LESSER_RISE: f64 = 0.036; // 70% of measured +0.0515
-const PUSHOFF_COP_DZ_MM: f64 = 62.0;    // 70% of measured +88.9
+// Toe push-off. Measured on the migrated foot: lesser MTP rise peaks
+// +0.2297 rad (legacy-era +0.0515 — the honest transmission moves the toes
+// 4.5× further toward the +0.4 command), CoP shifts +144.0 mm anterior
+// (legacy +88.9). The commanded hallux MTP is intentionally NOT a
+// criterion: the load-bearing hallux stays planted in free stance; full
+// hallux tracking is asserted by the validation suite's stabilized-shin
+// MTP test.
+const PUSHOFF_LESSER_RISE: f64 = 0.16;  // 70% of measured +0.2297
+const PUSHOFF_COP_DZ_MM: f64 = 100.0;   // 70% of measured +144.0
 
-// Toe curl (negative = flexion). Measured chain mean flex -0.106; split
-// into the two commanded rows for the final criteria (MTP commanded -0.2,
-// PIP/DIP -0.4) — targets at 70% of the measured per-row values quoted at
-// the constants. The hallux IP is NOT a criterion: measured, the planted
-// hallux's IP EXTENDS transiently (+0.042) instead of flexing — the tip
-// is load-locked, same story as push-off.
-// Measured per-row (both cycles identical): the curl concentrates in the
-// PIP/DIP row (-0.1546 rad) while the ground-pressed MTPs barely flex
-// (-0.0115 rad — flexing an MTP must drive the toe pad into the ground).
-const CURL_MTP_FLEX: f64 = -0.008; // 70% of measured -0.0115
-const CURL_IP_FLEX: f64 = -0.108;  // 70% of measured -0.1546
+// Toe curl (negative = flexion). One criterion per commanded row (MTP
+// commanded -0.2, PIP/DIP -0.4); the hallux IP is NOT a criterion (the
+// planted hallux tip is load-locked, same story as push-off). Measured on
+// the migrated foot: MTP row -0.1471 rad (legacy-era -0.0115 — the legacy
+// "MTPs barely flex" conclusion was the transmission gap, not physics:
+// with full torque the MTPs genuinely curl 13× further) and PIP/DIP row
+// -0.1976 (legacy -0.1546).
+const CURL_MTP_FLEX: f64 = -0.10;  // 70% of measured -0.1471
+const CURL_IP_FLEX: f64 = -0.138;  // 70% of measured -0.1976
 
-// Subtalar inversion / eversion (from a fresh stance; both cycles
-// identical). CoP signs measured: inversion rolls weight ONTO the lateral
-// (+x) edge — CONTRADICTING the naive "weight shifts lateral→medial"
-// guess — with subtalar +0.0714 rad and CoP +21.3 mm sustained; the
-// eversion command cannot roll the flat foot medially at all (subtalar
-// -0.0018 rad) and instead shifts the CoP heel-ward (posterior,
-// -26.4 mm). These are the demo's (and the project's) first ASSERTED
-// inversion/eversion criteria; the spec-grade sprain-kinematic test
-// remains backlog.
-const INV_SUBTALAR_SHIFT: f64 = 0.050;  // 70% of measured +0.0714
-const INV_COP_DX_MM: f64 = 15.0;        // 70% of measured +21.3
-const EV_SUBTALAR_SHIFT: f64 = -0.0013; // 70% of measured -0.0018
-const EV_COP_DZ_MM: f64 = -18.0;        // 70% of measured -26.4
+// Subtalar inversion / eversion (from a fresh stance). CoP signs measured:
+// inversion rolls weight ONTO the lateral (+x) edge — CONTRADICTING the
+// naive "weight shifts lateral→medial" guess — with subtalar +0.0754 rad
+// and CoP +12.6 mm (the legacy-era +21.3 mm included burst-artifact
+// dynamics; the honest coupled-solve roll moves the CoP less). EVERSION
+// re-measured (2026-10-21): the migrated foot GENUINELY everts — subtalar
+// -0.1052 rad, 58× the legacy-era -0.0018 — so the old "flat stance is
+// eversion-locked" conclusion was mostly the legacy force-transmission
+// gap, not stance mechanics; what remains of the asymmetry is that
+// eversion expresses with little medial CoP roll and a heel-ward
+// (posterior) CoP shift, -30.0 mm measured (legacy -26.4). These are the
+// demo's (and the project's) first ASSERTED inversion/eversion criteria;
+// the spec-grade sprain-kinematic test remains backlog.
+const INV_SUBTALAR_SHIFT: f64 = 0.052;  // 70% of measured +0.0754
+const INV_COP_DX_MM: f64 = 8.8;         // 70% of measured +12.6
+const EV_SUBTALAR_SHIFT: f64 = -0.073;  // 70% of measured -0.1052
+const EV_COP_DZ_MM: f64 = -21.0;        // 70% of measured -30.0
 
-/// Joint angle exactly as the PD controller measures it: swing-twist of
-/// the child-in-parent orientation (relative to the PD's baseline) about
-/// the PD's axis. Mirrors `AngularPDController::angle` and
-/// ankle_anatomical.rs's `pd_joint_angle`.
-fn pd_joint_angle(world: &XpbdWorld, pd_idx: usize) -> f64 {
-    let pd = &world.angular_pd_controllers[pd_idx];
-    let q_b_in_a = world.bodies[pd.body_a].orientation.inverse()
-                 * world.bodies[pd.body_b].orientation;
-    let q_from_rest = q_b_in_a * pd.baseline.inverse();
-    swing_twist_angle(q_from_rest, pd.axis_local_a)
+/// Joint angle exactly as the combined solve measures it: swing-twist of
+/// the child-in-parent orientation (relative to the joint's baseline)
+/// about the joint's axis — `JointAxis::angle`. Mirrors
+/// ankle_anatomical.rs's `ja_joint_angle`.
+fn ja_joint_angle(world: &XpbdWorld, ja_idx: usize) -> f64 {
+    world.joint_axes[ja_idx].angle(&world.bodies)
 }
 
 /// Angle of the articulated joint whose CHILD is `child`.
 fn child_angle(world: &XpbdWorld, foot: &FootHandles, child: Bone) -> f64 {
-    pd_joint_angle(world, foot.pd_by_child[child as usize])
+    ja_joint_angle(world, foot.ja_by_child[child as usize])
 }
 
 /// Mean angle of the four lesser-toe MTP joints.
@@ -545,7 +554,7 @@ impl Commander {
     /// transition (both the windowed and the headless drivers do).
     fn begin_scenario(&mut self, world: &XpbdWorld, foot: &FootHandles) {
         self.subtalar_ref =
-            pd_joint_angle(world, foot.pd_by_child[Bone::Calcaneus as usize]);
+            ja_joint_angle(world, foot.ja_by_child[Bone::Calcaneus as usize]);
     }
 
     /// Set the goal for the joint whose child is `child`, clamped to the
@@ -625,10 +634,13 @@ impl Commander {
                 // hold): ±0.05 cannot break the standing foot's friction
                 // lock AT ALL (subtalar shift +0.000 from pristine stance);
                 // +0.15 rolls the foot genuinely onto its lateral edge
-                // (subtalar +0.07, calcaneus tilt 0→5.4°, CoP +21 mm
-                // lateral, sustained) and it stays standing — the rolled
-                // pose is a stable attractor, which is why this scenario
-                // needs a fresh stance (see needs_fresh_stance).
+                // and it stays standing — the rolled pose is a stable
+                // attractor, which is why this scenario needs a fresh
+                // stance (see needs_fresh_stance). RE-PROBED AGAIN
+                // 2026-10-21 on the migrated foot (full torque
+                // transmission): +0.15 remains right — subtalar +0.0754,
+                // calcaneus tilt 0→4.9°, CoP +12.6 mm lateral, sustained,
+                // recovering upright after the pulse.
                 //
                 // RELATIVE command (see `subtalar_ref`): from the fresh
                 // stance subtalar_ref ≈ 0, so this is +0.15 in practice;
@@ -638,14 +650,16 @@ impl Commander {
             }
             4 => {
                 // Eversion: mirror command of scenario 3 (ROM min -0.17).
-                // Measured reality (2026-10-20): even from a pristine
-                // stance and at ROM-scale torque (7.5 N·m) the flat foot
-                // CANNOT roll medially — friction + the tall medial column
-                // lock the eversion direction (a real stance asymmetry:
-                // inversion sprains happen, eversion ones barely exist).
-                // The command instead expresses as a heel-ward (posterior)
-                // CoP shift plus a ~0.002 rad subtalar nudge, and those
-                // are what the scenario's criteria verify.
+                // History: on the LEGACY engine even ROM-scale torque
+                // (7.5 N·m) could not roll the flat foot medially and the
+                // scenario was documented as "eversion-locked". Re-measured
+                // 2026-10-21 on the migrated foot: that lock was mostly
+                // the legacy force-transmission gap — the coupled solve
+                // genuinely everts the subtalar by -0.105 rad. What
+                // remains of the stance asymmetry: the eversion roll
+                // barely moves the CoP medially and instead shifts it
+                // heel-ward (posterior, -30 mm) — the criteria verify the
+                // subtalar roll and that measured CoP signature.
                 let goal = self.subtalar_ref - 0.15;
                 self.set(Bone::Calcaneus, goal);
             }
@@ -653,17 +667,17 @@ impl Commander {
         }
     }
 
-    /// Move every PD target one frame-step toward its goal.
+    /// Move every joint target one frame-step toward its goal.
     fn tick(&self, world: &mut XpbdWorld, foot: &FootHandles, dt: f64) {
         let max_step = TARGET_RAMP_RATE * dt;
         for child in 0..BONE_COUNT {
-            let pd_idx = foot.pd_by_child[child];
-            if pd_idx == usize::MAX {
-                continue; // welded child — no PD
+            let ja_idx = foot.ja_by_child[child];
+            if ja_idx == usize::MAX {
+                continue; // welded child — no articulated joint
             }
-            let pd = &mut world.angular_pd_controllers[pd_idx];
-            let delta = self.goals[child] - pd.target_angle;
-            pd.target_angle += delta.clamp(-max_step, max_step);
+            let ja = &mut world.joint_axes[ja_idx];
+            let delta = self.goals[child] - ja.target_angle;
+            ja.target_angle += delta.clamp(-max_step, max_step);
         }
     }
 }
@@ -716,6 +730,15 @@ fn build_bare() -> Built {
     // the corrected geometry, the undamped bare foot still shows bounded
     // 20-30 deg tilt excursions (recovering pops), while with these
     // dampers it stands at ~2 deg with only millimeter-scale toe jitter.
+    // NOTE (2026-10-21, Stage-2 re-land): these host dampers are now LEGACY
+    // AngularDampers COAXIAL with the foot's primary-axis JointAxes — the
+    // mixed same-pair composition the warm-seed placement amendment exists
+    // for (crates/physics/tests/coupled_joint.rs canary 1). Measured A/B on
+    // the migrated foot (--probe, with/without): the extra damping is still
+    // load-bearing for the neutral-stance Fn band and does NOT rectify the
+    // seeds (the seeds apply after the legacy passes), so it stays. The
+    // clean migration (folding it into each JointAxis's passive_damping)
+    // is Commit-D cleanup territory.
     let subtalar_axis = foot::anat_to_world(foot::subtalar_axis_anat());
     world.angular_dampers.push(physics::angular_damper::AngularDamper::new(
         foot.body(Bone::Talus), foot.body(Bone::Calcaneus), subtalar_axis, 3.0));
@@ -1509,6 +1532,21 @@ fn probe() {
     let mut fn_smooth = 0.0;
     let mut t = 0.0;
     let mut next_print = 0.0;
+    // Smoothness instrumentation (FOOT_PROBE_DIP): per-substep stats of
+    // the toe4 DIP hinge velocity per scenario — sign flips with a
+    // 0.5 rad/s amplitude floor (micro-noise around zero flips sign
+    // thousands of times per second on EITHER engine and measures nothing;
+    // the floor counts only judder-amplitude reversals), plus mean/max
+    // |w_rel|. This is the demo-smoothness receipt instrument: the
+    // before/after table lives in docs/findings.md 2026-10-21 (e.g. toe
+    // curl: legacy 76.6 flips/s at max 20.2 rad/s → migrated 0 flips/s at
+    // max 0.10).
+    let dip_trace = std::env::var("FOOT_PROBE_DIP").is_ok();
+    let mut flips = [0u64; SCENARIO_COUNT];
+    let mut flip_substeps = [0u64; SCENARIO_COUNT];
+    let mut wsum = [0.0f64; SCENARIO_COUNT];
+    let mut wmax = [0.0f64; SCENARIO_COUNT];
+    let mut last_sign: i8 = 0;
     while t < total {
         if let Some(i) = scenario {
             commander.update(i, scenario_t);
@@ -1516,6 +1554,23 @@ fn probe() {
         commander.tick(&mut world, &foot, DT);
         for _ in 0..SOLVER_ITERATIONS {
             world.substep(SUB_DT);
+            if dip_trace {
+                if let Some(i) = scenario {
+                    let p = foot.body(Bone::Toe4Mp);
+                    let c = foot.body(Bone::Toe4Dp);
+                    let n = world.bodies[p].orientation * NaVec3::x();
+                    let w_rel = (world.bodies[c].angular_velocity
+                        - world.bodies[p].angular_velocity).dot(&n);
+                    let sign = if w_rel > 0.5 { 1 } else if w_rel < -0.5 { -1 } else { 0 };
+                    if sign != 0 {
+                        if last_sign != 0 && sign != last_sign { flips[i] += 1; }
+                        last_sign = sign;
+                    }
+                    flip_substeps[i] += 1;
+                    wsum[i] += w_rel.abs();
+                    wmax[i] = wmax[i].max(w_rel.abs());
+                }
+            }
         }
         t += DT;
         let (contacts, cop, fn_total) = gather_contacts(&world);
@@ -1592,6 +1647,17 @@ fn probe() {
                 cop.map_or("none".into(), |c| format!("{:+.3}", c.x)),
                 cop.map_or("none".into(), |c| format!("{:+.3}", c.z)),
             );
+        }
+    }
+    if dip_trace {
+        for i in 0..SCENARIO_COUNT {
+            let secs = flip_substeps[i] as f64 * SUB_DT;
+            if secs > 0.0 {
+                println!(
+                    "DIPFLIPS scenario {} ({}): {} sign flips (>0.5 rad/s floor) over {:.1} s = {:.1} flips/s; mean |w_rel| {:.4}, max {:.3} rad/s",
+                    i + 1, scenario_name(i), flips[i], secs,
+                    flips[i] as f64 / secs, wsum[i] / flip_substeps[i] as f64, wmax[i]);
+            }
         }
     }
     // Per-scenario acceptance gate: the demo's smoke check is now "each
@@ -1705,11 +1771,11 @@ fn probe_toe5() {
             }
         };
         if zero_pd {
-            // Zero only the FOOT joints' kp (via pd_by_child); in the loaded
+            // Zero only the FOOT joints' kp (via ja_by_child); in the loaded
             // config the talocrural PD stays, since it balances the column.
-            for &pd_idx in foot.pd_by_child.iter() {
-                if pd_idx != usize::MAX {
-                    world.angular_pd_controllers[pd_idx].kp = 0.0;
+            for &ja_idx in foot.ja_by_child.iter() {
+                if ja_idx != usize::MAX {
+                    world.joint_axes[ja_idx].kp = 0.0;
                 }
             }
         }

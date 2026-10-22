@@ -871,20 +871,404 @@ fn build_toe_ray(
     (world, idxs)
 }
 
+/// The MIGRATED twin of `build_toe_ray`: identical geometry and gains, but
+/// each articulated joint's four coaxial legacy primitives (soft limit,
+/// spring, damper, PD) are ONE `JointAxis` — exactly the composition
+/// `foot.rs::add_articulated` produces since the Stage-2 re-land. Off-axis
+/// locks and off-axis dampers stay legacy (different axes, nothing
+/// coaxial to combine), as in the migrated foot module.
+///
+/// ONE deliberate rig deviation from the legacy ray: the metatarsal root
+/// is PINNED instead of welded to a pinned anchor while resting on the
+/// ground. The welded-grounded root is a REDUNDANT support (weld + ground
+/// on one body) and sits exactly on the partial-warm-start preload valve
+/// (xpbd.rs `substep` KNOWN LIMITATION): its contact λ_n ratchets to the
+/// weld's elastic scale (measured here: 460 N stored on the 0.3 N root at
+/// 24+ sweeps, discharging as sustained 615 rad/s bursts at 16). The
+/// migrated foot composes no such support — its boundary is a pinned
+/// talus behind compliant joints — so the canary pins its root the same
+/// way (also the E1/E6 convention). The legacy ray keeps its historical
+/// weld (and its silent, bounded preload) untouched.
+fn build_toe_ray_ja(
+    parent_mhr: (f64, f64, f64),
+    links: &[ToeLink],
+) -> (XpbdWorld, Vec<usize>) {
+    use physics::joint_axis::JointAxis;
+    let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
+    // The migrated foot's L1 convergence setting (foot.rs::build_foot sets
+    // the same): chained JointAxes under contact need ≥ 16 SI sweeps to
+    // re-absorb the warm seeds' per-substep velocity injection. At the
+    // engine default of 8 this exact rig detonates (see
+    // ja_ray_press_dip_velocity_diagnostic: DIP ±2.4 rad past ROM,
+    // |ω| 4.8e4 rad/s); the legacy ray keeps the default 8 it was
+    // calibrated at.
+    world.solver_iterations = 32;
+
+    let along_z = Quat::from_scaled_axis(Vec3::new(std::f64::consts::FRAC_PI_2, 0.0, 0.0));
+
+    let (pm, ph, pr) = parent_mhr;
+    let mut parent = RigidBody::new_capsule(pm, ph, pr);
+    parent.orientation = along_z;
+    parent.position = Vec3::new(0.0, pr, 0.0);
+    parent.pin();
+    let parent_idx = world.add_body(parent);
+
+    let mut idxs = vec![parent_idx];
+    let mut prev_idx = parent_idx;
+    let mut prev_tip_z = ph + pr;
+    let mut prev_r = pr;
+    for link in links {
+        let joint_world = Vec3::new(0.0, (prev_r + link.radius) * 0.5, prev_tip_z);
+        let mut b = RigidBody::new_capsule(link.mass, link.half_h, link.radius);
+        b.orientation = along_z;
+        b.position = Vec3::new(0.0, link.radius, prev_tip_z + link.half_h + link.radius);
+        let idx = world.add_body(b);
+
+        let mut c = PositionalConstraint::new(prev_idx, idx, 0.0, 1.0 / 60_000.0);
+        c.local_anchor_a = anchor_local(&world, prev_idx, joint_world);
+        c.local_anchor_b = anchor_local(&world, idx, joint_world);
+        world.constraints.push(c);
+        world.joint_axes.push(
+            JointAxis::new(prev_idx, idx, Vec3::x())
+                .with_soft_limit(link.rom.0, link.rom.1, 8000.0, 2.0)
+                .with_passive_spring(4.0, 0.0)
+                .with_passive_damping(1.0)
+                .with_pd(link.kp, link.kd),
+        );
+        for off in [Vec3::y(), Vec3::z()] {
+            world.angular_constraints.push(AngularLimitConstraint::new(
+                prev_idx, idx, off, -0.05, 0.05,
+            ));
+            world.angular_dampers.push(AngularDamper::new(prev_idx, idx, off, 1.0));
+        }
+
+        idxs.push(idx);
+        prev_idx = idx;
+        prev_tip_z += 2.0 * (link.half_h + link.radius);
+        prev_r = link.radius;
+    }
+    (world, idxs)
+}
+
 fn toe5_ray() -> (XpbdWorld, Vec<usize>) {
     // toe5 ray behind a 30 g metatarsal-scale root: pp, mp, dp at the foot's
     // BONES-table values; MTP gains kp = 8 / kd = 0.3, PIP and DIP kp = 4 /
     // kd = 0.15. In this rig + is flexion (down), so the PIP/DIP ROMs
     // [0, 0.61] / [0, 1.05] rest at their straight-toe boundary like the
     // real foot's.
-    build_toe_ray(
-        (0.030, 0.025, 0.004),
-        &[
-            ToeLink { mass: 0.0061, half_h: 0.0060, radius: 0.0040, kp: 8.0, kd: 0.3, rom: (-0.70, 0.70) },
-            ToeLink { mass: 0.0022, half_h: 0.0010, radius: 0.0025, kp: 4.0, kd: 0.15, rom: (0.0, 0.61) },
-            ToeLink { mass: 0.0024, half_h: 0.0010, radius: 0.0030, kp: 4.0, kd: 0.15, rom: (0.0, 1.05) },
-        ],
-    )
+    build_toe_ray((0.030, 0.025, 0.004), &toe5_links())
+}
+
+/// toe5_ray's links, shared by the legacy and JointAxis builders.
+fn toe5_links() -> [ToeLink; 3] {
+    [
+        ToeLink { mass: 0.0061, half_h: 0.0060, radius: 0.0040, kp: 8.0, kd: 0.3, rom: (-0.70, 0.70) },
+        ToeLink { mass: 0.0022, half_h: 0.0010, radius: 0.0025, kp: 4.0, kd: 0.15, rom: (0.0, 0.61) },
+        ToeLink { mass: 0.0024, half_h: 0.0010, radius: 0.0030, kp: 4.0, kd: 0.15, rom: (0.0, 1.05) },
+    ]
+}
+
+fn toe5_ray_ja() -> (XpbdWorld, Vec<usize>) {
+    build_toe_ray_ja((0.030, 0.025, 0.004), &toe5_links())
+}
+
+/// DIAGNOSTIC: the JA ray's canary-style three phases with per-joint
+/// statics cross-checks, at both sub_dts. This is the measurement the
+/// JointAxis pump-canary bands are derived from. Knobs: JA_ITERS=<n>
+/// overrides the sweep count, JA_RAMP=1 uses the canary's ramped command
+/// protocol (default here: STEP commands — the knife-edge regime, kept
+/// steppable precisely so the claw-jam basin stays observable).
+/// Run with --ignored --nocapture.
+#[test]
+#[ignore = "diagnostic harness (Commit C band derivation) — run with --ignored --nocapture"]
+fn ja_ray_phase_measurement() {
+    for &sub_dt in &[SUB_DT, 1.0 / 3600.0] {
+        let (mut world, idxs) = toe5_ray_ja();
+        if let Some(it) = std::env::var("JA_ITERS").ok().and_then(|s| s.parse().ok()) {
+            world.solver_iterations = it;
+        }
+        println!("── sub_dt = 1/{:.0}, iterations {} ──", 1.0 / sub_dt, world.solver_iterations);
+
+        let report = |world: &XpbdWorld, m: &ChainMeasure, label: &str| {
+            print!("  {label}: max|ω| {:9.3}, last-sec {:9.4} | joint means", m.max_w, m.max_w_last);
+            for v in &m.joint_means { print!(" {v:+.4}"); }
+            print!(" | τ_tx/demand");
+            for (j, ja) in world.joint_axes.iter().enumerate() {
+                let theta = ja.angle(&world.bodies);
+                let s_lim = ja.limit.as_ref().map_or(0.0, |l| l.scalar_torque(theta));
+                let demand = ja.kp * (ja.target_angle - theta)
+                    - ja.passive_stiffness * (theta - ja.passive_rest_angle) + s_lim;
+                print!(" [{j}] {:+.4}/{:+.4}", ja.applied_total_torque, demand);
+            }
+            let fn_tot: f64 = idxs.iter().map(|&i| world.total_normal_force(i)).sum();
+            println!(" | ΣF_n {fn_tot:.2} N");
+        };
+
+        // Ramp the MTP target toward `goal` at 0.3 rad/s (the demo's
+        // muscles-don't-step protocol), then hold for the rest of `secs`.
+        let run_phase_ramped = |world: &mut XpbdWorld, goal: f64, secs: f64| -> ChainMeasure {
+            let frames = (secs / DT).round() as usize;
+            let spf = (DT / sub_dt).round() as usize;
+            let last_sec_from = frames.saturating_sub((1.0 / DT).round() as usize) * spf;
+            let mut max_w: f64 = 0.0;
+            let mut max_w_last: f64 = 0.0;
+            let n_joints = idxs.len() - 1;
+            let mut sums = vec![0.0f64; n_joints];
+            let mut n_samples = 0usize;
+            let mut substep_i = 0usize;
+            for _ in 0..frames {
+                let t = world.joint_axes[0].target_angle;
+                let step = 0.3 * DT;
+                world.joint_axes[0].target_angle = t + (goal - t).clamp(-step, step);
+                for _ in 0..spf {
+                    world.substep(sub_dt);
+                    for &i in &idxs[1..] {
+                        let w = world.bodies[i].angular_velocity.norm();
+                        if !w.is_finite() || w > max_w { max_w = w; }
+                        if substep_i >= last_sec_from && (!w.is_finite() || w > max_w_last) {
+                            max_w_last = w;
+                        }
+                    }
+                    if substep_i >= last_sec_from {
+                        for (j, pair) in idxs.windows(2).enumerate() {
+                            sums[j] += joint_angle(world, pair[0], pair[1]);
+                        }
+                        n_samples += 1;
+                    }
+                    substep_i += 1;
+                }
+            }
+            ChainMeasure {
+                max_w, max_w_last,
+                joint_means: sums.iter().map(|s| s / n_samples as f64).collect(),
+            }
+        };
+
+        let run_phase = |world: &mut XpbdWorld, secs: f64| -> ChainMeasure {
+            // run_chain_measured's cadence but at this sub_dt.
+            let frames = (secs / DT).round() as usize;
+            let spf = (DT / sub_dt).round() as usize;
+            let last_sec_from = frames.saturating_sub((1.0 / DT).round() as usize) * spf;
+            let mut max_w: f64 = 0.0;
+            let mut max_w_last: f64 = 0.0;
+            let n_joints = idxs.len() - 1;
+            let mut sums = vec![0.0f64; n_joints];
+            let mut n_samples = 0usize;
+            let mut substep_i = 0usize;
+            for _ in 0..frames {
+                for _ in 0..spf {
+                    world.substep(sub_dt);
+                    for &i in &idxs[1..] {
+                        let w = world.bodies[i].angular_velocity.norm();
+                        if !w.is_finite() || w > max_w { max_w = w; }
+                        if substep_i >= last_sec_from && (!w.is_finite() || w > max_w_last) {
+                            max_w_last = w;
+                        }
+                    }
+                    if substep_i >= last_sec_from {
+                        for (j, pair) in idxs.windows(2).enumerate() {
+                            sums[j] += joint_angle(world, pair[0], pair[1]);
+                        }
+                        n_samples += 1;
+                    }
+                    substep_i += 1;
+                }
+            }
+            ChainMeasure {
+                max_w, max_w_last,
+                joint_means: sums.iter().map(|s| s / n_samples as f64).collect(),
+            }
+        };
+
+        let p0 = run_phase(&mut world, 3.0);
+        report(&world, &p0, "P0 rest ");
+        let ramped = std::env::var("JA_RAMP").is_ok();
+        if ramped {
+            let p1 = run_phase_ramped(&mut world, 0.3, 4.0);
+            report(&world, &p1, "P1 press");
+            let p2 = run_phase_ramped(&mut world, -0.3, 4.0);
+            report(&world, &p2, "P2 lift ");
+        } else {
+            world.joint_axes[0].target_angle = 0.3;
+            let p1 = run_phase(&mut world, 4.0);
+            report(&world, &p1, "P1 press");
+            world.joint_axes[0].target_angle = -0.3;
+            let p2 = run_phase(&mut world, 3.0);
+            report(&world, &p2, "P2 lift ");
+        }
+    }
+}
+
+/// DIAGNOSTIC: per-0.1 s trace of the ray's LIFT phase (the sustained
+/// limit cycle at 16 iterations; the preload-valve ratchet on the legacy
+/// ray). Knobs: JA_ITERS=<n>, JA_LEGACY=1 (trace `toe5_ray` instead of
+/// the JointAxis ray). Run with --ignored --nocapture.
+#[test]
+#[ignore = "diagnostic harness (Commit C isolation) — run with --ignored --nocapture"]
+fn ja_ray_lift_trace() {
+    let iters: usize = std::env::var("JA_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+    let legacy = std::env::var("JA_LEGACY").is_ok();
+    let (mut world, idxs) = if legacy { toe5_ray() } else { toe5_ray_ja() };
+    world.solver_iterations = iters;
+    println!("── iters = {iters}, legacy = {legacy} ──");
+    let set_target = |world: &mut XpbdWorld, t: f64| {
+        if legacy {
+            world.angular_pd_controllers[0].target_angle = t;
+        } else {
+            world.joint_axes[0].target_angle = t;
+        }
+    };
+    // settle + press, as in the canary.
+    for _ in 0..((3.0 / SUB_DT) as usize) { world.substep(SUB_DT); }
+    set_target(&mut world, 0.3);
+    for _ in 0..((4.0 / SUB_DT) as usize) { world.substep(SUB_DT); }
+    set_target(&mut world, -0.3);
+    let window = (0.1 / SUB_DT) as usize;
+    let mut wmax = vec![0.0f64; idxs.len()];
+    for i in 0..((3.0 / SUB_DT) as usize) {
+        world.substep(SUB_DT);
+        for (k, &b) in idxs.iter().enumerate() {
+            wmax[k] = wmax[k].max(world.bodies[b].angular_velocity.norm());
+        }
+        if (i + 1) % window == 0 {
+            print!("t={:4.2}", (i + 1) as f64 * SUB_DT);
+            print!(" ω[");
+            for w in &mut wmax { print!(" {w:9.2}"); *w = 0.0; }
+            print!(" ] Fn[");
+            for &b in &idxs { print!(" {:7.2}", world.total_normal_force(b)); }
+            print!(" ] θ[");
+            for pair in idxs.windows(2) {
+                print!(" {:+.3}", joint_angle(&world, pair[0], pair[1]));
+            }
+            print!(" ] y_dp={:.4}", world.bodies[idxs[3]].position.y);
+            println!();
+        }
+    }
+}
+
+/// THE PARTIAL-WARM-START PRELOAD VALVE — living reproducer of the KNOWN
+/// LIMITATION documented at `XpbdWorld::substep` (found during Commit C).
+/// The LEGACY toe ray's root is a capsule WELDED to a pinned anchor while
+/// resting on the ground — a redundant support. The ground-manifold rows
+/// carry λ across substeps (the L2 lever); the weld's bilateral rows do
+/// not. Each substep the carried λ_n re-applies as an up-kick that the
+/// seedless weld rows (earlier in every sweep) absorb before the manifold
+/// row (last) can see the separating velocity that would unwind it, while
+/// every downward residual reaching the manifold row becomes +Δλ_n — a
+/// one-way integrator, fed by the chain's per-substep impulse traffic (a
+/// constant external torque alone relaxes cleanly — measured). The stored
+/// contact force ratchets toward the weld's ELASTIC scale instead of the
+/// physical share, discharging as velocity bursts at some sweep counts
+/// (the legacy canary's lift phase limit-cycles at 20.9 rad/s under 16
+/// default sweeps; the pre-pin JA ray burst at 615 rad/s at 16 and
+/// ratcheted quietly to ~460 N at 24/48).
+///
+/// MEASURED here (legacy ray, default 8 sweeps, lift phase after a press):
+/// root F_n climbs 46 → 77 → 95 → 106 → 113 → 117 N across 0.5–3 s on a
+/// 0.30 N body, world kinematically quiet throughout. Carrying the
+/// positional rows symmetrically was tried and measured WORSE on loop
+/// topologies (the foot's weld loops co-inflate through the still-
+/// uncarried angular locks: ΣF_n → 2e5 N on the demo foot); the complete
+/// fix is UNIFORM warm start across every row family (angular locks
+/// included, with unwind-capable accumulation for ranged limits) —
+/// deferred. Until then JointAxis assemblies must not compose rigid
+/// weld-to-pin supports with ground contact on one body (the migrated
+/// foot's boundary — a pinned talus behind compliant joints — does not,
+/// and `toe5_ray_ja` pins its root for the same reason).
+/// Run with --ignored --nocapture.
+#[test]
+#[ignore = "known-limitation reproducer (partial-warm-start preload valve) — run with --ignored --nocapture"]
+fn legacy_ray_welded_root_preload_valve() {
+    let (mut world, idxs) = toe5_ray();
+    for _ in 0..((3.0 / SUB_DT) as usize) { world.substep(SUB_DT); }
+    world.angular_pd_controllers[0].target_angle = 0.3;
+    for _ in 0..((4.0 / SUB_DT) as usize) { world.substep(SUB_DT); }
+    world.angular_pd_controllers[0].target_angle = -0.3;
+    let root = idxs[0];
+    let mut next = 0.5f64;
+    for i in 0..((3.0 / SUB_DT) as usize) {
+        world.substep(SUB_DT);
+        let t = (i + 1) as f64 * SUB_DT;
+        if t >= next {
+            next += 0.5;
+            println!(
+                "valve t={t:3.1}s root F_n={:7.2} N (root weight 0.30 N), |v_root|={:.2e} m/s",
+                world.total_normal_force(root),
+                world.bodies[root].linear_velocity.norm()
+            );
+        }
+    }
+    // The world stays quiet and finite — the defect is the stored preload,
+    // deliberately NOT asserted (it awaits the uniform-carry fix).
+    assert!(world.bodies[root].linear_velocity.norm() < 0.01);
+    assert!(world.bodies[root].position.y.is_finite());
+}
+
+/// DIAGNOSTIC: the JA ray in FREE SPACE (no ground): does the chained-seed
+/// limit cycle need contact, or do the chained joint rows alone sustain
+/// it? Run with --ignored --nocapture.
+#[test]
+#[ignore = "diagnostic harness (Commit C isolation) — run with --ignored --nocapture"]
+fn ja_ray_free_space_diagnostic() {
+    let (mut world, idxs) = toe5_ray_ja();
+    world.no_ground();
+    // Hold the chain against gravity by its welded root; command the MTP
+    // through the same ±0.3 cycle as the grounded canary.
+    for phase in [0.0f64, 0.3, -0.3] {
+        world.joint_axes[0].target_angle = phase;
+        let m = run_chain_measured(&mut world, &idxs, 2.0);
+        println!(
+            "free-space target {phase:+.1}: max|ω| {:9.3}, last-sec {:9.5} | joint means {:+.4} {:+.4} {:+.4}",
+            m.max_w, m.max_w_last, m.joint_means[0], m.joint_means[1], m.joint_means[2]);
+    }
+}
+
+/// DIAGNOSTIC: per-0.1 s stats of the DIP hinge velocity on the JointAxis
+/// toe ray through a commanded press — the minimal reproducer for the
+/// seed-scale limit cycle seen on the migrated demo foot (the L1
+/// solver_iterations measurement). Run with --ignored --nocapture.
+#[test]
+#[ignore = "diagnostic harness (Commit C limit-cycle isolation) — run with --ignored --nocapture"]
+fn ja_ray_press_dip_velocity_diagnostic() {
+    for iters in [8usize, 16, 32] {
+        let (mut world, idxs) = toe5_ray_ja();
+        world.solver_iterations = iters;
+        println!("── solver_iterations = {iters} ──");
+        // 3 s settle.
+        for _ in 0..((3.0 / SUB_DT) as usize) {
+            world.substep(SUB_DT);
+        }
+        world.joint_axes[0].target_angle = 0.3;
+        let (mp, dp) = (idxs[2], idxs[3]);
+        let mut n_sub = 0usize;
+        let (mut s, mut mx, mut flips) = (0.0f64, 0.0f64, 0u64);
+        let mut last_sign = 0i8;
+        let window = (0.1 / SUB_DT) as usize;
+        for i in 0..((2.0 / SUB_DT) as usize) {
+            world.substep(SUB_DT);
+            let n = world.bodies[mp].orientation * Vec3::x();
+            let w_rel = (world.bodies[dp].angular_velocity
+                - world.bodies[mp].angular_velocity).dot(&n);
+            let sign = if w_rel > 0.5 { 1 } else if w_rel < -0.5 { -1 } else { 0 };
+            if sign != 0 {
+                if last_sign != 0 && sign != last_sign { flips += 1; }
+                last_sign = sign;
+            }
+            s += w_rel.abs();
+            mx = mx.max(w_rel.abs());
+            n_sub += 1;
+            if (i + 1) % window == 0 {
+                let dip = joint_angle(&world, mp, dp);
+                let lam = world.joint_axes[2].lambda_a + world.joint_axes[2].lambda_p;
+                println!(
+                    "  t={:4.2} mean|w|={:10.4} max|w|={:10.3} flips={:4} dipθ={:+.4} λ_dip={:+.3e} F_n(dp)={:6.2}",
+                    (i + 1) as f64 * SUB_DT, s / n_sub as f64, mx, flips, dip, lam,
+                    world.total_normal_force(dp));
+                s = 0.0; mx = 0.0; flips = 0; n_sub = 0;
+            }
+        }
+    }
 }
 
 fn joint_angle(world: &XpbdWorld, a: usize, b: usize) -> f64 {
@@ -991,9 +1375,15 @@ fn run_chain_measured(world: &mut XpbdWorld, idxs: &[usize], seconds: f64) -> Ch
 /// this ray is built from; its removal is migration onto JointAxis under the
 /// coupled in-loop solve + warm-start pair (docs/findings.md 2026-10-21 — the
 /// pass-based combined solve preserved free space but throttled under
-/// contact, so the fix had to move into the SI loop). This legacy ray keeps
-/// the bias, and this band stays calibrated to it, until Commit C migrates
-/// the foot.
+/// contact, so the fix had to move into the SI loop). Commit C (2026-10-21)
+/// migrated the foot and added the parallel `ja_toe_ray_press_canary` below,
+/// whose bands ARE the honest wedge statics (see the findings Stage-2
+/// re-land entry); this legacy ray stays on the legacy path, keeps the
+/// bias, and keeps this band calibrated to it — it is the flag-off
+/// pipeline's canary now. Its welded-grounded root also sits on the
+/// partial-warm-start preload valve (silently stored contact preload, see
+/// `legacy_ray_welded_root_preload_valve`), which its bands predate and
+/// tolerate at the default 8 sweeps.
 ///
 /// BITE-VERIFIED against the pre-fix explicit-kp engine (checkout of
 /// e9dda0b~1 angular_pd_controller.rs + xpbd.rs): P1 DIP mean 0.0141 rad and
@@ -1080,6 +1470,278 @@ fn gram_scale_pd_in_ground_contact_does_not_pump() {
         (-0.35..=-0.08).contains(&dip_lift),
         "lift response lost: DIP mean {dip_lift} rad outside [−0.35, −0.08] \
          (measured −0.156; the pre-fix engine gives −0.035, flipped ordering +0.0003)"
+    );
+}
+
+/// Advance `seconds` on the JA ray, ramping the MTP (joint_axes[0]) target
+/// toward `goal` at 0.3 rad/s (the demo's muscles-don't-step protocol — a
+/// STEP command rams the honest full-transmission chain onto the
+/// flat-press/claw-jam buckling knife edge; measured: step presses land in
+/// either basin depending non-monotonically on sweeps × sub_dt, while
+/// ramped presses are clean and reproducible across the whole
+/// {16,32,64,128} × {1/7200, 1/3600} grid). Measures like
+/// `run_chain_measured`.
+fn run_ja_chain_ramped(
+    world: &mut XpbdWorld,
+    idxs: &[usize],
+    goal: f64,
+    seconds: f64,
+) -> ChainMeasure {
+    let frames = (seconds / DT).round() as usize;
+    let last_sec_from = frames.saturating_sub((1.0 / DT).round() as usize) * SUBSTEPS_PER_FRAME;
+    let mut max_w: f64 = 0.0;
+    let mut max_w_last: f64 = 0.0;
+    let n_joints = idxs.len() - 1;
+    let mut sums = vec![0.0f64; n_joints];
+    let mut n_samples = 0usize;
+    let mut substep_i = 0usize;
+    for _ in 0..frames {
+        let t = world.joint_axes[0].target_angle;
+        let step = 0.3 * DT;
+        world.joint_axes[0].target_angle = t + (goal - t).clamp(-step, step);
+        for _ in 0..SUBSTEPS_PER_FRAME {
+            world.substep(SUB_DT);
+            for &i in &idxs[1..] {
+                let w = world.bodies[i].angular_velocity.norm();
+                if !w.is_finite() || w > max_w { max_w = w; }
+                if substep_i >= last_sec_from && (!w.is_finite() || w > max_w_last) {
+                    max_w_last = w;
+                }
+            }
+            if substep_i >= last_sec_from {
+                for (j, pair) in idxs.windows(2).enumerate() {
+                    sums[j] += joint_angle(world, pair[0], pair[1]);
+                }
+                n_samples += 1;
+            }
+            substep_i += 1;
+        }
+    }
+    ChainMeasure {
+        max_w,
+        max_w_last,
+        joint_means: sums.iter().map(|s| s / n_samples as f64).collect(),
+    }
+}
+
+/// Total mechanical + joint-elastic energy of the JA ray's free links.
+fn ja_chain_energy(world: &XpbdWorld, idxs: &[usize]) -> f64 {
+    let mut e = 0.0;
+    for &i in &idxs[1..] {
+        let b = &world.bodies[i];
+        e += 0.5 * b.mass * b.linear_velocity.dot(&b.linear_velocity);
+        let r = b.orientation.to_rotation_matrix();
+        let i_world = r.matrix() * b.inertia_tensor * r.matrix().transpose();
+        e += 0.5 * b.angular_velocity.dot(&(i_world * b.angular_velocity));
+        e += b.mass * 9.81 * b.position.y;
+    }
+    for ja in &world.joint_axes {
+        e += ja.potential_energy(&world.bodies);
+    }
+    e
+}
+
+/// THE MIGRATED PUMP CANARY (Commit C, design E4): the JointAxis twin of
+/// `gram_scale_pd_in_ground_contact_does_not_pump`, on `toe5_ray_ja` —
+/// same bones, same gains, the coupled in-loop solve + warm-start pair,
+/// the migrated foot's 32-sweep setting, ramped commands (see
+/// `run_ja_chain_ramped` for why steps are not used). The legacy canary
+/// above stays untouched on the legacy path.
+///
+/// THE RIGID-SPLIT-WITH-CONTACT PREDICTION (each band's derivation):
+///
+/// P1 ramped press (MTP target +0.3): the flat chain is kinematically
+/// WEDGED — the ground blocks flexion of every joint (the links lie on the
+/// plane) and the PIP/DIP ROM floors at 0 block extension — so every joint
+/// holds its rest angle, θ ≈ 0 (bands ±0.05 rad, ~25× the measured
+/// residuals), and the MTP must transmit its FULL static demand
+/// kp·(0.3 − 0) = 2.4 N·m through the contacts: `applied_total_torque` =
+/// state demand within E1(i)'s 10% band (measured 2.402 vs 2.399, 0.1%).
+/// The x-moment balance of the chain about the MTP hinge puts a hard floor
+/// under the total contact force: ΣF_i·Δz_i = τ + W·Δz_com ≈ 2.4 N·m with
+/// every lever Δz_i ≤ the 45 mm chain length ⇒ ΣF_n ≥ 2.4/0.045 ≈ 53 N
+/// (assert ≥ 50; measured 361–386 N across engine-knob states — the
+/// distribution is proximal-heavy, and its exact split is statically
+/// indeterminate and NOT asserted; see the xpbd.rs KNOWN LIMITATION). The legacy pre-pass transmits ~1/D of the
+/// demand, so under it ΣF_n collapses to the ~0.1 N chain weight — this
+/// floor is the force-transmission bite. Contrast the LEGACY ray's press:
+/// its DIP settles at +0.21 rad — a burst-transient artifact of the
+/// throttled sequential passes (its own doc comment); the honest coupled
+/// chain does not move, it pushes.
+///
+/// P2 ramped lift (MTP target −0.3): the chain leaves the ground and the
+/// free-space equilibrium is exact statics: θ_MTP = kp/(kp + K_sp)·(−0.3)
+/// = 8/12·(−0.3) = −0.200 (band ±0.02 = 10%; measured −0.2000), PIP/DIP
+/// at their 0 rest (bands ±0.02; measured −0.0007, +0.0000).
+///
+/// Quiet bands: sustained (last-second) max |ω| < 0.5 rad/s in the press
+/// and < 0.05 in the lift — the LEGACY canary's own untouchable bounds,
+/// reused unchanged (measured here: press 0.026, lift 0.0000; the
+/// claw-chatter failure regime sustains 200+ rad/s). The press transient
+/// is bounded < 10 rad/s (measured 0.059 at the ramp protocol — two
+/// orders of headroom — vs 100s–1000s in the chatter regime); the LIFT
+/// transient is NOT banded: contact release under carried seeds fires a
+/// self-healing velocity burst whose magnitude varies non-monotonically
+/// with sweeps × sub_dt (measured 1.3–3.3e5 rad/s across the grid at a
+/// clean end state; one substep's un-cancelled seed is w·dt·τ ≈ 8e4 rad/s
+/// at toe scale) — documented in docs/findings.md 2026-10-21, awaiting
+/// the design's L3 escalation; finiteness and the sustained/means bands
+/// still catch every sticky failure.
+///
+/// ENERGY (E5's running-min form, frame-cadence samples over one settled
+/// second after 4 s of press): bound 1e-5 J — the house 1% of the scene's
+/// W·l ≈ 2e-3 J scale, same derivation as E5_BOUND in
+/// tests/coupled_joint.rs (measured rise: 3.4e-7 J, 30× inside).
+///
+/// DUAL-RATE (E1(iii) at assembly level): the pressed transmitted torque
+/// at 1/3600 with 64 sweeps — MATCHED CONVERGENCE EFFORT, 230k sweeps per
+/// simulated second at both rates, because the warm seeds' per-substep
+/// velocity injection scales ∝ dt (full derivation at
+/// foot.rs::grounded_toe_press_is_substep_rate_independent) — agrees with
+/// the 1/7200×32 value within 2% (measured 2.4084 vs 2.4060, 0.1%).
+///
+/// BITE-VERIFIED (2026-10-21), three independent legs:
+/// (1) `coupled_joint_solve = false` (the legacy pre-pass on the same
+///     rig): fails the P1 transmission band at fraction 0.0005 (= 1/D at
+///     this w), with ΣF_n 0.2 N far under the 50 N floor;
+/// (2) `solver_iterations = 8` (the under-converged chain regime): fails
+///     at P0 already — the RESTING chain limit-cycles under the seeds;
+/// (3) an anti-damper injector (passive_damping → −1.0 on the MTP after
+///     the settled hold) pumps 8.5e4 J against the 1e-5 J bound and fails
+///     the run.
+#[test]
+fn ja_toe_ray_press_canary() {
+    let (mut world, idxs) = toe5_ray_ja();
+
+    // P0 — rest.
+    let p0 = run_ja_chain_ramped(&mut world, &idxs, 0.0, 3.0);
+    assert!(
+        p0.max_w_last < 0.01,
+        "resting JA toe chain is not quiet: sustained |ω| {} rad/s (measured 0.0000)",
+        p0.max_w_last
+    );
+
+    // P1 — ramped press to +0.3 (1 s ramp + 3 s hold), with the energy
+    // monitor over the settled hold (last 2 s).
+    let p1a = run_ja_chain_ramped(&mut world, &idxs, 0.3, 2.0);
+    let mut e_min = ja_chain_energy(&world, &idxs);
+    let mut max_rise: f64 = 0.0;
+    let p1b = run_ja_chain_ramped(&mut world, &idxs, 0.3, 2.0);
+    // Frame-cadence energy samples over one further settled second.
+    for _ in 0..120 {
+        for _ in 0..SUBSTEPS_PER_FRAME {
+            world.substep(SUB_DT);
+        }
+        let e = ja_chain_energy(&world, &idxs);
+        if e - e_min > max_rise {
+            max_rise = e - e_min;
+        }
+        if e < e_min {
+            e_min = e;
+        }
+    }
+    let max_w = p1a.max_w.max(p1b.max_w);
+    let theta_mtp = joint_angle(&world, idxs[0], idxs[1]);
+    let ja = &world.joint_axes[0];
+    let s_lim = ja.limit.as_ref().map_or(0.0, |l| l.scalar_torque(theta_mtp));
+    let demand = ja.kp * (ja.target_angle - theta_mtp)
+        - ja.passive_stiffness * (theta_mtp - ja.passive_rest_angle)
+        + s_lim;
+    let tau_tx = ja.applied_total_torque;
+    let fn_total: f64 = idxs.iter().map(|&i| world.total_normal_force(i)).sum();
+    println!(
+        "JA canary P1: τ_tx {tau_tx:+.4} vs demand {demand:+.4} N·m (fraction {:+.4}), \
+         ΣF_n {fn_total:.1} N, max|ω| {max_w:.3}, last-sec {:.4}, joint means \
+         {:+.4} {:+.4} {:+.4}, energy rise {max_rise:.3e} J",
+        tau_tx / demand, p1b.max_w_last,
+        p1b.joint_means[0], p1b.joint_means[1], p1b.joint_means[2]
+    );
+    assert!(
+        (tau_tx - demand).abs() <= 0.10 * demand.abs(),
+        "P1 press transmission lost: τ_tx {tau_tx} vs demand {demand} N·m (> 10% off; \
+         the legacy pre-pass transmits 1/D ≈ 0.05% here)"
+    );
+    assert!(
+        fn_total >= 50.0,
+        "P1 press ground reaction {fn_total} N below the moment-balance floor \
+         τ/l_max ≈ 53 N — the chain is not pushing on the world"
+    );
+    for (j, mean) in p1b.joint_means.iter().enumerate() {
+        assert!(
+            mean.abs() <= 0.05,
+            "P1 wedged joint {j} mean {mean} rad outside ±0.05 (prediction: the flat \
+             chain is kinematically wedged at θ ≈ 0; the claw-jam regime gives +0.5)"
+        );
+    }
+    assert!(
+        max_w < 10.0,
+        "P1 ramped-press transient |ω| {max_w} rad/s > 10 (measured 0.059; the \
+         chatter regime gives 100s–1000s)"
+    );
+    assert!(
+        p1b.max_w_last < 0.5,
+        "P1 press sustains |ω| {} rad/s > 0.5 (the legacy canary's own band; \
+         measured 0.026)",
+        p1b.max_w_last
+    );
+    assert!(
+        max_rise < 1e-5,
+        "P1 settled press pumped {max_rise} J above its running minimum (> 1e-5 J)"
+    );
+
+    // P2 — ramped lift to −0.3 (2 s ramp + 2 s hold).
+    let p2 = run_ja_chain_ramped(&mut world, &idxs, -0.3, 4.0);
+    for &i in &idxs {
+        let b = &world.bodies[i];
+        assert!(
+            finite(b.position) && finite(b.linear_velocity) && finite(b.angular_velocity),
+            "P2 lift went non-finite"
+        );
+    }
+    println!(
+        "JA canary P2: max|ω| {:.3} (transient, unbanded — see doc), last-sec {:.4}, \
+         joint means {:+.4} {:+.4} {:+.4}",
+        p2.max_w, p2.max_w_last, p2.joint_means[0], p2.joint_means[1], p2.joint_means[2]
+    );
+    assert!(
+        p2.max_w_last < 0.05,
+        "P2 lift sustains |ω| {} rad/s > 0.05 (the legacy canary's own band; the \
+         claw-chatter regime sustains 200+)",
+        p2.max_w_last
+    );
+    assert!(
+        (p2.joint_means[0] + 0.200).abs() <= 0.02,
+        "P2 lifted MTP mean {} rad vs the exact free equilibrium kp/(kp+K)·(−0.3) = \
+         −0.200 (±0.02)",
+        p2.joint_means[0]
+    );
+    for (j, mean) in p2.joint_means.iter().enumerate().skip(1) {
+        assert!(
+            mean.abs() <= 0.02,
+            "P2 lifted joint {j} mean {mean} rad outside ±0.02 of its 0 rest"
+        );
+    }
+
+    // DUAL-RATE press at matched convergence effort (1/3600 × 64 sweeps).
+    let (mut wc, idxs_c) = toe5_ray_ja();
+    wc.solver_iterations = 64;
+    let sub_dt_c = 1.0 / 3600.0;
+    let mut target = 0.0f64;
+    for _ in 0..((4.0 / DT) as usize) {
+        let step = 0.3 * DT;
+        target = (target + (0.3 - target).clamp(-step, step)).min(0.3);
+        wc.joint_axes[0].target_angle = target;
+        for _ in 0..((DT / sub_dt_c).round() as usize) {
+            wc.substep(sub_dt_c);
+        }
+    }
+    let tau_c = wc.joint_axes[0].applied_total_torque;
+    println!("JA canary dual-rate: τ_tx {tau_tx:+.4} @1/7200×32 vs {tau_c:+.4} @1/3600×64");
+    let _ = &idxs_c;
+    assert!(
+        (tau_tx - tau_c).abs() <= 0.02 * tau_tx.abs(),
+        "pressed transmitted torque differs across rates at matched convergence \
+         effort: {tau_tx} vs {tau_c} N·m (> 2%)"
     );
 }
 

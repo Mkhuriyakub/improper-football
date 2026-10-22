@@ -18,6 +18,26 @@ pub const GRAVITY: Vec3 = Vec3::new(0.0, -9.81, 0.0);
 /// Default number of sequential-impulse iterations per substep. Each iteration
 /// is one Gauss-Seidel pass over all positional and angular constraints,
 /// refining the impulses that satisfy the velocity-level constraints.
+///
+/// STAYS 8 (2026-10-21, Commit C): the coupled-joint design's L1 lever
+/// ("solver_iterations 8 → 16", spec §2.6) was triggered by the migrated
+/// foot — CHAINED JointAxes under ground contact need more sweeps to
+/// re-absorb the L2 warm seeds' per-substep velocity injection (w·λ ≈ 10³
+/// rad/s at toe scale) against near-degenerate joint↔contact alignments:
+/// at 8 the residual survives to integrate_positions and the chain
+/// detonates (measured: DIP ±2.4 rad past ROM, |ω| spikes 4.8e4 rad/s on
+/// the toe-ray reproducer); at 16 it is bounded but still bursts; 32 is
+/// clean at sub_dt 1/7200, and the demand scales ∝ dt (the seed does).
+/// But raising the GLOBAL default was measured to break the legacy
+/// pipeline it must leave bit-identical (§5's invariance promise): the
+/// legacy toe-ray pump canary's lift phase limit-cycles at 20.9 rad/s
+/// under 16 default iterations (vs 0.008 at 8) — that rig's
+/// welded-grounded root sits on the partial-warm-start preload valve (see
+/// the KNOWN LIMITATION note in `substep`), whose stored contact preload
+/// discharges at some iteration counts and sits quiet at others. So L1
+/// lands PER-ASSEMBLY: JointAxis-chain worlds raise their own
+/// `solver_iterations` (foot::build_foot bumps its world to ≥ 32); legacy
+/// worlds keep 8 and stay bit-identical.
 pub const DEFAULT_SI_ITERATIONS: usize = 8;
 
 /// Read-only summary of one endpoint of a capsule that's currently
@@ -387,6 +407,33 @@ impl XpbdWorld {
                 ja.apply_warm_start(&mut self.bodies);
             }
         }
+        // KNOWN LIMITATION (2026-10-21, measured during Commit C — the
+        // warm-start one-way valve): the SI warm carry is PARTIAL — ground
+        // manifold and JointAxis rows carry impulses across substeps, the
+        // bilateral rows (PositionalConstraint, AngularLimitConstraint) do
+        // not. On a REDUNDANTLY supported body (e.g. a capsule welded to a
+        // pinned anchor at rest height while also resting on the ground)
+        // the contact accumulator becomes a one-way integrator: the weld
+        // rows (earlier in each sweep) absorb the contact seed's up-kick
+        // before the manifold row (last) can see the separating velocity
+        // that would unwind λ_n, while every downward residual reaching it
+        // becomes +Δλ_n. The stored contact preload ratchets to the weld's
+        // ELASTIC scale instead of the physical load (measured on the
+        // legacy toe-ray rig: F_n ≈ 117 N on a 0.3 N welded capsule), held
+        // internally by the weld pulling down; at some iteration counts the
+        // preload discharges as sustained velocity bursts. Carrying the
+        // positional rows alone was tried and measured WORSE on loop
+        // topologies (the 26-bone foot's weld loops): the carried pair
+        // co-inflates through the still-uncarried angular-lock rows without
+        // bound (ΣF_n → 2e5 N). The complete fix is UNIFORM warm start
+        // across every row family (angular locks included, with
+        // unwind-capable accumulation for ranged limits) — deferred, with
+        // the reproducer preserved in tests/engine_regression.rs
+        // (legacy_ray_welded_root_preload_valve). Until then:
+        // do not compose rigid weld-to-pin supports with ground contact on
+        // the same body in JointAxis assemblies — the foot's real boundary
+        // (a pinned talus behind compliant joints) does not, and its mild
+        // residual preload wobble is documented at its gates.
         for _ in 0..self.solver_iterations {
             self.solve_constraints(sub_dt);
         }

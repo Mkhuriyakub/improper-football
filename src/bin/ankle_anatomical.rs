@@ -7,7 +7,7 @@
 
 use physics::xpbd::XpbdWorld;
 use physics::rigid_body::RigidBody;
-use physics::math::{Vec3, swing_twist_angle};
+use physics::math::Vec3;
 use nalgebra::UnitQuaternion;
 
 use improper_football::anatomy::foot::{self, Bone, FootHandles};
@@ -36,7 +36,7 @@ struct Assembly {
     #[allow(dead_code)]
     shin_idx: usize,
     stick_idx: usize,
-    talocrural_pd_idx: usize,
+    talocrural_ja_idx: usize,
 }
 
 fn build_world() -> Assembly {
@@ -71,7 +71,7 @@ fn build_world() -> Assembly {
     }
 
     // Talocrural joint shin↔talus (baseline-aware; DF 20°/PF 40°).
-    let talocrural_pd_idx = foot::attach_talocrural(
+    let talocrural_ja_idx = foot::attach_talocrural(
         &mut world, shin_idx, &foot, -0.35, 0.70, 800.0, 40.0);
 
     // Load stick welded to the shin top (both identity-oriented, so the
@@ -85,7 +85,7 @@ fn build_world() -> Assembly {
     let anchor_stick = foot::anchor_at(&world, stick_idx, weld_pt);
     foot::weld(&mut world, shin_idx, stick_idx, anchor_shin, anchor_stick);
 
-    Assembly { world, foot, shin_idx, stick_idx, talocrural_pd_idx }
+    Assembly { world, foot, shin_idx, stick_idx, talocrural_ja_idx }
 }
 
 // ─── Test framework ───────────────────────────────────────────────────
@@ -201,26 +201,40 @@ fn center_of_pressure(world: &XpbdWorld) -> Option<Vec3> {
     if den > 1e-6 { Some(num / den) } else { None }
 }
 
-/// Joint angle as the PD controller itself measures it: swing-twist of the
-/// child-in-parent orientation (relative to the PD's baseline) about the
-/// PD's axis. Mirrors `AngularPDController::angle`.
-fn pd_joint_angle(world: &XpbdWorld, pd_idx: usize) -> f64 {
-    let pd = &world.angular_pd_controllers[pd_idx];
-    let q_b_in_a = world.bodies[pd.body_a].orientation.inverse()
-                 * world.bodies[pd.body_b].orientation;
-    let q_from_rest = q_b_in_a * pd.baseline.inverse();
-    swing_twist_angle(q_from_rest, pd.axis_local_a)
+/// Joint angle as the combined solve itself measures it: swing-twist of
+/// the child-in-parent orientation (relative to the joint's baseline)
+/// about the joint's axis — `JointAxis::angle`.
+fn ja_joint_angle(world: &XpbdWorld, ja_idx: usize) -> f64 {
+    world.joint_axes[ja_idx].angle(&world.bodies)
 }
 
 /// Center-of-pressure migration under a plantarflexion command.
 ///
 /// Settles the full assembly to flat-foot stance, then commands the
-/// talocrural PD toward plantarflexion (positive target — verified
+/// talocrural joint toward plantarflexion (positive target — verified
 /// empirically: positive raises the heel and shifts load forward) and
 /// checks that the CoP migrates anteriorly (world +z) by at least 5 mm
 /// while ground contact persists. Measured inside the short stable-stance
 /// window (settle 0.25 s, command 0.25 s) — sustained standing is a
 /// deferred milestone (see test_footprint_bears_full_weight's note).
+///
+/// RE-DERIVED 2026-10-21 (Commit C, the migrated foot on the coupled
+/// in-loop solve): measured max anterior shift +112.1 mm. The mechanism is
+/// the designed one (spec E4): the transmitted ankle torque shifts load
+/// anteriorly at ~τ/W per unit lever until the CoP reaches the forefoot
+/// edge, then the heel rises and the remaining migration is heel-to-toe
+/// geometry — ~110 mm is most of the ~150 mm heel-to-toe footprint span,
+/// i.e. the CoP ends on the forefoot/toes with the heel unloaded. Context
+/// for the historical numbers: the artifact-era legacy figure (+124 mm in
+/// docs/findings.md 2026-07, re-measured +114.8 mm at the current engine)
+/// was produced by 41–207 rad/s per-pass burst transients ratcheting the
+/// heel up — right magnitude, wrong physics; the BLOCKED Stage-2 branch
+/// (honest solve, broken transmission) measured +3.3 mm; the honest
+/// coupled solve recovers the full heel-to-toe migration because a real
+/// ~24 N·m of commanded ankle torque genuinely does lift the heel. The
+/// ≥ 5 mm band is kept unchanged (never loosened — it still fails the
+/// blocked-transmission regime 34× over); the measured value is printed
+/// each run.
 fn test_cop_migration() -> TestResult {
     let mut a = build_world();
     simulate(&mut a.world, 0.25, |_, _| {});
@@ -232,8 +246,8 @@ fn test_cop_migration() -> TestResult {
     };
 
     // Gentle plantarflexion command (positive = PF, verified by probe:
-    // +0.2 rad raises the heel ~2 cm and shifts the CoP anteriorly).
-    a.world.angular_pd_controllers[a.talocrural_pd_idx].target_angle = 0.2;
+    // +0.2 rad raises the heel and shifts the CoP anteriorly).
+    a.world.joint_axes[a.talocrural_ja_idx].target_angle = 0.2;
 
     let mut max_anterior_shift = f64::MIN;
     simulate(&mut a.world, 0.25, |w, _| {
@@ -243,6 +257,7 @@ fn test_cop_migration() -> TestResult {
     });
 
     if max_anterior_shift >= 0.005 {
+        println!("  [CoP migration] measured max anterior shift {:.1} mm", max_anterior_shift * 1000.0);
         TestResult::pass("CoP migration")
     } else {
         TestResult::fail("CoP migration", format!(
@@ -312,8 +327,28 @@ fn test_arch_compression() -> TestResult {
 ///    body stabilizes the leg; whole-body balance is out of scope —
 ///    mirror of the ANKLE_PIN_FOOT diagnostic), same ramped command.
 ///    Asserts the hallux proximal phalanx visibly dorsiflexes: its
-///    capsule bottom lifts ≥ 1 mm off the sole plane, and the settled
-///    angle stays positive and within ROM + 10%.
+///    center lifts ≥ 2 mm, and the settled angle stays positive and
+///    within ROM + 10%.
+///
+/// RE-SCOPE NOTE RE-DERIVED 2026-10-21 (Commit C): on the migrated foot
+/// Part A settles at the ANALYTIC free equilibrium kp/(kp+K)·0.8 =
+/// 0.70588 (measured 0.7059 — the chained coupled solve at 32 SI sweeps
+/// lands the textbook statics), and Part B's grounded lift measures
+/// 5.33 mm at pose angle 0.505 rad — EXCEEDING the legacy-era 2.30 mm at
+/// 0.331 rad, as physics predicts: the legacy grounded response rode on
+/// burst artifacts of a throttled solve, the honest solve transmits the
+/// full demand (the BLOCKED transmission-gap branch managed 0.6 mm). The
+/// lift threshold rises 1 mm → 2 mm: geometry puts the pp center ~8 mm
+/// from the MTP anchor, so any settled dorsiflexion ≥ 0.25 rad lifts it
+/// ≥ 8·sin(0.25) ≈ 2 mm — while the measured value keeps 2.7×
+/// margin. (The mm-scale lift carries the ±40% preload-split scatter
+/// documented at foot.rs's dual-rate test, so the band is NOT tightened
+/// to the measured value.) BITE-VERIFIED (2026-10-21): with
+/// `coupled_joint_solve = false` (the transmission-gap regime on this
+/// same foot) Part B measures 1.1 mm at 0.164 rad and FAILS the 2 mm
+/// band — the OLD 1 mm threshold would have PASSED that regime, so the
+/// tightening is load-bearing; the CoP test fails the same bite at
+/// 3.6 mm (< 5 mm). Thresholds only ever tightened: 1 → 2 mm.
 fn test_mtp_pushoff() -> TestResult {
     let target = 0.8;
     let ramp_time = 1.0; // ramp over 1 s, hold 1.5 s
@@ -323,12 +358,12 @@ fn test_mtp_pushoff() -> TestResult {
     let mut world = XpbdWorld::new();
     world.no_ground();
     let foot = foot::build_foot(&mut world, Vec3::new(0.0, 0.039, 0.0));
-    let pd_idx = foot.pd_by_child[Bone::HalluxPp as usize];
+    let ja_idx = foot.ja_by_child[Bone::HalluxPp as usize];
     simulate(&mut world, 2.5, |w, t| {
-        w.angular_pd_controllers[pd_idx].target_angle =
+        w.joint_axes[ja_idx].target_angle =
             target * (t / ramp_time).min(1.0);
     });
-    let achieved = pd_joint_angle(&world, pd_idx);
+    let achieved = ja_joint_angle(&world, ja_idx);
     let err = achieved - target;
     if err.abs() > 0.15 {
         return TestResult::fail("MTP push-off", format!(
@@ -347,22 +382,23 @@ fn test_mtp_pushoff() -> TestResult {
     foot::attach_talocrural(&mut world, shin_idx, &foot, -0.35, 0.70, 800.0, 40.0);
     world.bodies[shin_idx].pin();
 
-    let pd_idx = foot.pd_by_child[Bone::HalluxPp as usize];
+    let ja_idx = foot.ja_by_child[Bone::HalluxPp as usize];
     let pp_idx = foot.body(Bone::HalluxPp);
     simulate(&mut world, 0.5, |_, _| {}); // settle to stance
     let pp_y0 = world.bodies[pp_idx].position.y;
     simulate(&mut world, 2.5, |w, t| {
-        w.angular_pd_controllers[pd_idx].target_angle =
+        w.joint_axes[ja_idx].target_angle =
             target * (t / ramp_time).min(1.0);
     });
-    let pose_angle = pd_joint_angle(&world, pd_idx);
+    let pose_angle = ja_joint_angle(&world, ja_idx);
     let pp_lift = world.bodies[pp_idx].position.y - pp_y0;
 
-    if pp_lift >= 0.001 && pose_angle > 0.0 && pose_angle <= rom_max * 1.1 {
+    if pp_lift >= 0.002 && pose_angle > 0.0 && pose_angle <= rom_max * 1.1 {
+        println!("  [MTP push-off] airborne settle {achieved:.4} rad; grounded pp lift {:.2} mm, pose angle {pose_angle:.4} rad", pp_lift * 1000.0);
         TestResult::pass("MTP push-off")
     } else {
         TestResult::fail("MTP push-off", format!(
-            "pose (grounded, stabilized shin): pp lift {:.1} mm (need >= 1 mm), \
+            "pose (grounded, stabilized shin): pp lift {:.1} mm (need >= 2 mm), \
              angle {pose_angle:.3} rad (need 0 < angle <= {:.2})",
             pp_lift * 1000.0, rom_max * 1.1))
     }
