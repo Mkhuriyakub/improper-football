@@ -428,14 +428,20 @@ measured +3.3 mm, and the honest value is the full heel-to-toe migration
 because the transmitted ~24 N·m genuinely lifts the heel; the ≥ 5 mm band
 is untouched. MTP Part B grounded lift: **5.33 mm** at pose 0.505 rad —
 exceeding the legacy 2.30 mm at 0.331 rad as predicted (blocked branch:
-0.6 mm); threshold tightened 1 → 2 mm (geometric floor of a ≥ 0.25 rad
-dorsiflexion about the ~8 mm MTP lever). Demo scenario responses, legacy →
+0.6 mm); threshold tightened 1 → 2 mm on its EMPIRICAL bite (the
+flag-off transmission-gap regime measures 1.1 mm and fails it; the
+original "~8 mm MTP lever" geometric claim was not derived from the
+bone table — the pp center sits ~20 mm from the midpoint anchor, and
+the back-solved effective levers are 11.0/6.7 mm — see the re-scope
+note in ankle_anatomical.rs). Demo scenario responses, legacy →
 migrated (targets re-derived at 70%): push-off lesser-MTP rise +0.0775 →
 **+0.2297** and CoP +104.9 → **+144.0 mm**; curl MTP flex −0.0149 →
 **−0.1471** (the "ground-pressed MTPs barely flex" conclusion was the
 transmission gap) and PIP/DIP −0.1548 → **−0.1976**; inversion subtalar
-+0.0792 → +0.0754 with CoP x +21.3 → **+12.6 mm** (the one response that
-SHRANK — the honest roll moves the CoP less than the artifact did);
++0.0792 → +0.0754 with CoP x +21.3 → **+12.6 mm** (one of TWO lowered
+bars — the honest roll moves the CoP less than the artifact did; the
+other is the neutral-stance contact count, measured 33 → 28 with its
+demo target 23 → 19, disclosed at the demo's NEUTRAL_MIN_CONTACTS);
 eversion subtalar −0.0016 → **−0.1052** (58×: "eversion-locked stance"
 was mostly the transmission gap) with the heel-ward CoP shift kept
 (−47.5 → −30.0 mm). Demo smoothness receipt (toe4 DIP, per-substep sign

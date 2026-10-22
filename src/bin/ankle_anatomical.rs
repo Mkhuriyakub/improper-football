@@ -338,10 +338,18 @@ fn test_arch_compression() -> TestResult {
 /// 0.331 rad, as physics predicts: the legacy grounded response rode on
 /// burst artifacts of a throttled solve, the honest solve transmits the
 /// full demand (the BLOCKED transmission-gap branch managed 0.6 mm). The
-/// lift threshold rises 1 mm → 2 mm: geometry puts the pp center ~8 mm
-/// from the MTP anchor, so any settled dorsiflexion ≥ 0.25 rad lifts it
-/// ≥ 8·sin(0.25) ≈ 2 mm — while the measured value keeps 2.7×
-/// margin. (The mm-scale lift carries the ±40% preload-split scatter
+/// lift threshold rises 1 mm → 2 mm. Its basis is EMPIRICAL, not
+/// geometric (honesty note, 2026-10-22): the bone table puts the pp
+/// CENTER ~20.0 mm from the MTP anchor (midpoint of the mt1/pp centers
+/// at REST_POS; the pp's proximal capsule extent is 15.5 mm), but the
+/// rigid-lever prediction l·sin(θ) over-predicts — back-solving
+/// l = lift/sin(θ) from the measurements gives EFFECTIVE levers of only
+/// 11.0 mm (migrated: 5.33 mm at 0.505 rad) and 6.7 mm (flag-off:
+/// 1.1 mm at 0.164 rad), because the pp rides a compliant positional
+/// anchor and the indeterminate contact/weld preload split. No clean
+/// geometric floor exists; the 2 mm threshold stands on its flag-off
+/// bite below, with the measured migrated value keeping 2.7× margin.
+/// (The mm-scale lift carries the ±40% preload-split scatter
 /// documented at foot.rs's dual-rate test, so the band is NOT tightened
 /// to the measured value.) BITE-VERIFIED (2026-10-21): with
 /// `coupled_joint_solve = false` (the transmission-gap regime on this
