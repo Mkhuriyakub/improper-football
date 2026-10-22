@@ -193,3 +193,13 @@ Red-first receipt: with the flag off, record the current numbers (expected ~dema
 - crates/physics/tests/engine_regression.rs — E1/E2/E5/E6 live here; build_toe_ray/toe5_ray are the rig templates; pump-canary doc corrections
 - crates/physics/src/contact_constraint.rs — unchanged in baseline; the L2 manifold warm-start lever and the lambda-identity carry live here if needed
 - src/anatomy/foot.rs (+ branch stage2-coaxial-foot-blocked, commit 7dae7e0) and src/bin/ankle_anatomical.rs — the Stage-2 re-land and CoP gate re-derivation
+
+## Amendment (2026-10-21): the joint warm seed applies at contact-reset time, not in prepare
+
+Section 2.3 placed `prepare` before `generate_ground_manifold` and had it apply the L2 joint-lambda warm seed there, "so speculative-contact admission sees any warm-start velocity change". Two facts, found while landing the pre-Commit-C mixed-primitive gates, change that placement:
+
+1. **The admission rationale was already moot in practice.** The manifold-side seeds were moved to apply at the contact-reset step (after the legacy implicit passes) when the L2 pair landed, so admission never saw THEIR velocity either; the cross-substep fixed point never depended on admission seeing seeds — only on the seeds being applied before the SI sweeps read velocities, which the reset slot satisfies.
+
+2. **Applied in prepare, the joint seed re-opens the exact rectification channel this batch diagnosed for the manifold seed.** The seed (Δω = w·dt·τ₀, ~1.3e3 rad/s at toe scale under a 2.4 N·m demand) is read by any legacy implicit primitive sharing a body with the joint — precisely the mid-migration state Commit C creates. Measured on the mixed canaries (crates/physics/tests/coupled_joint.rs): a legacy damper on the same pair into a pinned parent silently steals the ground reaction (0.21 N arrives of a ~101 N lever demand, while the λ diagnostic reads full transmission and the world stays quiet); a legacy articulated stack on an adjacent free body turns the seed into a per-substep kick — sustained 151/1441 rad/s limit cycle, 5.2e-2 J energy pump, sign-flipped transmission.
+
+Resolution: `prepare` still runs before manifold generation (read-only on the bodies — it consumes ext_*, runs the tear latch, caches the solve state, and clamps + parks the seed); the parked impulse is applied by the new `JointAxis::apply_warm_start` at the contact-reset slot, immediately alongside the manifold seeds — after every legacy implicit pass, before the SI sweeps. With the amendment both canaries are quiet and transmit exactly (ΔF_n = Δτ/l to 4 digits), and the full gate set stays green: E1 fraction 1.0000 at both rates and 8/16/32 iterations; E6's warm table 0.9999/0.9999/1.0000/1.0000 @1/7200, 1.0002/1.0000/1.0000/1.0000 @1/3600.

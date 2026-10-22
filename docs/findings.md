@@ -265,20 +265,20 @@ a → 1): 0.069/0.132/0.241/0.412 at 4/8/16/32 iterations @1/7200, halving
 at 1/3600 — the per-sweep residual tracks (D−1)/D, so the escalation
 ladder's L1 (16 iterations) measured 0.050 on E1's 10% band and did NOT
 land. L2 (the warm-start pair) landed on that trigger: joint lambdas carry
-across substeps (clamped to the current ±cap, re-applied in prepare,
-BEFORE manifold generation so speculative admission sees the velocity) AND
+across substeps (clamped to the current ±cap in `prepare`, applied at the
+contact-reset slot — see the seed-placement amendment below) AND
 ground-manifold lambdas carry across the per-substep regeneration, matched
 by (body, endpoint slot). With both sides carried the cross-substep fixed
 point Λ* = dt·τ₀ is exact for ANY alignment — verified by measurement:
-the same sweep reads 0.9998/0.9999/0.9999/1.0000 @1/7200 and
-1.0020/1.0009/1.0003/1.0001 @1/3600. One side alone is NOT enough
+the same sweep reads 0.9999/0.9999/1.0000/1.0000 @1/7200 and
+1.0002/1.0000/1.0000/1.0000 @1/3600. One side alone is NOT enough
 (bite-measured: joint seed with the manifold carry disabled = 0.049 — the
 contact side forgets the reaction each substep and iteration 1 re-crushes
 the joint lambda to ~τ₀/D).
 
 GATES (all green, flag default now true): E1 static transmission (2.4 N·m
 demand through a 23.7 mm lever = 101.4 N at the tip; transmitted fraction
-1.0000, ΔF_n = Δτ/l to 4 digits, 2% cross-rate band met exactly); E2
+1.0000, ΔF_n = Δτ/l to 4 digits, 2% cross-rate band met at 0.5%); E2
 heel-lift threshold (τ* = W·l exact by anchor placement; outcome AND
 settled lift height dt-independent, where the legacy path's outcome
 qualitatively flips with sub_dt); E5 pressed-phase energy monotone over
@@ -294,3 +294,32 @@ The legacy pre-pass (`apply_implicit`) and the sequential legacy
 primitives keep the documented gap and stay as the flag-off rollback path;
 un-migrated assemblies are unaffected until they adopt JointAxis (Commit C
 re-lands the foot).
+
+SEED-PLACEMENT AMENDMENT (2026-10-21, pre-Commit-C gates; spec doc
+amendment of the same date). The joint-side warm seed originally applied
+inside `prepare`, BEFORE the legacy implicit passes — the exact
+rectification channel this entry diagnosed for the manifold seed (which
+already applies at contact-reset time). A MIXED world — a grounded
+JointAxis body sharing bodies with legacy dampers/springs/PDs, which is
+precisely the mid-migration state Commit C creates — re-exposed it, and
+no gate covered that composition. Two canaries now do
+(crates/physics/tests/coupled_joint.rs), both bite-verified against the
+pre-amendment placement: a legacy damper on the SAME pair into a pinned
+parent silently steals the ground reaction (F_n 0.21 N of a ~101 N lever
+demand while the λ diagnostic reads full transmission and the world stays
+quiet — the statics assertion is the one that bites); a legacy articulated
+stack on an ADJACENT free body turns the seed (Δω = w·dt·τ₀ ≈ 1.3e3 rad/s
+at toe scale) into a per-substep kick — sustained 151/1441 rad/s limit
+cycle, 5.2e-2 J energy pump, sign-flipped transmission. Fix: `prepare` is
+now read-only (clamps and PARKS the seed); `JointAxis::apply_warm_start`
+applies it at the contact-reset slot alongside the manifold seeds, after
+every legacy pass and before the SI sweeps — which is all the
+cross-substep fixed point ever needed (admission never saw the manifold
+seeds either, so §2.3's original rationale was already moot). All gates
+re-measured green at the amended placement: the figures quoted above are
+the current ones. Also hardened in the same batch: `warm_start`
+cone-projects the carried FRICTION seed against the constraint's current
+cone (μ ≤ 0 zeroes it) — un-projected, a friction impulse carried onto a
+μ = 0 ground re-applies every substep and never unwinds (measured: a
+coasting capsule reverses and gains speed without bound,
+carried_friction_seed_is_cone_projected_when_mu_drops).

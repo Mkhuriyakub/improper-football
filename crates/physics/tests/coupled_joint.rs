@@ -1,9 +1,10 @@
-//! Commit A of the coupled joint+contact solve (design contract:
-//! docs/superpowers/specs/2026-10-21-coupled-joint-contact-solve.md, §5
-//! item 1): the in-loop JointAxis lifecycle behind
-//! `XpbdWorld::coupled_joint_solve` — default FALSE, so a flag-off substep
-//! is exactly the legacy pipeline and the whole existing suite guards it.
-//! These tests pin the flag-ON free-space guarantee (design §2.4): the
+//! The coupled joint+contact solve (design contract:
+//! docs/superpowers/specs/2026-10-21-coupled-joint-contact-solve.md): the
+//! in-loop JointAxis lifecycle behind `XpbdWorld::coupled_joint_solve` —
+//! default TRUE since Commit B (gated on E1/E2/E5 green); false is the
+//! one-flag rollback to the exact legacy pre-pass pipeline, which keeps
+//! the documented force-transmission gap under contact.
+//! The A–D tests pin the flag-ON free-space guarantee (design §2.4): the
 //! in-loop form lands on `apply_implicit`'s fixed point —
 //!   A  — single-substep equivalence, unsaturated 2×2 path;
 //!   B  — single-substep equivalence, saturated branch (accumulated clamp,
@@ -24,6 +25,12 @@
 //!        sustained contact fight);
 //!   plus an #[ignore] receipts/L1-sweep harness.
 //!
+//! The L2 warm-start pair's cross-primitive gates (2026-10-21, the
+//! pre-Commit-C set): the two MIXED-PRIMITIVE canaries (a grounded
+//! JointAxis press sharing a body with legacy primitives — the warm seed
+//! must apply AFTER the legacy implicit passes, at the contact-reset slot)
+//! and the carried-friction-seed cone projection.
+//!
 //! TOLERANCE DERIVATION (single-substep comparisons): the two paths
 //! evaluate the SAME rational function of the same inputs — the in-loop
 //! γ-form is the pre-pass D-form with numerator and denominator both
@@ -41,6 +48,7 @@
 //! TOL_TORQUE = 1e-10 is three orders of headroom and six below the
 //! smallest compared torque (~5e-3 N·m).
 
+use physics::angular_damper::AngularDamper;
 use physics::constraints::PositionalConstraint;
 use physics::joint_axis::JointAxis;
 use physics::math::{Mat3, Quat, Vec3, swing_twist_angle};
@@ -412,10 +420,11 @@ fn d_multi_substep_free_space_trajectory_matches() {
 /// 0.069 / 0.132 / 0.241 / 0.412 at 4/8/16/32 iters @1/7200, halving at
 /// 1/3600). On THIS geometry the residual tracks (D−1)/D — the L2 trigger.
 ///
-/// MEASURED (2026-10-21, L2 warm-start pair landed — the current path):
-/// the same sweep transmits the full demand at EVERY point of the grid:
-/// fraction 0.9998 / 0.9999 / 0.9999 / 1.0000 at 4/8/16/32 iters @1/7200
-/// and 1.0020 / 1.0009 / 1.0003 / 1.0001 @1/3600 (legacy pre-pass
+/// MEASURED (2026-10-21, L2 warm-start pair landed; re-measured after the
+/// warm-seed placement amendment, the current path): the same sweep
+/// transmits the full demand at EVERY point of the grid: fraction
+/// 0.9999 / 0.9999 / 1.0000 / 1.0000 at 4/8/16/32 iters @1/7200
+/// and 1.0002 / 1.0000 / 1.0000 / 1.0000 @1/3600 (legacy pre-pass
 /// unchanged: 0.0090 / 0.0045). The design's §2.6 claim — the
 /// cross-substep fixed point Λ* = dt·τ₀ is exact for ANY alignment once
 /// BOTH the joint lambdas and the manifold lambdas carry — is verified by
@@ -674,9 +683,12 @@ fn e1_two_phases(coupled: bool, iters: usize, sub_dt: f64) -> (E1Phase, E1Phase,
 /// whose cross-substep fixed point is exact for any alignment; L2 is now
 /// in and the ignore is lifted. NEVER weaken the bands instead.
 ///
-/// MEASURED AFTER L2 (2026-10-21, joint + manifold warm-start pair):
-/// fraction 1.0000 at both rates and at 8/16/32 iterations; ΔF_n 101.42 N
-/// = Δτ/l 101.42 N; (iii) cross-rate agreement to the printed precision.
+/// MEASURED AFTER L2 (2026-10-21, joint + manifold warm-start pair;
+/// re-measured after the warm-seed placement amendment, the current path):
+/// fraction 1.0000 at both rates and at 8/16/32 iterations; ΔF_n = Δτ/l to
+/// the printed precision at each rate (101.34 N @1/7200, 100.82 N @1/3600
+/// at 8 iterations); (iii) cross-rate spread 0.56% on τ_tx and 0.51% on
+/// ΔF_n, inside the 2% band.
 /// BITE-VERIFIED (2026-10-21), both L2 sides: (1) with the MANIFOLD carry
 /// disabled (joint seed alone) this test fails at fraction 0.0494 —
 /// measuring §2.6's derivation that the joint-side seed cannot accumulate
@@ -901,11 +913,13 @@ fn e2_run(coupled: bool, iters: usize, cmd_frac: f64, sub_dt: f64) -> (bool, f64
 /// 10% across rates). The lift outcomes are also asserted against the
 /// statics-derived truth, not merely against each other.
 ///
-/// MEASURED (2026-10-21, flag on, cold start, 8 iters): 0.8·τ* stays
-/// grounded with heel load 0.961 N / 0.976 N across rates (statics:
-/// (τ* − 0.8τ*)/0.2 m = 0.98 N); 1.25·τ* lifts to 2.377e-3 / 2.376e-3 m —
-/// 0.05% apart, and within 3% of the frictionless equilibrium
-/// kp·(target − θ) = τ*·cos θ ⇒ 2.45 mm. This rig's alignment is benign
+/// MEASURED (2026-10-21, post-L2 with the warm-seed placement amendment —
+/// the current path; 8 iters): 0.8·τ* stays grounded with heel load
+/// 0.981 N / 0.981 N across rates (statics: (τ* − 0.8τ*)/0.2 m = 0.98 N);
+/// 1.25·τ* lifts to 2.353e-3 / 2.351e-3 m — 0.08% apart, and within 4% of
+/// the frictionless equilibrium kp·(target − θ) = τ*·cos θ ⇒ 2.45 mm.
+/// (Historical cold-start figures, Commit B: heel 0.961/0.976 N, lift
+/// 2.377/2.376 mm.) This rig's alignment is benign
 /// (D ≈ 1.2 ⇒ per-sweep residual ≤ 0.17, fully converged in 8 sweeps), so
 /// the gate passes at cold start — no lever needed.
 ///
@@ -949,6 +963,301 @@ fn e2_heel_lift_threshold_is_dt_independent() {
             );
         }
     }
+}
+
+/// Append a LEGACY distal link to E1's rig: a dp-scale capsule beyond the
+/// child's distal tip, flat on the ground, attached by the foot's full
+/// legacy articulated stack exactly as `build_toe_ray`/`add_articulated`
+/// compose it (positional constraint at 1/60000, primary-axis soft limit
+/// k = 8000 exp 2, passive spring k = 4, damper c = 1.0, PD kp = 4 /
+/// kd = 0.15, off-axis ±0.05 locks with dampers). Spring rest and PD
+/// target sit at the as-assembled relative angle −φ₀ (zero-preload
+/// assembly, the house practice). Returns the new body's index.
+fn add_legacy_distal_link(rig: &mut E1Rig) -> usize {
+    use physics::angular_pd_controller::AngularPDController;
+    use physics::angular_soft_limit::AngularSoftLimit;
+    use physics::angular_spring::AngularSpring;
+    use physics::angular_constraint::AngularLimitConstraint;
+
+    let (c_mass, c_half_h, c_r) = (0.0024, 0.0010, 0.0030);
+    let b = &rig.world.bodies[rig.child];
+    // Distal end-sphere center and surface tip of the pitched child.
+    let distal = b.position + b.orientation * Vec3::new(0.0, E1_HALF_H, 0.0);
+    let tip_z = distal.z + E1_R * rig.phi0.cos();
+
+    let along_z = Quat::from_scaled_axis(Vec3::new(std::f64::consts::FRAC_PI_2, 0.0, 0.0));
+    let mut link = RigidBody::new_capsule(c_mass, c_half_h, c_r);
+    link.orientation = along_z;
+    link.position = Vec3::new(0.0, c_r, tip_z + c_half_h + c_r);
+    let c = rig.world.add_body(link);
+
+    let joint_world = Vec3::new(0.0, (E1_R + c_r) * 0.5, tip_z);
+    let mut pc = PositionalConstraint::new(rig.child, c, 0.0, 1.0 / 60_000.0);
+    pc.local_anchor_a = rig.world.bodies[rig.child].orientation.inverse()
+        * (joint_world - rig.world.bodies[rig.child].position);
+    pc.local_anchor_b =
+        rig.world.bodies[c].orientation.inverse() * (joint_world - rig.world.bodies[c].position);
+    rig.world.constraints.push(pc);
+
+    let rest = -rig.phi0; // as-assembled relative angle (child pitched, link flat)
+    rig.world.angular_soft_limits.push(AngularSoftLimit::new(
+        rig.child, c, Vec3::x(), rest - 0.70, rest + 0.70, 8000.0, 2.0,
+    ));
+    rig.world
+        .angular_springs
+        .push(AngularSpring::new(rig.child, c, Vec3::x(), 4.0, rest));
+    rig.world
+        .angular_dampers
+        .push(AngularDamper::new(rig.child, c, Vec3::x(), 1.0));
+    let mut pd = AngularPDController::new(rig.child, c, Vec3::x(), 4.0, 0.15);
+    pd.target_angle = rest;
+    rig.world.angular_pd_controllers.push(pd);
+    for off in [Vec3::y(), Vec3::z()] {
+        rig.world.angular_constraints.push(AngularLimitConstraint::new(
+            rig.child, c, off, -0.05, 0.05,
+        ));
+        rig.world
+            .angular_dampers
+            .push(AngularDamper::new(rig.child, c, off, 1.0));
+    }
+    c
+}
+
+/// MIXED-PRIMITIVE CANARY 1 (pre-Commit-C gate): a grounded JointAxis press
+/// with a LEGACY AngularDamper on the SAME body pair — one half of the
+/// mid-migration composition a partial foot migration creates.
+///
+/// THE CHANNEL THIS PINS: the joint-side L2 warm seed is a real velocity
+/// change (Δω = w·dt·τ₀ ≈ 1.27e3 rad/s on this rig — measured, carried
+/// λ_a+λ_p = 3.33e-4 N·m·s at w ≈ 3.8e6). If it is applied while the
+/// legacy implicit passes (apply_pd_kp_implicit, springs, dampers) still
+/// run AFTER it, a legacy damper reads the seed velocity as real motion
+/// and rectifies it — the identical channel the manifold seed had before
+/// it moved to contact-reset time (the measured 26 rad/s legacy-ray limit
+/// cycle). The joint seed must apply in the SAME slot: after the legacy
+/// passes, before the SI sweeps (`JointAxis::apply_warm_start`).
+///
+/// Rig: E1's pressed toe (pinned proximal, distal tip wedged, 2.4 N·m
+/// sustained demand ⇒ a large warm seed every substep) plus
+/// AngularDamper(parent, child, x̂, c = 1.0) — the foot stack's shared
+/// damper, exactly as `build_toe_ray`/`add_articulated` attach it. Statics
+/// are damping-independent, so the honest settled state matches E1's.
+///
+/// ON THIS composition (damper into a PINNED parent, everything collinear
+/// with the joint axis) the rectification does NOT surface as a limit
+/// cycle: the per-substep theft drains into the pin and the collinear
+/// joint+contact sweeps re-anchor the lambdas, so the world stays quiet
+/// and the λ-based τ diagnostic still reads full demand — but the GROUND
+/// REACTION is stolen: the damper removes the seed momentum before the
+/// contact ever sees it. Hence the load-bearing assertion here is E1's
+/// lever statics, alongside the house invariants:
+///   (1) ΔF_n = Δτ_tx/lever within 10% (E1(ii)'s band — NEVER loosen);
+///   (2) no sustained velocity limit cycle: max |ω_child| < OMEGA_BOUND;
+///   (3) no energy pump: every 10 ms mechanical-energy sample within
+///       MIXED_E_BOUND of its running minimum (E5's running-min form).
+///
+/// OMEGA_BOUND DERIVATION: healthy settled press is static (this rig
+/// measures sustained |ω| ≈ 1.0e-13 rad/s); the mechanism scale is the
+/// damper-rectified seed velocity, seed Δω/(1 + dt·w·c) ≈ 1.27e3/529 ≈
+/// 2.4 rad/s ≈ τ₀/c (and canary 2 measures 151–1441 rad/s when the
+/// stolen momentum lands on a free body). 0.05 rad/s sits ≥ 5e11× above
+/// the healthy scale and ≥ 48× below the smallest mechanism scale.
+/// MIXED_E_BOUND: same scene scale as E5 (the rig is E1's plus one
+/// damper): mechanical energy scale W·l ≈ 1.2e-3 J, 1% ⇒ 1e-5 J.
+///
+/// MEASURED AT THE PRE-FIX HEAD (2026-10-21, seed applied in `prepare`,
+/// BEFORE the legacy passes): pressed-phase F_n = 0.21 N against a
+/// ~101 N lever demand — ΔF_n/(Δτ/l) ≈ 0.002, assertion (1) bitten by
+/// ~500× — while the τ diagnostic reads fraction 1.0000 and the world
+/// stays quiet (sustained |ω| 1.9e-13, rise 0.0 J): the theft is silent
+/// except in the statics. With the seed at the contact-reset slot:
+/// F_n = 101.37 N, ΔF_n = Δτ/l to 4 digits, sustained |ω| 1.0e-13 rad/s,
+/// max rise 0.0 J.
+/// BITE-VERIFIED (2026-10-21): with `apply_warm_start` reverted to the
+/// pre-legacy-pass slot, assertion (1) fails (ΔF_n 0.19 N vs
+/// Δτ/l 101.41 N); restored, all three pass.
+#[test]
+fn mixed_same_pair_legacy_damper_press_transmits_to_ground() {
+    const OMEGA_BOUND: f64 = 0.05;
+    const MIXED_E_BOUND: f64 = 1e-5;
+    let sub_dt = SUB_DT_FINE;
+
+    let mut rig = e1_rig(true, 8);
+    rig.world
+        .angular_dampers
+        .push(AngularDamper::new(rig.parent, rig.child, Vec3::x(), 1.0));
+
+    // Neutral settle, then pressed settle (E1's two phases).
+    let neutral = e1_run_phase(&mut rig, sub_dt, 1.0);
+    rig.world.joint_axes[0].target_angle = rig.phi0 + E1_PRESS;
+    let pressed = e1_run_phase(&mut rig, sub_dt, 1.0);
+    let d_fn = pressed.f_n - neutral.f_n;
+    let expect = (pressed.tau_tx - neutral.tau_tx) / pressed.lever;
+    println!(
+        "mixed same-pair: transmitted {:+.4} N·m vs demand {:+.4} N·m (fraction {:+.4}), \
+         ΔF_n {d_fn:+.2} N vs Δτ/l {expect:+.2} N",
+        pressed.tau_tx, pressed.demand, pressed.tau_tx / pressed.demand
+    );
+    // (1) The ground actually receives the lever reaction — the silent
+    // failure mode of this composition (momentum stolen into the pin).
+    assert!(
+        (d_fn - expect).abs() <= 0.10 * expect.abs(),
+        "mixed same-pair: ΔF_n {d_fn} N vs Δτ/l {expect} N (> 10% off) — the legacy \
+         damper is stealing the joint warm seed's momentum before the contact sees it \
+         (the seed must apply AFTER the legacy implicit passes, at the contact-reset slot)"
+    );
+
+    // 3 s measured window on the settled press.
+    let mut e_min = e1_mechanical_energy(&rig.world, rig.child);
+    let mut max_rise: f64 = 0.0;
+    let mut max_w: f64 = 0.0;
+    let sample_every = (0.01 / sub_dt).round() as usize;
+    let total = (3.0 / sub_dt).round() as usize;
+    for i in 0..total {
+        rig.world.substep(sub_dt);
+        let w = rig.world.bodies[rig.child].angular_velocity.norm();
+        if !w.is_finite() || w > max_w {
+            max_w = w;
+        }
+        if (i + 1) % sample_every == 0 {
+            let e = e1_mechanical_energy(&rig.world, rig.child);
+            if e - e_min > max_rise {
+                max_rise = e - e_min;
+            }
+            if e < e_min {
+                e_min = e;
+            }
+        }
+    }
+    println!(
+        "mixed same-pair: sustained max |ω| {max_w:.3e} rad/s, max energy rise {max_rise:.3e} J"
+    );
+    // (2)/(3) The house invariants.
+    assert!(
+        max_w < OMEGA_BOUND,
+        "mixed same-pair press sustains |ω| {max_w} rad/s ≥ {OMEGA_BOUND} — seed \
+         rectification limit cycle"
+    );
+    assert!(
+        max_rise < MIXED_E_BOUND,
+        "mixed same-pair press pumped {max_rise} J above its running minimum \
+         (> {MIXED_E_BOUND} J)"
+    );
+}
+
+/// MIXED-PRIMITIVE CANARY 2 (pre-Commit-C gate): a grounded JointAxis press
+/// with a full LEGACY articulated stack on an ADJACENT FREE body — the
+/// other half of the mid-migration composition (a JointAxis joint whose
+/// child also carries a still-legacy joint to the next bone, exactly what
+/// a partial toe-ray migration creates).
+///
+/// Same channel as canary 1, but here the legacy damper connects the
+/// seeded body to a free dp-scale link instead of a pin: the damper
+/// equalizes the pair's velocities, so the seed spin (≈ 1.27e3 rad/s,
+/// canary 1's derivation) is TRANSFERRED to the link as a real kick every
+/// substep — momentum that the SI sweeps cannot re-anchor because the link
+/// has no JointAxis. The result at the pre-fix HEAD is categorical, not
+/// marginal (see MEASURED below).
+///
+/// Asserted over 3 s of settled press:
+///   (1) no sustained velocity limit cycle: max |ω| over child AND link
+///       < OMEGA_BOUND (canary 1's derivation; the measured failure is
+///       151–1441 rad/s, ≥ 3000× the bound; healthy is ≤ 2.2e-12);
+///   (2) no energy pump: running-min form, MIXED_E_BOUND = 1e-5 J (scene
+///       scale unchanged: the 2.4 g link adds < 10% to W·l ≈ 1.2e-3 J;
+///       the measured failure pumps 5.2e-2 J, 5200× the bound). The
+///       energy sum counts both free bodies + the JointAxis's elastic PE;
+///       the legacy stack's elastic terms are omitted like E5's hinge —
+///       constant at a settled static press, so a pump must surface in
+///       the counted terms;
+///   (3) the press still transmits: τ_tx within 10% of the JointAxis's
+///       static demand (E1(i)'s band).
+///
+/// MEASURED AT THE PRE-FIX HEAD (2026-10-21, seed applied in `prepare`):
+/// sustained max |ω| 151 rad/s (child) / 1441 rad/s (link), max energy
+/// rise 5.23e-2 J, transmitted fraction −2.53 (sign-flipped!), child
+/// F_n diagnostic 3.7e6 N — a full-blown limit cycle, pump, and garbage
+/// statics. With the seed at the contact-reset slot: max |ω| 9.9e-14 /
+/// 2.2e-12 rad/s, max rise 0.0 J, fraction 1.0158.
+/// BITE-VERIFIED (2026-10-21): with `apply_warm_start` reverted to the
+/// pre-legacy-pass slot the test fails at assertion (3) (fraction −2.53);
+/// the measured 151/1441 rad/s and 5.23e-2 J above also violate (1) and
+/// (2), each thousands of times over its bound. Restored, green.
+#[test]
+fn mixed_adjacent_legacy_stack_press_stays_quiet() {
+    const OMEGA_BOUND: f64 = 0.05;
+    const MIXED_E_BOUND: f64 = 1e-5;
+    let sub_dt = SUB_DT_FINE;
+
+    let mut rig = e1_rig(true, 8);
+    let link = add_legacy_distal_link(&mut rig);
+
+    e1_run_phase(&mut rig, sub_dt, 1.0);
+    rig.world.joint_axes[0].target_angle = rig.phi0 + E1_PRESS;
+    let pressed = e1_run_phase(&mut rig, sub_dt, 1.0);
+    println!(
+        "mixed adjacent-stack: transmitted {:+.4} N·m vs demand {:+.4} N·m (fraction {:+.4})",
+        pressed.tau_tx, pressed.demand, pressed.tau_tx / pressed.demand
+    );
+    // (3) The press transmits through the mixed assembly.
+    assert!(
+        (pressed.tau_tx - pressed.demand).abs() <= 0.10 * pressed.demand.abs(),
+        "mixed adjacent-stack: transmitted {} N·m vs demand {} N·m (> 10% off)",
+        pressed.tau_tx, pressed.demand
+    );
+
+    // Mechanical energy of both free bodies + the JointAxis's elastic PE.
+    let child = rig.child;
+    let energy = move |world: &XpbdWorld| -> f64 {
+        let mut e = e1_mechanical_energy(world, child);
+        let b = &world.bodies[link];
+        e += 0.5 * b.mass * b.linear_velocity.dot(&b.linear_velocity);
+        let r = b.orientation.to_rotation_matrix();
+        let i_w = r.matrix() * b.inertia_tensor * r.matrix().transpose();
+        e += 0.5 * b.angular_velocity.dot(&(i_w * b.angular_velocity));
+        e += b.mass * 9.81 * b.position.y;
+        e
+    };
+
+    let mut e_min = energy(&rig.world);
+    let mut max_rise: f64 = 0.0;
+    let mut max_w: f64 = 0.0;
+    let sample_every = (0.01 / sub_dt).round() as usize;
+    let total = (3.0 / sub_dt).round() as usize;
+    for i in 0..total {
+        rig.world.substep(sub_dt);
+        for &idx in &[rig.child, link] {
+            let w = rig.world.bodies[idx].angular_velocity.norm();
+            if !w.is_finite() || w > max_w {
+                max_w = w;
+            }
+        }
+        if (i + 1) % sample_every == 0 {
+            let e = energy(&rig.world);
+            if e - e_min > max_rise {
+                max_rise = e - e_min;
+            }
+            if e < e_min {
+                e_min = e;
+            }
+        }
+    }
+    println!(
+        "mixed adjacent-stack: sustained max |ω| {max_w:.3e} rad/s, \
+         max energy rise {max_rise:.3e} J"
+    );
+    // (1)/(2) The house invariants.
+    assert!(
+        max_w < OMEGA_BOUND,
+        "mixed adjacent-stack press sustains |ω| {max_w} rad/s ≥ {OMEGA_BOUND} — the \
+         legacy damper is pumping the joint warm seed into the free link every substep \
+         (the seed must apply AFTER the legacy implicit passes, at the contact-reset slot)"
+    );
+    assert!(
+        max_rise < MIXED_E_BOUND,
+        "mixed adjacent-stack press pumped {max_rise} J above its running minimum \
+         (> {MIXED_E_BOUND} J) — energy injection through the seed-rectification channel"
+    );
 }
 
 /// L2-carry friction-seed cone projection: setting ground μ to 0 (or any

@@ -97,10 +97,11 @@ pub struct XpbdWorld {
     /// docs/superpowers/specs/2026-10-21-coupled-joint-contact-solve.md).
     /// When true (THE DEFAULT since Commit B, gated on E1/E2/E5 green),
     /// every `JointAxis` runs INSIDE the SI loop as an iterated 2×2 soft
-    /// constraint — `prepare` (which warm-starts the joint lambdas, L2)
-    /// before manifold generation, `solve_iteration` each GS sweep between
-    /// the angular limits and the contacts, `finalize` before position
-    /// integration — instead of the pre-pass `apply_implicit`, and the
+    /// constraint — `prepare` before manifold generation (seeding the
+    /// joint lambdas, L2), `apply_warm_start` at the contact-reset slot,
+    /// `solve_iteration` each GS sweep between the angular limits and the
+    /// contacts, `finalize` before position integration — instead of the
+    /// pre-pass `apply_implicit`, and the
     /// ground manifold carries its lambdas across regeneration (the other
     /// half of L2), so joint and contact impulses couple within each sweep
     /// and a joint transmits its full static demand through a blocked
@@ -280,16 +281,23 @@ impl XpbdWorld {
         self.apply_torque_dispatchers();
         self.apply_tendons();
         self.integrate_velocities(sub_dt);
-        // In-loop joint prepare runs BEFORE manifold generation — a
-        // load-bearing ordering: prepare WARM-STARTS each joint (re-applies
-        // the previous substep's accumulated impulse, design §2.6 L2), and
-        // that velocity change must be visible to speculative-contact
-        // admission below. It also consumes each joint's ext_* injections
-        // and runs its tear latch — the same per-substep semantics the
-        // pre-pass has below.
+        // In-loop joint prepare: read-only on the bodies — it consumes
+        // each joint's ext_* injections, runs its tear latch, caches the
+        // substep-constant solve state, and CLAMPS + PARKS the L2 warm
+        // seed (design §2.6, amended 2026-10-21). The seed impulse is
+        // applied by `apply_warm_start` at the contact-reset slot below,
+        // AFTER the legacy implicit passes, exactly like the manifold
+        // seeds: applied here, a legacy damper/PD sharing a body with the
+        // joint reads the seed velocity as real motion and rectifies it
+        // every substep (measured: a stolen 101 N ground reaction and a
+        // 151/1441 rad/s limit cycle on the mixed-primitive canaries in
+        // tests/coupled_joint.rs). Nothing between this slot and the reset
+        // slot reads the parked seed, and speculative-contact admission
+        // below sees pre-seed velocities for the JOINT seed just as it
+        // already does for the manifold seeds.
         if self.coupled_joint_solve {
             for ja in &mut self.joint_axes {
-                ja.prepare(&mut self.bodies, sub_dt);
+                ja.prepare(&self.bodies, sub_dt);
             }
         }
         // Ground contact is now a multi-point manifold of unilateral SI
@@ -367,6 +375,17 @@ impl XpbdWorld {
             );
             cc.warm_start(&mut self.bodies, lambda_n, lambda_t);
             self.ground_manifold[i] = cc;
+        }
+        // Joint-side L2 warm start, applied in the SAME slot and for the
+        // same reason (design §2.6, amended 2026-10-21): the seed `prepare`
+        // parked goes onto the bodies here, after the legacy implicit
+        // passes (which would otherwise rectify it — see
+        // `JointAxis::apply_warm_start`) and immediately before the SI
+        // sweeps that solve incrementally from the seeded lambdas.
+        if self.coupled_joint_solve {
+            for ja in &mut self.joint_axes {
+                ja.apply_warm_start(&mut self.bodies);
+            }
         }
         for _ in 0..self.solver_iterations {
             self.solve_constraints(sub_dt);

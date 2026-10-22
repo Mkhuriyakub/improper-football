@@ -217,12 +217,14 @@ pub struct JointAxis {
     /// sustained saturated output is exactly ±torque_limit — dt-independent
     /// (the impulse cap scales with dt, the torque cap does not).
     /// WARM-STARTED across substeps (the design's L2 lever): `prepare`
-    /// clamps the carried value to the current ±cap, APPLIES it to the
-    /// bodies, and keeps it seeded, so the cross-substep fixed point under
-    /// a blocking contact is the full static demand Λ* = dt·τ₀ for ANY
-    /// joint↔contact alignment (design §2.6). In free space the first
-    /// sweep's solve is independent of the seed (λ₁ = −(ω+b)/(w+γ), design
-    /// §2.4), so a stale impulse unwinds exactly when contact vanishes.
+    /// clamps the carried value to the current ±cap and keeps it seeded;
+    /// `apply_warm_start` puts the impulse on the bodies at the
+    /// contact-reset slot (after the legacy implicit passes — see its
+    /// doc), so the cross-substep fixed point under a blocking contact is
+    /// the full static demand Λ* = dt·τ₀ for ANY joint↔contact alignment
+    /// (design §2.6). In free space the first sweep's solve is independent
+    /// of the seed (λ₁ = −(ω+b)/(w+γ), design §2.4), so a stale impulse
+    /// unwinds exactly when contact vanishes.
     pub lambda_a: f64,
     /// Accumulated PASSIVE impulse (N·m·s) this substep. Never clamped —
     /// the muscle saturates, the ligaments don't. Warm-started like
@@ -277,6 +279,13 @@ struct SolveCache {
     skip: bool,
     /// Constant (γ→∞) rows still awaiting their one-time application.
     constants_pending: bool,
+    /// Warm-start impulse computed (and clamped) by `prepare`, waiting to
+    /// be applied by `apply_warm_start` at the contact-reset slot — AFTER
+    /// the legacy implicit passes, exactly where the manifold seeds apply.
+    /// Applying it in `prepare` lets a legacy damper/PD on the same or an
+    /// adjacent body read the seed velocity as real motion and rectify it
+    /// (see `apply_warm_start`).
+    pending_warm: f64,
     /// Saturation state of the most recent applied solve, read by
     /// `finalize`: when the loop ENDS clamped, the active diagnostic is
     /// σ·torque_limit assigned directly — dividing the clamped impulse by
@@ -301,6 +310,7 @@ impl SolveCache {
             cap: f64::INFINITY,
             skip: true,
             constants_pending: false,
+            pending_warm: 0.0,
             clamped: false,
             sigma: 0.0,
         }
@@ -638,30 +648,35 @@ impl JointAxis {
     // exchange impulses within each sweep and the coupled fixed point
     // transmits the full static demand, dt-independently (§2.5).
 
-    /// In-loop step 1/3: once per substep, in the slot BEFORE
-    /// `generate_ground_manifold` — load-bearing since the L2 warm start
-    /// landed: the carried impulse applied here changes velocities that
-    /// speculative-contact admission must see (design §2.3 placed the slot
-    /// for exactly this). Consumes the ext_* injections and runs the tear
-    /// latch at θₙ — the identical per-substep semantics as
-    /// `apply_implicit`, through the same shared helpers — then caches
-    /// everything the iterations need and WARM-STARTS the lambdas
-    /// (design §2.6 L2): each row classified Soft re-applies its previous
-    /// substep's accumulated impulse (the active one clamped to the
-    /// current ±cap) and keeps it seeded; a row that is now Constant or
-    /// Absent carries nothing (a Constant row books its exact impulse on
-    /// iteration 1 — re-applying a carried value on top would
-    /// double-book).
+    /// In-loop step 1/3: once per substep, read-only on the bodies.
+    /// Consumes the ext_* injections and runs the tear latch at θₙ — the
+    /// identical per-substep semantics as `apply_implicit`, through the
+    /// same shared helpers — then caches everything the iterations need
+    /// and SEEDS the lambdas (design §2.6 L2, amended 2026-10-21): the
+    /// carry criterion is the row's CURRENT class. A row classified Soft
+    /// keeps whatever impulse its lambda accumulated last substep (the
+    /// active one clamped to the current ±cap) — including an impulse a
+    /// then-Constant row booked, if the row changed class to Soft, which
+    /// is benign because the first sweep's soft solve is seed-independent
+    /// (λ₁ = −(ω+b)/(w+γ), §2.4) and simply re-lands on the fixed point. A
+    /// row that is NOW Constant or Absent carries nothing: a Constant row
+    /// books its exact impulse dt·τ₀ on iteration 1, so a carried value on
+    /// top would double-book.
     ///
-    /// Takes `&mut` bodies: the warm-start impulse is a real velocity
-    /// change. It is exactly the impulse the previous substep ACCUMULATED,
-    /// so under a blocking contact the pair (joint seed, manifold seed)
-    /// relaxes to the true coupled statics across substeps even where the
-    /// per-sweep Gauss-Seidel contraction is near-degenerate (§2.6: the
-    /// fixed point Λ* = dt·τ₀ is exact for any alignment); in free space
-    /// iteration 1's solve is seed-independent and unwinds it exactly
-    /// (§2.4).
-    pub fn prepare(&mut self, bodies: &mut Vec<RigidBody>, dt: f64) {
+    /// The seed impulse is NOT applied here: `prepare` runs before the
+    /// legacy implicit passes, and a seed applied that early is read by
+    /// legacy dampers/PDs as real motion and rectified (the same channel
+    /// the manifold seed had — see `apply_warm_start` and
+    /// `XpbdWorld::substep`). It is computed, clamped, and parked in the
+    /// cache; `apply_warm_start` puts it on the bodies at the contact-reset
+    /// slot. The seed is exactly the impulse the previous substep
+    /// ACCUMULATED, so under a blocking contact the pair (joint seed,
+    /// manifold seed) relaxes to the true coupled statics across substeps
+    /// even where the per-sweep Gauss-Seidel contraction is near-degenerate
+    /// (§2.6: the fixed point Λ* = dt·τ₀ is exact for any alignment); in
+    /// free space iteration 1's solve is seed-independent and unwinds it
+    /// exactly (§2.4).
+    pub fn prepare(&mut self, bodies: &[RigidBody], dt: f64) {
         let (ext_torque, ext_stiffness, ext_damping) = self.consume_ext();
         let (prev_la, prev_lp) = (self.lambda_a, self.lambda_p);
         self.lambda_a = 0.0;
@@ -689,6 +704,7 @@ impl JointAxis {
             cap: dt * self.torque_limit,
             skip: true,
             constants_pending: false,
+            pending_warm: 0.0,
             clamped: false,
             sigma: 0.0,
         };
@@ -762,24 +778,48 @@ impl JointAxis {
         cache.constants_pending = matches!(cache.active, Row::Constant { .. })
             || matches!(cache.passive, Row::Constant { .. });
 
-        // L2 warm start: re-apply the previous substep's accumulated
-        // impulse and keep the lambdas seeded — Soft rows only (see the
-        // method doc; Constant rows re-book exactly on iteration 1 and
-        // carry nothing). The active seed is clamped to the CURRENT ±cap,
-        // so a change of torque_limit or dt can never smuggle a stale
-        // over-budget impulse past the clamp.
+        // L2 warm start: seed each CURRENTLY-Soft row with its lambda's
+        // accumulated impulse from last substep (whatever booked it — a
+        // row that changed class Constant→Soft carries the booked constant
+        // impulse, benign by the seed-independence of the first sweep's
+        // solve; see the method doc). Rows that are NOW Constant or Absent
+        // carry nothing (Constant re-books exactly on iteration 1). The
+        // active seed is clamped to the CURRENT ±cap, so a change of
+        // torque_limit or dt can never smuggle a stale over-budget impulse
+        // past the clamp. The combined impulse is parked for
+        // `apply_warm_start` — never applied here, where the legacy
+        // implicit passes would read it as real motion.
         if let Row::Soft { .. } = cache.active {
             self.lambda_a = prev_la.clamp(-cache.cap, cache.cap);
         }
         if let Row::Soft { .. } = cache.passive {
             self.lambda_p = prev_lp;
         }
-        let j_warm = self.lambda_a + self.lambda_p;
-        if j_warm != 0.0 {
-            bodies[self.body_a].angular_velocity -= cache.i_inv_a_n * j_warm;
-            bodies[self.body_b].angular_velocity += cache.i_inv_b_n * j_warm;
-        }
+        cache.pending_warm = self.lambda_a + self.lambda_p;
         self.cache = cache;
+    }
+
+    /// In-loop step 1.5/3: apply the warm-start impulse `prepare` parked —
+    /// at the contact-reset slot in `XpbdWorld::substep`, AFTER the legacy
+    /// implicit passes and immediately before the SI sweeps, the same slot
+    /// where the manifold seeds apply. The seed velocity then exists only
+    /// inside the loop that solves incrementally from the seeded lambdas,
+    /// which is all the cross-substep fixed point needs. Applied any
+    /// earlier, a legacy damper/PD acting on the same or an adjacent body
+    /// reads the seed velocity (w·dt·τ₀ — ~1.3e3 rad/s at toe scale under
+    /// a 2.4 N·m demand) as real motion and rectifies it every substep:
+    /// measured on the mixed-primitive canaries as a stolen ground
+    /// reaction (0.21 N arriving of a 101 N demand, same-pair damper into
+    /// a pinned parent) and a sustained 151/1441 rad/s limit cycle with a
+    /// 5.2e-2 J energy pump (legacy stack on an adjacent free body) —
+    /// crates/physics/tests/coupled_joint.rs.
+    pub fn apply_warm_start(&mut self, bodies: &mut Vec<RigidBody>) {
+        let j = self.cache.pending_warm;
+        if j != 0.0 {
+            bodies[self.body_a].angular_velocity -= self.cache.i_inv_a_n * j;
+            bodies[self.body_b].angular_velocity += self.cache.i_inv_b_n * j;
+            self.cache.pending_warm = 0.0;
+        }
     }
 
     /// In-loop step 2/3: one Gauss-Seidel iteration of the joint's
