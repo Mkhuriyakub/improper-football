@@ -21,6 +21,14 @@ pub struct SoftLimit {
     /// If |excess| ever exceeds this threshold the ligament tears and the
     /// stiffness is permanently scaled by `post_tear_factor`.
     /// `f64::INFINITY` = no tearing. Same semantics as `AngularSoftLimit`.
+    /// WARNING: under the coupled solve's carried warm seeds, contact
+    /// RELEASE fires a documented self-healing one-substep velocity burst
+    /// of up to ~3e5 rad/s at toe scale (docs/findings.md 2026-10-21) —
+    /// one substep of that is an ω·dt angle excursion of tens of radians,
+    /// which would permanently (falsely) latch any finite threshold here.
+    /// Size tear thresholds with that burst scale in mind, or keep tearing
+    /// off on grounded warm-started assemblies until the L3 escalation
+    /// removes the burst.
     pub tear_threshold: f64,
     /// Stiffness multiplier applied after tearing (0.0 = complete failure).
     pub post_tear_factor: f64,
@@ -396,7 +404,11 @@ impl JointAxis {
 
     /// Enable ligament tearing on the soft limit (mirror of
     /// `AngularSoftLimit::with_tearing`). Must be called after
-    /// `with_soft_limit`.
+    /// `with_soft_limit`. WARNING: a contact-release burst under carried
+    /// warm seeds (a documented one-substep transient up to ~3e5 rad/s at
+    /// toe scale) would permanently false-trigger a finite threshold on a
+    /// grounded assembly — see the `SoftLimit::tear_threshold` doc before
+    /// choosing one.
     pub fn with_tearing(mut self, threshold: f64, post_tear_factor: f64) -> Self {
         let lim = self.limit.as_mut()
             .expect("JointAxis::with_tearing requires with_soft_limit first");

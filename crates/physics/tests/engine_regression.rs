@@ -1042,6 +1042,10 @@ fn ja_ray_phase_measurement() {
             ChainMeasure {
                 max_w, max_w_last,
                 joint_means: sums.iter().map(|s| s / n_samples as f64).collect(),
+                burst_substeps: 0,
+                energy_max_rise: 0.0,
+                energy_end_rise: 0.0,
+                energy_settled_rise: 0.0,
             }
         };
 
@@ -1078,6 +1082,10 @@ fn ja_ray_phase_measurement() {
             ChainMeasure {
                 max_w, max_w_last,
                 joint_means: sums.iter().map(|s| s / n_samples as f64).collect(),
+                burst_substeps: 0,
+                energy_max_rise: 0.0,
+                energy_end_rise: 0.0,
+                energy_settled_rise: 0.0,
             }
         };
 
@@ -1285,7 +1293,39 @@ struct ChainMeasure {
     max_w_last: f64,
     /// Per joint (root-most first): mean joint angle over the last second.
     joint_means: Vec<f64>,
+    /// Substeps whose per-substep max-over-bones |ω| exceeded
+    /// BURST_FLOOR (only the JA ramped runner counts these; the legacy
+    /// runner reports 0). A self-healing contact-release burst is a
+    /// ONE-substep event, so this separates "a few bursts" from a
+    /// sustained detonation regardless of either's amplitude.
+    burst_substeps: u64,
+    /// Max rise of the chain's total mechanical + joint-elastic energy
+    /// above its running minimum, sampled at frame cadence over the whole
+    /// phase (E5's running-min form; only the JA ramped runner computes
+    /// it — the legacy runner reports 0).
+    energy_max_rise: f64,
+    /// Energy at the phase's LAST frame sample minus the running minimum
+    /// over the whole phase: what the phase permanently left behind above
+    /// its floor. Unlike `energy_max_rise` it is blind to a self-healing
+    /// burst's one-sample transient KE (measured 5.3e4 J at the healthy
+    /// canary config) and sees only retained energy — the pump signature.
+    energy_end_rise: f64,
+    /// `energy_max_rise` restricted to the phase's last simulated second
+    /// (its own running minimum): the settled-window E5 monitor, the same
+    /// form the canary's P1 check uses.
+    energy_settled_rise: f64,
 }
+
+/// Amplitude floor separating a release burst from everything a healthy
+/// phase does: healthy JA-ray transients measure ≤ 10 rad/s (the banded P1
+/// press ceiling) and sustained chatter regimes run 150–1450 rad/s, while
+/// the one-substep release bursts start at the partial-seed scale (the
+/// grid measured 1.3e2–3.3e5 rad/s; a full un-cancelled seed is
+/// w·dt·τ ≈ 8e4 at toe scale). 1e3 sits two orders above every healthy
+/// transient; counting substeps above it bounds how LONG the world spends
+/// at burst amplitude, which is what distinguishes self-healing bursts
+/// (one substep each) from a detonation (thousands of substeps).
+const BURST_FLOOR: f64 = 1e3;
 
 /// Advance `seconds` and measure. `idxs` is the full chain (parent first).
 fn run_chain_measured(world: &mut XpbdWorld, idxs: &[usize], seconds: f64) -> ChainMeasure {
@@ -1322,6 +1362,10 @@ fn run_chain_measured(world: &mut XpbdWorld, idxs: &[usize], seconds: f64) -> Ch
         max_w,
         max_w_last,
         joint_means: sums.iter().map(|s| s / n_samples as f64).collect(),
+        burst_substeps: 0,
+        energy_max_rise: 0.0,
+        energy_end_rise: 0.0,
+        energy_settled_rise: 0.0,
     }
 }
 
@@ -1495,18 +1539,34 @@ fn run_ja_chain_ramped(
     let mut sums = vec![0.0f64; n_joints];
     let mut n_samples = 0usize;
     let mut substep_i = 0usize;
-    for _ in 0..frames {
+    let mut burst_substeps = 0u64;
+    let mut e_min = f64::MAX;
+    let mut energy_max_rise: f64 = 0.0;
+    let mut e_last = 0.0f64;
+    let settled_from_frame = frames.saturating_sub((1.0 / DT).round() as usize);
+    let mut e_min_settled = f64::MAX;
+    let mut energy_settled_rise: f64 = 0.0;
+    for frame in 0..frames {
         let t = world.joint_axes[0].target_angle;
         let step = 0.3 * DT;
         world.joint_axes[0].target_angle = t + (goal - t).clamp(-step, step);
         for _ in 0..SUBSTEPS_PER_FRAME {
             world.substep(SUB_DT);
+            // Per-substep max over the free bones (NaN propagates like the
+            // historical direct max: any non-finite w wins).
+            let mut w_sub: f64 = 0.0;
             for &i in &idxs[1..] {
                 let w = world.bodies[i].angular_velocity.norm();
-                if !w.is_finite() || w > max_w { max_w = w; }
-                if substep_i >= last_sec_from && (!w.is_finite() || w > max_w_last) {
-                    max_w_last = w;
-                }
+                if !w.is_finite() || w > w_sub { w_sub = w; }
+            }
+            if !w_sub.is_finite() || w_sub > max_w { max_w = w_sub; }
+            if substep_i >= last_sec_from && (!w_sub.is_finite() || w_sub > max_w_last) {
+                max_w_last = w_sub;
+            }
+            // Burst accounting: substeps spent above BURST_FLOOR (a NaN
+            // substep counts — negated comparison).
+            if !(w_sub <= BURST_FLOOR) {
+                burst_substeps += 1;
             }
             if substep_i >= last_sec_from {
                 for (j, pair) in idxs.windows(2).enumerate() {
@@ -1516,11 +1576,35 @@ fn run_ja_chain_ramped(
             }
             substep_i += 1;
         }
+        // E5's running-min energy form at frame cadence over the WHOLE
+        // phase (the canary's P1 monitor keeps its own settled-second
+        // window on top of this), plus the retained (end-minus-min) and
+        // settled-window forms — see the ChainMeasure field docs.
+        let e = ja_chain_energy(world, idxs);
+        if e - e_min > energy_max_rise {
+            energy_max_rise = e - e_min;
+        }
+        if e < e_min {
+            e_min = e;
+        }
+        if frame >= settled_from_frame {
+            if e - e_min_settled > energy_settled_rise {
+                energy_settled_rise = e - e_min_settled;
+            }
+            if e < e_min_settled {
+                e_min_settled = e;
+            }
+        }
+        e_last = e;
     }
     ChainMeasure {
         max_w,
         max_w_last,
         joint_means: sums.iter().map(|s| s / n_samples as f64).collect(),
+        burst_substeps,
+        energy_max_rise,
+        energy_end_rise: e_last - e_min,
+        energy_settled_rise,
     }
 }
 
@@ -1579,19 +1663,51 @@ fn ja_chain_energy(world: &XpbdWorld, idxs: &[usize]) -> f64 {
 /// reused unchanged (measured here: press 0.026, lift 0.0000; the
 /// claw-chatter failure regime sustains 200+ rad/s). The press transient
 /// is bounded < 10 rad/s (measured 0.059 at the ramp protocol — two
-/// orders of headroom — vs 100s–1000s in the chatter regime); the LIFT
-/// transient is NOT banded: contact release under carried seeds fires a
-/// self-healing velocity burst whose magnitude varies non-monotonically
-/// with sweeps × sub_dt (measured 1.3–3.3e5 rad/s across the grid at a
-/// clean end state; one substep's un-cancelled seed is w·dt·τ ≈ 8e4 rad/s
-/// at toe scale) — documented in docs/findings.md 2026-10-21, awaiting
-/// the design's L3 escalation; finiteness and the sustained/means bands
-/// still catch every sticky failure.
+/// orders of headroom — vs 100s–1000s in the chatter regime).
 ///
-/// ENERGY (E5's running-min form, frame-cadence samples over one settled
-/// second after 4 s of press): bound 1e-5 J — the house 1% of the scene's
-/// W·l ≈ 2e-3 J scale, same derivation as E5_BOUND in
-/// tests/coupled_joint.rs (measured rise: 3.4e-7 J, 30× inside).
+/// P2 BURST BANDS (2026-10-22 review fix — the lift transient was
+/// previously UNbanded, so the release artifact could worsen silently).
+/// Contact release under carried seeds fires self-healing one-substep
+/// velocity bursts whose magnitude varies non-monotonically with
+/// sweeps × sub_dt (grid-measured 1.3e2–3.3e5 rad/s at clean end states;
+/// one substep's un-cancelled seed is w·dt·τ ≈ 8e4 rad/s at toe scale —
+/// docs/findings.md 2026-10-21, the design's L3 escalation is the known
+/// fix). Two teeth, each anchored on both sides (all values measured
+/// 2026-10-22 on this rig via the instrumented runner):
+/// - AMPLITUDE ceiling max|ω| < 5e5 rad/s: 1.8× above this config's
+///   measured burst (2.7629e5) and 1.5× above the worst clean-state
+///   burst anywhere on the {16,32,64,128} × {1/7200,1/3600} grid
+///   (3.3e5), yet below every measured detonation amplitude (8-sweep
+///   regime: P2 7.06e5, P1 9.14e5). Honest caveat: clean-burst and
+///   detonation scales are only ~2× apart, so this is a
+///   between-the-measured-regimes band, not an order-of-magnitude one.
+///   BITE: at 8 sweeps P2 measures 7.056e5 > 5e5 — fails.
+/// - BURST-COUNT ≤ 720 substeps above BURST_FLOOR (1e3 rad/s) in the
+///   4 s phase (28,800 substeps): bursts are one-substep events, so the
+///   count bounds how LONG the world sits at burst amplitude independent
+///   of amplitude. Healthy measures 358 (repeated grazing releases
+///   through the lift window, ~90/s while contacts shed); the bound is
+///   2× that and 2× under the 8-sweep detonation's 1394. BITE: at 8
+///   sweeps 1394 > 720 — fails.
+///
+/// ENERGY (E5's running-min form, frame-cadence samples). THREE windows:
+/// - P1 settled second after 4 s of press: bound 1e-5 J — the house 1%
+///   of the scene's W·l ≈ 2e-3 J scale, same derivation as E5_BOUND in
+///   tests/coupled_joint.rs (measured rise: 3.4e-7 J, 30× inside).
+/// - P2 FULL window, retained form (end-of-phase energy minus the
+///   window's running min) ≤ 0.3 J: the naive full-window max-rise is
+///   measured NON-discriminating here — a healthy self-healing burst
+///   carries ~5.3e4 J of one-sample transient KE (½Iω² at 2.8e5 rad/s on
+///   toe inertia), the same order as the 8-sweep detonation's 7.0e4 — so
+///   the banded form is what the phase LEAVES behind, which a transient
+///   burst does not touch. Legitimate retained storage is the passive
+///   spring at the lifted equilibrium, ½·K_sp·θ² = ½·4·0.2² = 0.080 J
+///   (measured: 0.0804) plus ~1e-4 J of gravity lift; the bound is 3.7×
+///   that, under the 16-sweep limit cycle's 0.411. BITE: at 16 sweeps
+///   0.411 > 0.3 — fails.
+/// - P2 settled last second, running-min max rise < 1e-5 J (the same
+///   house bound as P1's): measured 1.52e-6 healthy (6.6× inside).
+///   BITE: 0.114 at 16 sweeps and 0.408 at 8 — both fail.
 ///
 /// DUAL-RATE (E1(iii) at assembly level): the pressed transmitted torque
 /// at 1/3600 with 64 sweeps — MATCHED CONVERGENCE EFFORT, 230k sweeps per
@@ -1699,15 +1815,47 @@ fn ja_toe_ray_press_canary() {
         );
     }
     println!(
-        "JA canary P2: max|ω| {:.3} (transient, unbanded — see doc), last-sec {:.4}, \
-         joint means {:+.4} {:+.4} {:+.4}",
-        p2.max_w, p2.max_w_last, p2.joint_means[0], p2.joint_means[1], p2.joint_means[2]
+        "JA canary P2: max|ω| {:.4e} (burst ceiling 5e5), last-sec {:.4}, \
+         bursts {} substeps > {BURST_FLOOR:.0e} rad/s (≤ 720), energy end-rise \
+         {:.3e} J (≤ 0.3), settled rise {:.3e} J (< 1e-5), joint means \
+         {:+.4} {:+.4} {:+.4}",
+        p2.max_w, p2.max_w_last, p2.burst_substeps, p2.energy_end_rise,
+        p2.energy_settled_rise, p2.joint_means[0], p2.joint_means[1], p2.joint_means[2]
     );
     assert!(
         p2.max_w_last < 0.05,
         "P2 lift sustains |ω| {} rad/s > 0.05 (the legacy canary's own band; the \
          claw-chatter regime sustains 200+)",
         p2.max_w_last
+    );
+    // P2 burst bands — derivations and bites in the doc comment above.
+    assert!(
+        p2.max_w < 5e5,
+        "P2 release-burst amplitude {:.3e} rad/s past the 5e5 ceiling (measured \
+         2.763e5 at this config, 3.3e5 worst clean burst on the grid; the 8-sweep \
+         detonation regime measures 7.06e5)",
+        p2.max_w
+    );
+    assert!(
+        p2.burst_substeps <= 720,
+        "P2 spent {} substeps above {BURST_FLOOR:.0e} rad/s (> 720 of the 28,800-substep \
+         phase; healthy measures 358 one-substep release bursts, the 8-sweep detonation \
+         1394) — bursts are no longer self-healing one-substep events",
+        p2.burst_substeps
+    );
+    assert!(
+        p2.energy_end_rise <= 0.3,
+        "P2 retained {:.3e} J above its running energy minimum at phase end (> 0.3 J; \
+         legitimate retained storage is the ½·K_sp·θ² = 0.080 J lifted-spring energy — \
+         the 16-sweep limit cycle retains 0.411)",
+        p2.energy_end_rise
+    );
+    assert!(
+        p2.energy_settled_rise < 1e-5,
+        "P2 settled second pumped {:.3e} J above its running minimum (> 1e-5 J, the \
+         house E5 bound; measured 1.5e-6 healthy, 0.114/0.408 in the 16/8-sweep \
+         regimes)",
+        p2.energy_settled_rise
     );
     assert!(
         (p2.joint_means[0] + 0.200).abs() <= 0.02,
