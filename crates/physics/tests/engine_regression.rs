@@ -1745,6 +1745,40 @@ fn ja_toe_ray_press_canary() {
     );
 }
 
+/// The assembly convergence-effort guard (2026-10-22 review fix F2): a
+/// world whose assembly recorded a validated sweeps-per-simulated-second
+/// floor (`min_si_sweep_rate`, e.g. foot::build_foot's 32 × 7200) must not
+/// silently run below it — chained JointAxes under contact are the
+/// measured 27%-wrong-statics regime at half the product and detonate at a
+/// quarter (docs/findings.md 2026-10-21, Stage-2 re-land finding 1).
+/// This drives the guard directly: 32 iterations at sub_dt 1/3600 is half
+/// the recorded 230,400 floor and must trip the debug_assert. (In release
+/// builds the same condition prints a once-per-world stderr warning
+/// instead; the probe binaries surface it.)
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "sweeps-per-simulated-second")]
+fn under_converged_sweep_rate_trips_the_assembly_guard() {
+    let mut world = XpbdWorld::new();
+    world.min_si_sweep_rate = 32.0 * 7200.0;
+    world.solver_iterations = 32;
+    world.substep(1.0 / 3600.0);
+}
+
+/// Companion positive leg: at the validated product itself — at BOTH rate
+/// pairings of it — the guard stays quiet. (The real-assembly coverage is
+/// the foot's matched-effort dual-rate test; this pins the arithmetic,
+/// including the exact-equality boundary the 1e-9 slack protects.)
+#[test]
+fn validated_sweep_rate_passes_the_assembly_guard() {
+    for (iters, sub_dt) in [(32usize, 1.0 / 7200.0), (64, 1.0 / 3600.0)] {
+        let mut world = XpbdWorld::new();
+        world.min_si_sweep_rate = 32.0 * 7200.0;
+        world.solver_iterations = iters;
+        world.substep(sub_dt); // must not panic
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Coulomb friction — cone threshold, kinetic dissipation, release unwind
 // ════════════════════════════════════════════════════════════════════════

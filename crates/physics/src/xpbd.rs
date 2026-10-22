@@ -143,6 +143,27 @@ pub struct XpbdWorld {
     /// substep (measured: a 26 rad/s sustained limit cycle on the legacy
     /// toe-ray pump canary with seeds applied at generation time).
     manifold_warm_seeds: Vec<(usize, f64, Vec2)>,
+    /// Validated convergence-effort floor, in SI sweeps per SIMULATED
+    /// second (`solver_iterations / sub_dt`). 0.0 (the default) = no floor.
+    /// An assembly whose within-substep convergence demand scales with the
+    /// substep (chained JointAxes under contact: the L2 warm seeds
+    /// re-inject w·λ ∝ dt of velocity every substep, so the sweeps needed
+    /// to re-absorb them scale ∝ dt too — docs/findings.md 2026-10-21,
+    /// Stage-2 re-land finding 1) records here the sweeps × rate product it
+    /// was VALIDATED at, via `max()` so composed assemblies keep the
+    /// strictest floor (`foot::build_foot` sets 32 × 7200 = 230,400).
+    /// `substep` checks the actual product against it: below the floor is
+    /// the measured under-convergence regime (at HALF the foot's product —
+    /// 32 sweeps at sub_dt 1/3600 — the settled grounded toe press lands
+    /// 27% off its matched-effort value, and at a quarter the chain
+    /// detonates), and NO intermediate product has been validated, so the
+    /// guard fires at anything materially below the recorded floor
+    /// (relative slack 1e-9, pure float-rounding headroom): a
+    /// `debug_assert` in debug builds, a once-per-world stderr warning in
+    /// release.
+    pub min_si_sweep_rate: f64,
+    /// The release-build warning above has fired (one print per world).
+    sweep_rate_warned: bool,
 }
 
 impl XpbdWorld {
@@ -167,6 +188,8 @@ impl XpbdWorld {
             coupled_joint_solve: true,
             last_sub_dt: 0.0,
             manifold_warm_seeds: Vec::new(),
+            min_si_sweep_rate: 0.0,
+            sweep_rate_warned: false,
         }
     }
 
@@ -298,6 +321,34 @@ impl XpbdWorld {
     /// every substep (same as before the rewrite).
     pub fn substep(&mut self, sub_dt: f64) {
         self.last_sub_dt = sub_dt;
+        // Convergence-effort guard (see `min_si_sweep_rate`): an assembly
+        // that recorded the sweeps-per-simulated-second product it was
+        // validated at must not silently run below it — that is the
+        // measured 27%-wrong-statics (and, lower, detonation) regime for
+        // chained JointAxes under contact, whose sweep demand scales ∝ dt.
+        if self.min_si_sweep_rate > 0.0 {
+            let sweep_rate = self.solver_iterations as f64 / sub_dt;
+            let ok = sweep_rate >= self.min_si_sweep_rate * (1.0 - 1e-9);
+            if !ok && !self.sweep_rate_warned {
+                self.sweep_rate_warned = true;
+                eprintln!(
+                    "physics warning: world runs {sweep_rate:.0} SI sweeps per simulated \
+                     second ({} iterations at sub_dt {sub_dt:.2e}) but an assembly in it \
+                     was validated at >= {:.0} sweeps-per-simulated-second — chained \
+                     JointAxes under contact are under-converged below that product \
+                     (docs/findings.md 2026-10-21). Raise solver_iterations or shrink \
+                     sub_dt to restore the validated sweeps x rate.",
+                    self.solver_iterations, self.min_si_sweep_rate
+                );
+            }
+            debug_assert!(
+                ok,
+                "SI sweeps-per-simulated-second {sweep_rate:.0} below the assembly-validated \
+                 floor {:.0} (solver_iterations {} at sub_dt {sub_dt:.2e}): the measured \
+                 under-convergence regime for chained JointAxes under contact",
+                self.min_si_sweep_rate, self.solver_iterations
+            );
+        }
         self.apply_torque_dispatchers();
         self.apply_tendons();
         self.integrate_velocities(sub_dt);

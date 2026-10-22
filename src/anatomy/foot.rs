@@ -483,12 +483,55 @@ pub fn attach_talocrural(
     ja_idx
 }
 
+/// Convergence effort (SI sweeps per SIMULATED second,
+/// `solver_iterations / sub_dt`) the foot assembly was VALIDATED at:
+/// 32 sweeps × 7200 substeps/s, with the same product re-verified at
+/// 64 × 3600 (the matched-effort dual-rate gates here and in the
+/// engine-regression JA canary). The demand scales with the substep —
+/// the L2 warm seeds re-inject w·λ ∝ dt of velocity every substep, so
+/// the sweeps needed to re-absorb them scale ∝ dt too — which is why the
+/// floor is a PRODUCT, not an iteration count. Measured below it: at
+/// half the product (32 × 3600) the settled grounded toe press lands 27%
+/// off its matched-effort value; at a quarter (8 × 7200) the toe chains
+/// detonate (docs/findings.md 2026-10-21, Stage-2 re-land finding 1).
+/// `build_foot` records this on `XpbdWorld::min_si_sweep_rate`, whose
+/// `substep` guard fires (debug_assert / release warning) when a host
+/// runs the world materially below it.
+pub const VALIDATED_SI_SWEEP_RATE: f64 = 32.0 * 7200.0;
+
 /// Build the 26-bone foot into `world`. `attach` is the world position
 /// of the talus center (the host places it at the shin's distal end).
 /// The talocrural joint (shin↔talus) is created by the HOST, not here.
 /// Returns FootHandles with all 26 body indices and the per-child
 /// JointAxis indices for the 21 articulated joints (welded children stay
 /// usize::MAX).
+///
+/// MUTATES THE HOST WORLD beyond adding bodies/constraints — two
+/// world-level settings, both floors (`max()`, never lowered):
+///
+/// 1. `world.solver_iterations` is raised to ≥ 32 — the design's L1
+///    convergence lever, scoped per-assembly (derivation in the body
+///    comment below). This is PER-WORLD, so every OTHER assembly composed
+///    into the same world inherits ≥ 32 SI sweeps too. For JointAxis
+///    assemblies that is strictly more convergence; but a LEGACY assembly
+///    that composes a rigid weld-to-pin support with ground contact on
+///    one body sits on the partial-warm-start preload valve (the KNOWN
+///    LIMITATION at `XpbdWorld::substep`), whose stored preload is
+///    quiet at some sweep counts and discharges at others — measured: the
+///    legacy toe-ray pump canary's lift phase limit-cycles at 20.9 rad/s
+///    under 16 sweeps vs 0.008 at its calibrated 8. Do not compose such
+///    legacy rigs into a foot world without re-validating them at ≥ 32.
+///
+/// 2. `world.min_si_sweep_rate` is raised to `VALIDATED_SI_SWEEP_RATE`
+///    (32 × 7200 = 230,400 sweeps per simulated second — see that
+///    constant's derivation). The 32 iterations alone do NOT encode the
+///    convergence demand: it scales with the substep, so a host running
+///    sub_dt = 1/3600 at the inherited 32 sweeps lands silently in the
+///    measured 27%-wrong-statics regime. The recorded floor makes
+///    `substep` surface exactly that composition (debug_assert in debug
+///    builds, once-per-world stderr warning in release) instead of
+///    letting it pass quietly; a 1/3600 host restores validated behavior
+///    at 64 iterations.
 pub fn build_foot(world: &mut XpbdWorld, attach: Vec3) -> FootHandles {
     // The design's L1 convergence lever, scoped to this assembly (spec
     // §2.6; measured in Commit C): chained JointAxes under ground contact
@@ -506,6 +549,11 @@ pub fn build_foot(world: &mut XpbdWorld, attach: Vec3) -> FootHandles {
     // (non-JointAxis) worlds remain bit-identical (docs/findings.md,
     // Stage-2 re-land entry). max(): never LOWER a host's own setting.
     world.solver_iterations = world.solver_iterations.max(32);
+    // And the validated sweeps × rate product behind that number (see
+    // VALIDATED_SI_SWEEP_RATE and the doc comment above): the iteration
+    // floor alone would let a coarser-substep host run under-converged
+    // silently.
+    world.min_si_sweep_rate = world.min_si_sweep_rate.max(VALIDATED_SI_SWEEP_RATE);
     let baseline = bone_baseline();
     // Foot origin = ground point below the talus. talus REST_POS.y is its
     // height above origin, so origin = attach - (0, talus.y, 0).
