@@ -706,9 +706,27 @@ impl JointAxis {
         // A row whose γ has no finite value (d + dt·k = 0, or small enough
         // that the division overflows) is the γ→∞ limit: a constant
         // impulse dt·τ₀ — or nothing at all when τ₀ is also zero.
+        //
+        // GAMMA_MAX guards the overflow band BELOW the is_finite() cut:
+        // for stiffness content in ~1e-305..1e-150, γ itself is still
+        // finite but its downstream products are not — γ_a·γ_p in the 2×2
+        // determinant, (w+γ)·r in the block numerators (r carries the
+        // O(γ·dt·τ₀) bias), and the bias itself at large τ₀ — and an
+        // inf/NaN there poisons the whole solve (measured: NaN velocities
+        // on a two-row config at d = 1e-280 each) while the pre-pass
+        // D-form, whose denominator is 1 + dt·w·(d + dt·k) ≈ 1, stays
+        // exact. Any γ > 1e100 is therefore classified as the γ→∞
+        // constant-impulse limit instead: every surviving product is then
+        // finite (γ_a·γ_p ≤ 1e200, w·γ ≤ ~1e115 at any physical inertia,
+        // bias finite for all |τ₀| < ~1e204), and the classification error
+        // is unmeasurable — a row with γ > 1e100 has stiffness content
+        // d + dt·k < 1/(dt·1e100) ≈ 7e-93 N·m·s/rad, whose per-substep
+        // torque at any representable state is below one ulp of the
+        // constant term dt·τ₀.
+        const GAMMA_MAX: f64 = 1e100;
         let stiff_a = t.d_act + dt * t.k_act;
         let gamma_a = 1.0 / (dt * stiff_a);
-        cache.active = if gamma_a.is_finite() {
+        cache.active = if gamma_a.is_finite() && gamma_a <= GAMMA_MAX {
             Row::Soft { gamma: gamma_a, bias: -gamma_a * dt * t.tau_act0 }
         } else if t.tau_act0 != 0.0 {
             // Pure feedforward. The budget still applies: a constant
@@ -728,7 +746,7 @@ impl JointAxis {
 
         let stiff_p = t.d_pas + dt * t.k_pas;
         let gamma_p = 1.0 / (dt * stiff_p);
-        cache.passive = if gamma_p.is_finite() {
+        cache.passive = if gamma_p.is_finite() && gamma_p <= GAMMA_MAX {
             Row::Soft { gamma: gamma_p, bias: -gamma_p * dt * t.tau_pas0 }
         } else if t.tau_pas0 != 0.0 {
             // Pure ext_torque with no passive structures: constant and

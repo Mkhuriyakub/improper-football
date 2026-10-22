@@ -277,6 +277,51 @@ fn c_degenerate_gamma_branches_match_apply_implicit() {
     );
 }
 
+/// C5 — overflow-scale (unphysical-but-representable) stiffness content
+/// degrades to the Constant row instead of poisoning the solve. For
+/// damping around 1e-280, γ = 1/(dt·d) ≈ 2e283 is still FINITE — the
+/// plain is_finite() classification keeps the row Soft — but the 2×2
+/// block's downstream products overflow: the determinant γ_a·γ_p and the
+/// numerator (w+γ_p)·r_a both exceed f64 range, inf/inf = NaN lands in
+/// the deltas, and the flag-on world's velocities go NaN while the
+/// pre-pass D-form (denominator 1 + dt·w·d ≈ 1) stays exact. The
+/// GAMMA_MAX = 1e100 guard classifies any such row as the γ→∞
+/// constant-impulse limit, whose error is below one ulp of dt·τ₀ (see the
+/// derivation at the guard).
+///
+/// Config: feedforward 0.3 with kd = 1e-280 (active row: nonzero τ₀ +
+/// overflow-scale γ) plus passive damping 3e-280 (passive row: zero τ₀ +
+/// overflow-scale γ ⇒ Absent under the guard). One substep, flag on vs
+/// flag off, the A/B/C tolerances.
+///
+/// MEASURED: |Δω|, |Δτ_total|, |Δτ_active| all exactly 0.0 — at this
+/// scale the constant-impulse limit and the D-form agree bit-for-bit
+/// (D = 1 + dt·w·d rounds to exactly 1.0 at d ~ 1e-280).
+/// BITE-VERIFIED (2026-10-21): with the GAMMA_MAX guard removed
+/// (classification reverted to bare is_finite()), the flag-on child
+/// velocity is NaN and this test fails; guard restored, it passes.
+#[test]
+fn c5_overflow_scale_stiffness_degrades_to_constant_row() {
+    let (mut off, mut on) = equivalence_pair(
+        &|p, ch| {
+            JointAxis::new(p, ch, Vec3::z())
+                .with_feedforward(0.3)
+                .with_pd(0.0, 1e-280)
+                .with_passive_damping(3e-280)
+        },
+        2.0,
+    );
+    let (dv, d_total, d_active) = single_substep_divergence(&mut off, &mut on, SUB_DT_FINE);
+    println!("C5 overflow-γ: |Δω| {dv:.3e}, |Δτ_total| {d_total:.3e}, |Δτ_active| {d_active:.3e}");
+    assert!(
+        on.bodies[1].angular_velocity.z.is_finite(),
+        "C5: flag-on velocity went non-finite (overflow-γ row poisoned the block solve)"
+    );
+    assert!(dv < TOL_OMEGA, "C5 ω diverged: {dv:e}");
+    assert!(d_total < TOL_TORQUE, "C5 total torque diverged: {d_total:e}");
+    assert!(d_active < TOL_TORQUE, "C5 active torque diverged: {d_active:e}");
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // D — multi-substep free-space trajectory (E3 precursor)
 // ════════════════════════════════════════════════════════════════════════
