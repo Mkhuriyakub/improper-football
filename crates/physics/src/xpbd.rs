@@ -267,15 +267,16 @@ impl XpbdWorld {
         self.apply_torque_dispatchers();
         self.apply_tendons();
         self.integrate_velocities(sub_dt);
-        // In-loop joint prepare runs BEFORE manifold generation so that a
-        // future warm-start's velocity change is visible to speculative-
-        // contact admission; with the baseline cold start nothing yet
-        // depends on the slot (prepare is read-only on the bodies). It
-        // consumes each joint's ext_* injections and runs its tear latch —
-        // the same per-substep semantics the pre-pass has below.
+        // In-loop joint prepare runs BEFORE manifold generation — a
+        // load-bearing ordering: prepare WARM-STARTS each joint (re-applies
+        // the previous substep's accumulated impulse, design §2.6 L2), and
+        // that velocity change must be visible to speculative-contact
+        // admission below. It also consumes each joint's ext_* injections
+        // and runs its tear latch — the same per-substep semantics the
+        // pre-pass has below.
         if self.coupled_joint_solve {
             for ja in &mut self.joint_axes {
-                ja.prepare(&self.bodies, sub_dt);
+                ja.prepare(&mut self.bodies, sub_dt);
             }
         }
         // Ground contact is now a multi-point manifold of unilateral SI
@@ -448,6 +449,29 @@ impl XpbdWorld {
     /// material-point (local_point) approximation only needs to hold for a
     /// single substep — acceptable for the small per-substep rotation.
     fn generate_ground_manifold(&mut self) {
+        // L2 manifold warm start (design §2.6, gated by coupled_joint_solve
+        // like the joint-side seed it pairs with): carry each ground-
+        // manifold constraint's accumulated impulses across the per-substep
+        // regeneration, matched by (body, endpoint slot) — the manifold's
+        // stable identity. The carried impulses are applied (and the
+        // lambdas seeded) AFTER generation below, so speculative admission
+        // reads velocities unchanged by the contact seeds themselves. A
+        // carried impulse whose endpoint is not re-admitted this substep is
+        // simply not re-created — nothing was applied, so there is nothing
+        // to unwind — and a stale seed on a separating contact unwinds
+        // within the first sweep via the λ ≥ 0 clamp (and the cone
+        // projection for its friction). Together with the joint-side seed,
+        // this gives the coupled solve its cross-substep static memory: the
+        // fixed point transmits the full joint demand for ANY alignment.
+        let carried: Vec<(usize, u8, f64, Vec2)> = if self.coupled_joint_solve {
+            self.ground_manifold
+                .iter()
+                .filter(|c| c.lambda_normal > 0.0)
+                .map(|c| (c.body, c.endpoint_slot, c.lambda_normal, c.lambda_friction))
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.ground_manifold.clear();
         let Some(plane_y) = self.ground.plane_y else {
             return;
@@ -470,9 +494,12 @@ impl XpbdWorld {
             let r = shape.radius;
 
             // Two endpoints of the capsule's central segment, in world.
+            // Slot order (0 = +axis, 1 = −axis) is the manifold's stable
+            // cross-substep identity for the warm-start carry; it matches
+            // `engaged_endpoints`' slot convention.
             let endpoints = [axis_world * half, -axis_world * half];
 
-            for endpoint_offset in endpoints {
+            for (slot, endpoint_offset) in endpoints.into_iter().enumerate() {
                 let endcenter_world = position + endpoint_offset;
                 // Bottom of the end-sphere = endpoint center - radius (along +y).
                 let bottom_y = endcenter_world.y - r;
@@ -517,8 +544,22 @@ impl XpbdWorld {
                     ContactConstraint::new(body_idx, local_point)
                         .with_plane_y(plane_y)
                         .with_friction(mu)
-                        .with_baumgarte(0.0),
+                        .with_baumgarte(0.0)
+                        .with_endpoint_slot(slot as u8),
                 );
+            }
+        }
+
+        // Apply the L2 warm-start seeds to the freshly generated manifold
+        // (see the header comment: after generation, so admission decided
+        // on pre-seed velocities).
+        for &(body, slot, lambda_n, lambda_t) in &carried {
+            if let Some(c) = self
+                .ground_manifold
+                .iter_mut()
+                .find(|c| c.body == body && c.endpoint_slot == slot)
+            {
+                c.warm_start(&mut self.bodies, lambda_n, lambda_t);
             }
         }
     }

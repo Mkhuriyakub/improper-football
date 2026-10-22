@@ -294,9 +294,12 @@ fn c_degenerate_gamma_branches_match_apply_implicit() {
 /// (bounded, but branch-semantic) divergence — the saturated branch is
 /// pinned by test B instead.
 ///
-/// MEASURED: max|Δθ| 7.8e-16, max|Δω| 1.2e-13 over 600 substeps — the
-/// divergence is NOT accumulating (the contraction wins), five orders
-/// inside the linear bound. BITE-VERIFIED (2026-10-20): the 0.999 impulse
+/// MEASURED: max|Δθ| 7.8e-16, max|Δω| 1.2e-13 over 600 substeps at the
+/// cold-start baseline; re-measured with the L2 warm start landed (the
+/// current path — the seed re-apply + first-sweep unwind changes op order
+/// every substep): max|Δθ| 1.4e-17, max|Δω| 7.3e-14 — still not
+/// accumulating, no ulp-walk, so the §2.4 fallback tolerance re-derivation
+/// stays unused. BITE-VERIFIED (2026-10-20): the 0.999 impulse
 /// scaling (test A's bite) fails this test.
 #[test]
 fn d_multi_substep_free_space_trajectory_matches() {
@@ -354,17 +357,23 @@ fn d_multi_substep_free_space_trajectory_matches() {
 /// (L1: 16 iterations; L2: warm-start pair); it asserts nothing beyond
 /// running to finite numbers.
 ///
-/// MEASURED (2026-10-20, Commit A baseline): this rig is close to the
-/// design's WORST-CASE alignment (the parent is pinned, so the tip contact
-/// blocks the joint's only freedom almost exactly through the mass
-/// matrix — §2.6's a → 1). The cold-start fraction behaves exactly as
-/// that analysis predicts: ~linear in iterations and ~linear in dt
-/// (legacy pre-pass 0.0090 ≈ 1/D; coupled 0.069 / 0.132 / 0.241 / 0.412
-/// at 4/8/16/32 iters @1/7200, halving at 1/3600). On THIS geometry the
-/// residual tracks (D−1)/D, i.e. the L2 warm-start pair — whose fixed
-/// point is exact for any alignment — is the lever that closes it; the
-/// real foot's chain alignments (a ≈ 0.4–0.5 estimated) are expected far
-/// better, which E1/E2 on the Commit B rigs will measure.
+/// MEASURED (2026-10-20, Commit A baseline — COLD start, historical): this
+/// rig is close to the design's WORST-CASE alignment (the parent is
+/// pinned, so the tip contact blocks the joint's only freedom almost
+/// exactly through the mass matrix — §2.6's a → 1). The cold-start
+/// fraction behaved exactly as that analysis predicts: ~linear in
+/// iterations and ~linear in dt (legacy pre-pass 0.0090 ≈ 1/D; coupled
+/// 0.069 / 0.132 / 0.241 / 0.412 at 4/8/16/32 iters @1/7200, halving at
+/// 1/3600). On THIS geometry the residual tracks (D−1)/D — the L2 trigger.
+///
+/// MEASURED (2026-10-21, L2 warm-start pair landed — the current path):
+/// the same sweep transmits the full demand at EVERY point of the grid:
+/// fraction 0.9998 / 0.9999 / 0.9999 / 1.0000 at 4/8/16/32 iters @1/7200
+/// and 1.0020 / 1.0009 / 1.0003 / 1.0001 @1/3600 (legacy pre-pass
+/// unchanged: 0.0090 / 0.0045). The design's §2.6 claim — the
+/// cross-substep fixed point Λ* = dt·τ₀ is exact for ANY alignment once
+/// BOTH the joint lambdas and the manifold lambdas carry — is verified by
+/// measurement on the worst-case geometry.
 /// BITE-VERIFIED (2026-10-20): a panic planted at the harness head fails
 /// the --ignored run (the harness genuinely executes end to end).
 #[test]
@@ -617,6 +626,18 @@ fn e1_two_phases(coupled: bool, iters: usize, sub_dt: f64) -> (E1Phase, E1Phase,
 /// (16 iterations) does not close the 10% band. Ignored pending the L2
 /// warm-start pair (design §2.6), whose cross-substep fixed point is exact
 /// for any alignment. NEVER weaken the bands instead.
+///
+/// MEASURED AFTER L2 (2026-10-21, joint + manifold warm-start pair):
+/// fraction 1.0000 at both rates and at 8/16/32 iterations; ΔF_n 101.42 N
+/// = Δτ/l 101.42 N; (iii) cross-rate agreement to the printed precision.
+/// BITE-VERIFIED (2026-10-21), both L2 sides: (1) with the MANIFOLD carry
+/// disabled (joint seed alone) this test fails at fraction 0.0494 —
+/// measuring §2.6's derivation that the joint-side seed cannot accumulate
+/// across substeps while the contact side forgets; (2) a warm_start that
+/// double-applies the carried contact impulse fails this test (E5 stays
+/// green under that bug: the over-application is unwound within the first
+/// sweep by the λ ≥ 0 clamp without pumping — E1's statics catch it, not
+/// the energy canary).
 #[test]
 #[ignore = "pending escalation lever, see E6: cold-start fraction 0.0255 @8 iters misses the \
             10% band on this near-degenerate rig; L1 (16 iters) gives 0.0502 — awaiting L2"]

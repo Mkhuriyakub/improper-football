@@ -51,6 +51,13 @@ pub struct ContactConstraint {
     pub lambda_normal: f64,
     /// Accumulated tangential friction impulse (x, z components).
     pub lambda_friction: Vec2,
+    /// Which capsule endpoint this contact belongs to (0 = +axis,
+    /// 1 = −axis — `engaged_endpoints`' slot convention). Set by
+    /// `generate_ground_manifold`; (body, endpoint_slot) is the manifold's
+    /// stable identity for the cross-substep warm-start carry. 0 and
+    /// meaningless for user-pushed contacts (their container never
+    /// carries).
+    pub endpoint_slot: u8,
 }
 
 impl ContactConstraint {
@@ -71,6 +78,7 @@ impl ContactConstraint {
             baumgarte: 0.002,
             lambda_normal: 0.0,
             lambda_friction: Vec2::zeros(),
+            endpoint_slot: 0,
         }
     }
 
@@ -78,12 +86,42 @@ impl ContactConstraint {
     pub fn with_friction(mut self, mu: f64) -> Self { self.friction_coefficient = mu; self }
     pub fn with_compliance(mut self, c: f64) -> Self { self.compliance = c; self }
     pub fn with_baumgarte(mut self, b: f64) -> Self { self.baumgarte = b; self }
+    pub fn with_endpoint_slot(mut self, slot: u8) -> Self { self.endpoint_slot = slot; self }
 
     /// Reset accumulated impulses. Called once per substep, BEFORE the
     /// SI iteration loop.
     pub fn reset_impulses(&mut self) {
         self.lambda_normal = 0.0;
         self.lambda_friction = Vec2::zeros();
+    }
+
+    /// Standard warm start (the coupled solve's L2 lever, design §2.6):
+    /// seed this freshly generated constraint with the impulses its
+    /// (body, endpoint_slot) identity accumulated LAST substep, and apply
+    /// them to the body through the current lever arm — at reset time,
+    /// before the SI sweeps. The sweeps then solve incrementally from the
+    /// seed: a still-valid seed means iteration deltas near zero (the
+    /// cross-substep static memory the near-degenerate joint↔contact
+    /// alignments need), a stale one is unwound within the first sweep by
+    /// the λ ≥ 0 clamp (normal) and the cone projection (friction) through
+    /// this same lever arm — orientation is frozen across the substep's SI
+    /// loop, so the removal cancels the application exactly.
+    pub fn warm_start(&mut self, bodies: &mut Vec<RigidBody>, lambda_n: f64, lambda_t: Vec2) {
+        let body = &bodies[self.body];
+        if body.inv_mass == 0.0 {
+            return;
+        }
+        // The unilateral invariant λ_n ≥ 0 holds for any carried value
+        // (the carry filters on λ_n > 0; max(0) keeps the invariant local).
+        self.lambda_normal = lambda_n.max(0.0);
+        self.lambda_friction = lambda_t;
+        let impulse = Vec3::new(lambda_t.x, self.lambda_normal, lambda_t.y);
+        let inv_mass = body.inv_mass;
+        let i_inv = body.world_inv_inertia();
+        let r = body.orientation * self.local_point;
+        let r_cross_imp = r.cross(&impulse);
+        bodies[self.body].linear_velocity += impulse * inv_mass;
+        bodies[self.body].angular_velocity += i_inv * r_cross_imp;
     }
 
     /// One Gauss-Seidel iteration of normal + friction constraint.
