@@ -114,8 +114,28 @@ impl ContactConstraint {
         // The unilateral invariant λ_n ≥ 0 holds for any carried value
         // (the carry filters on λ_n > 0; max(0) keeps the invariant local).
         self.lambda_normal = lambda_n.max(0.0);
-        self.lambda_friction = lambda_t;
-        let impulse = Vec3::new(lambda_t.x, self.lambda_normal, lambda_t.y);
+        // Cone-project the friction seed against THIS constraint's current
+        // cone before applying it. Load-bearing when μ drops between
+        // substeps (a μ ≤ 0 world in the extreme): `solve` returns before
+        // its friction branches at μ ≤ 0, so an unprojected seed would be
+        // applied here every substep and never re-clamped or unwound by any
+        // sweep — an unbounded tangential injection (the carry filter only
+        // checks λ_n > 0). A seed carried under an unchanged μ already
+        // satisfies the cone (last substep's solve clamped it), so this
+        // projection is a no-op on every steady path.
+        let cone = if self.friction_coefficient > 0.0 {
+            self.friction_coefficient * self.lambda_normal
+        } else {
+            0.0
+        };
+        let mag = lambda_t.norm();
+        self.lambda_friction = if mag > cone {
+            if cone > 0.0 { lambda_t * (cone / mag) } else { Vec2::zeros() }
+        } else {
+            lambda_t
+        };
+        let impulse =
+            Vec3::new(self.lambda_friction.x, self.lambda_normal, self.lambda_friction.y);
         let inv_mass = body.inv_mass;
         let i_inv = body.world_inv_inertia();
         let r = body.orientation * self.local_point;

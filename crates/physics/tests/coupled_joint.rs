@@ -951,6 +951,87 @@ fn e2_heel_lift_threshold_is_dt_independent() {
     }
 }
 
+/// L2-carry friction-seed cone projection: setting ground μ to 0 (or any
+/// lower value) mid-sim must re-clamp the CARRIED tangential seed, never
+/// ratchet it.
+///
+/// THE HOLE THIS PINS: `ContactConstraint::warm_start` seeds
+/// `lambda_friction` from the cross-substep carry, and `solve` returns at
+/// `friction_coefficient <= 0` BEFORE its release-projection branch, while
+/// the carry filter checks only `lambda_normal > 0`. Unprojected, a
+/// friction impulse carried into a μ = 0 world is applied as a real
+/// tangential impulse by warm_start every substep and never unwound or
+/// re-clamped by any sweep — unbounded injection (measured below). The fix
+/// cone-projects the seed in warm_start against the constraint's CURRENT
+/// cone: μ ≤ 0 zeroes it, μ > 0 clamps it to μ·λ_n.
+///
+/// Rig: a 1 kg capsule slides along its own axis (+x, the friction trio's
+/// pure-sliding geometry) at μ = 0.6 for 20 substeps, so the manifold
+/// carries a kinetic-friction impulse λ_t ≈ μ·m·g·dt ≈ 8.2e-4 N·s per
+/// endpoint; then ground μ is set to 0 and it coasts 0.5 s.
+///
+/// BOUND DERIVATION: with μ = 0 the ground can exert only +y (normal)
+/// impulses and gravity is vertical, so the horizontal speed after the flip
+/// is CONSERVED up to fp roundoff — the physics bound is |v| ≤ v_flip
+/// exactly; 1% headroom is ~13 orders above the roundoff scale. The bug
+/// fails it by construction: re-applying the carried λ_t each substep walks
+/// the velocity by λ_t/m ≈ 8.2e-4 m/s per substep, linear in time and
+/// unbounded (MEASURED at the pre-fix HEAD: max horizontal speed 1.9594 m/s
+/// over the 0.5 s window on a 0.9837 m/s flip speed — the capsule reverses
+/// and accelerates backward, 2× the bound in half a second and growing).
+///
+/// BITE-VERIFIED (2026-10-21): with warm_start's cone projection reverted
+/// (seeding `lambda_friction` raw), this test fails at max speed 1.9594 m/s;
+/// projection restored, it passes.
+#[test]
+fn carried_friction_seed_is_cone_projected_when_mu_drops() {
+    let mut world = XpbdWorld::new();
+    world.set_ground(0.0);
+    assert_eq!(world.ground.friction_coefficient, 0.6, "rig assumes default μ = 0.6");
+
+    let radius = 0.03;
+    let mut cap = RigidBody::new_capsule(1.0, 0.15, radius);
+    // Local +Y onto world +X: slide along the capsule axis (pure sliding).
+    cap.orientation = Quat::from_scaled_axis(Vec3::new(0.0, 0.0, -std::f64::consts::FRAC_PI_2));
+    cap.position = Vec3::new(0.0, radius, 0.0);
+    cap.linear_velocity = Vec3::new(1.0, 0.0, 0.0);
+    let b = world.add_body(cap);
+
+    // Slide at μ = 0.6: kinetic friction accumulates and the L2 carry
+    // seeds it into every next substep.
+    for _ in 0..20 {
+        world.substep(SUB_DT_FINE);
+    }
+    let v_flip = world.bodies[b].linear_velocity.x;
+    assert!(v_flip > 0.9, "rig broken: capsule stopped before the μ flip (v = {v_flip})");
+    assert!(
+        world
+            .ground_manifold
+            .iter()
+            .any(|c| c.lambda_normal > 0.0 && c.lambda_friction.norm() > 1e-6),
+        "rig broken: no friction impulse is being carried at the μ flip"
+    );
+
+    world.ground.friction_coefficient = 0.0;
+    let mut max_speed: f64 = 0.0;
+    let total = (0.5 / SUB_DT_FINE).round() as usize;
+    for _ in 0..total {
+        world.substep(SUB_DT_FINE);
+        let v = world.bodies[b].linear_velocity;
+        let h_speed = (v.x * v.x + v.z * v.z).sqrt();
+        if h_speed > max_speed {
+            max_speed = h_speed;
+        }
+    }
+    println!("friction-seed ratchet: v_flip {v_flip:.4} m/s, max |v_h| after μ→0 {max_speed:.4} m/s");
+    assert!(
+        max_speed <= 1.01 * v_flip,
+        "carried friction seed injected tangential impulse on a μ = 0 ground: \
+         max horizontal speed {max_speed} m/s > v_flip {v_flip} m/s — the warm-start \
+         seed must be cone-projected (zeroed at μ ≤ 0)"
+    );
+}
+
 /// DIAGNOSTIC harness for the E1/E2 receipts and the L1 iteration sweep —
 /// run with `cargo test -p physics --test coupled_joint -- --ignored
 /// --nocapture`. Prints E1 and E2 at flag off/on × solver_iterations
