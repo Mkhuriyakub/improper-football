@@ -1,4 +1,4 @@
-use crate::math::{Vec2, Vec3};
+use crate::math::{Mat3, Vec2, Vec3};
 use crate::rigid_body::RigidBody;
 
 /// Unilateral point-on-ground contact, solved as a velocity-level
@@ -58,6 +58,64 @@ pub struct ContactConstraint {
     /// meaningless for user-pushed contacts (their container never
     /// carries).
     pub endpoint_slot: u8,
+    /// Per-substep cache built by `prepare` (see its doc): everything the
+    /// per-iteration solve reads that is frozen while positions are.
+    cache: SolveCache,
+}
+
+/// Per-substep cache of the solve's position-dependent invariants.
+/// Positions and orientations are FROZEN during the velocity-level SI loop
+/// (only `integrate_positions`, after the loop, moves them), so the lever
+/// arm, world inverse inertia, penetration, bias, and every effective mass
+/// are constant across all `solver_iterations` sweeps of a substep.
+/// Recomputing them per row per sweep (a quaternion-to-matrix conversion
+/// plus two 3×3 multiplies each, times ~150 rows × 32 sweeps × 7200
+/// substeps/s on the loaded foot) was the measured real-time regression of
+/// the 32-sweep assembly setting (docs/findings.md 2026-10-22).
+///
+/// BIT-IDENTITY CONTRACT: every cached value is computed by the exact
+/// expression the per-iteration code used, from the same frozen inputs, so
+/// a prepared solve produces bit-identical trajectories to the historical
+/// recompute-per-iteration solve. A cache that changes any measured value
+/// is a bug, not a tolerance question.
+#[derive(Clone, Copy)]
+struct SolveCache {
+    /// Lever arm r = orientation · local_point at the frozen orientation.
+    r: Vec3,
+    /// World inverse inertia at the frozen orientation.
+    i_inv: Mat3,
+    /// plane_y − contact_world.y at the frozen pose.
+    penetration: f64,
+    /// Normal-row velocity bias: Baumgarte drive while penetrating,
+    /// speculative approach floor (penetration/dt ≤ 0) while separated.
+    bias: f64,
+    /// I⁻¹·(r × n) — the angular response to a unit normal impulse.
+    i_inv_r_cross_n: Vec3,
+    /// Normal effective mass w_n = m⁻¹ + (r×n)·I⁻¹·(r×n).
+    w_n: f64,
+    /// compliance / dt.
+    cfm: f64,
+    /// Effective masses of the world-X and world-Z friction tangents.
+    w_t: [f64; 2],
+    /// Pinned body: every iteration is a no-op.
+    skip: bool,
+}
+
+impl SolveCache {
+    /// State before any `prepare`: iterations skip.
+    fn inert() -> Self {
+        Self {
+            r: Vec3::zeros(),
+            i_inv: Mat3::zeros(),
+            penetration: 0.0,
+            bias: 0.0,
+            i_inv_r_cross_n: Vec3::zeros(),
+            w_n: 0.0,
+            cfm: 0.0,
+            w_t: [0.0; 2],
+            skip: true,
+        }
+    }
 }
 
 impl ContactConstraint {
@@ -79,6 +137,7 @@ impl ContactConstraint {
             lambda_normal: 0.0,
             lambda_friction: Vec2::zeros(),
             endpoint_slot: 0,
+            cache: SolveCache::inert(),
         }
     }
 
@@ -144,43 +203,27 @@ impl ContactConstraint {
         bodies[self.body].angular_velocity += i_inv * r_cross_imp;
     }
 
-    /// One Gauss-Seidel iteration of normal + friction constraint.
-    /// Called from `XpbdWorld::solve_constraints` (which is called
-    /// `solver_iterations` times per substep).
-    pub fn solve(&mut self, bodies: &mut Vec<RigidBody>, dt: f64) {
+    /// Build the per-substep cache (see `SolveCache`). Called once per
+    /// substep by `XpbdWorld::substep`, after the pose is final for the SI
+    /// loop and before the first sweep; `solve` also runs it inline so a
+    /// directly-driven constraint (tests, external rigs) needs no separate
+    /// call. Every expression here is copied verbatim from the historical
+    /// per-iteration solve — the bit-identity contract on the cache.
+    pub fn prepare(&mut self, bodies: &[RigidBody], dt: f64) {
         let body = &bodies[self.body];
         if body.inv_mass == 0.0 {
+            self.cache = SolveCache::inert();
             return;
         }
         let r = body.orientation * self.local_point;
         let contact_world = body.position + r;
         let penetration = self.plane_y - contact_world.y;
 
-        // ─── Normal constraint (world +Y) ─────────────────────────────
         let n = Vec3::new(0.0, 1.0, 0.0);
-        let v_contact = body.linear_velocity + body.angular_velocity.cross(&r);
-        let v_n = v_contact.dot(&n);
-
-        // Skip when the constraint can produce no impulse this iteration:
-        // not yet touching (penetration ≤ 0), nothing accumulated to
-        // maintain or unwind, and not approaching fast enough to cross the
-        // plane within this substep (v_n ≥ penetration/dt — with that
-        // speculative bias the normal solve below would yield
-        // delta_lambda ≤ 0, clamped to zero by unilaterality).
-        if penetration <= 0.0
-            && self.lambda_normal <= 0.0
-            && v_n >= penetration / dt
-        {
-            return;
-        }
-
-        let inv_mass = body.inv_mass;
         let i_inv = body.world_inv_inertia();
         let r_cross_n = r.cross(&n);
-        let w_n = inv_mass + r_cross_n.dot(&(i_inv * r_cross_n));
-        if w_n < 1e-12 {
-            return;
-        }
+        let i_inv_r_cross_n = i_inv * r_cross_n;
+        let w_n = body.inv_mass + r_cross_n.dot(&i_inv_r_cross_n);
         let cfm = self.compliance / dt;
 
         let bias = if penetration > 0.0 {
@@ -196,8 +239,81 @@ impl ContactConstraint {
             // surface instead of embedding one substep deep. Purely
             // dissipative: λ ≥ 0 only ever REDUCES approach speed, and the
             // floor is never positive, so a separated body is never pushed.
+            // Doubles as the separated-skip threshold in `solve_prepared`
+            // (the historical skip compared v_n ≥ penetration/dt — the
+            // same division).
             penetration / dt
         };
+
+        let mut w_t = [0.0; 2];
+        for (axis_idx, tangent) in [Vec3::x(), Vec3::z()].iter().enumerate() {
+            let r_cross_t = r.cross(tangent);
+            w_t[axis_idx] = body.inv_mass + r_cross_t.dot(&(i_inv * r_cross_t));
+        }
+
+        self.cache = SolveCache {
+            r,
+            i_inv,
+            penetration,
+            bias,
+            i_inv_r_cross_n,
+            w_n,
+            cfm,
+            w_t,
+            skip: false,
+        };
+    }
+
+    /// One Gauss-Seidel iteration of normal + friction constraint,
+    /// self-contained: prepares the per-substep cache inline, then solves.
+    /// `XpbdWorld::solve_constraints` calls `solve_prepared` instead (the
+    /// world runs `prepare` once per substep); this composed form keeps the
+    /// historical single-call API for direct drivers and is bit-identical
+    /// to it.
+    pub fn solve(&mut self, bodies: &mut Vec<RigidBody>, dt: f64) {
+        self.prepare(bodies, dt);
+        self.solve_prepared(bodies, dt);
+    }
+
+    /// One Gauss-Seidel iteration of normal + friction constraint, reading
+    /// the position-dependent invariants from the cache `prepare` built
+    /// this substep. Called from `XpbdWorld::solve_constraints` (which is
+    /// called `solver_iterations` times per substep).
+    pub(crate) fn solve_prepared(&mut self, bodies: &mut Vec<RigidBody>, _dt: f64) {
+        if self.cache.skip {
+            return;
+        }
+        let body = &bodies[self.body];
+        let r = self.cache.r;
+        let penetration = self.cache.penetration;
+
+        // ─── Normal constraint (world +Y) ─────────────────────────────
+        let n = Vec3::new(0.0, 1.0, 0.0);
+        let v_contact = body.linear_velocity + body.angular_velocity.cross(&r);
+        let v_n = v_contact.dot(&n);
+
+        // Skip when the constraint can produce no impulse this iteration:
+        // not yet touching (penetration ≤ 0), nothing accumulated to
+        // maintain or unwind, and not approaching fast enough to cross the
+        // plane within this substep (v_n ≥ penetration/dt = the cached
+        // speculative bias — with that bias the normal solve below would
+        // yield delta_lambda ≤ 0, clamped to zero by unilaterality).
+        if penetration <= 0.0
+            && self.lambda_normal <= 0.0
+            && v_n >= self.cache.bias
+        {
+            return;
+        }
+
+        let inv_mass = body.inv_mass;
+        let i_inv = self.cache.i_inv;
+        let w_n = self.cache.w_n;
+        if w_n < 1e-12 {
+            return;
+        }
+        let cfm = self.cache.cfm;
+
+        let bias = self.cache.bias;
         let velocity_error = v_n - bias;
         let delta_lambda_n = -velocity_error / (w_n + cfm);
 
@@ -210,7 +326,8 @@ impl ContactConstraint {
         if applied_dn.abs() > 1e-15 {
             let impulse_n = n * applied_dn;
             bodies[self.body].linear_velocity += impulse_n * inv_mass;
-            bodies[self.body].angular_velocity += i_inv * r_cross_n * applied_dn;
+            bodies[self.body].angular_velocity +=
+                self.cache.i_inv_r_cross_n * applied_dn;
         }
 
         // ─── Friction (Coulomb cone, world XZ tangent plane) ──────────
@@ -238,11 +355,9 @@ impl ContactConstraint {
             // later). Project to the cone: remove the accumulated impulse
             // through the SAME lever arm it was applied with (r is
             // orientation-dependent only, and orientation doesn't change
-            // within the SI loop, so the removal cancels exactly).
+            // within the SI loop, so the removal cancels exactly — the
+            // cached r and I⁻¹ ARE the frozen-pose values).
             if self.lambda_friction.norm() > 1e-15 {
-                let body = &bodies[self.body];
-                let r = body.orientation * self.local_point;
-                let i_inv = body.world_inv_inertia();
                 let removal =
                     Vec3::new(-self.lambda_friction.x, 0.0, -self.lambda_friction.y);
                 let r_cross_imp = r.cross(&removal);
@@ -254,10 +369,8 @@ impl ContactConstraint {
         }
         // Re-read body state after normal impulse.
         let body = &bodies[self.body];
-        let r = body.orientation * self.local_point;
         let v_contact = body.linear_velocity + body.angular_velocity.cross(&r);
 
-        let i_inv = body.world_inv_inertia();
         let limit = self.friction_coefficient * self.lambda_normal;
 
         // Solve world-X tangent then world-Z tangent in sequence,
@@ -268,8 +381,7 @@ impl ContactConstraint {
 
         for (axis_idx, tangent) in [Vec3::x(), Vec3::z()].iter().enumerate() {
             let v_t = v_contact.dot(tangent);
-            let r_cross_t = r.cross(tangent);
-            let w_t = inv_mass + r_cross_t.dot(&(i_inv * r_cross_t));
+            let w_t = self.cache.w_t[axis_idx];
             if w_t < 1e-12 {
                 continue;
             }

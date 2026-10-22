@@ -434,6 +434,35 @@ impl XpbdWorld {
         // the same body in JointAxis assemblies — the foot's real boundary
         // (a pinned talus behind compliant joints) does not, and its mild
         // residual preload wobble is documented at its gates.
+        //
+        // SI-row prepare pass (perf, 2026-10-22): positions and orientations
+        // are FROZEN during the velocity-level loop below, so each row's
+        // position-dependent solve state (world inverse inertia, levers,
+        // swing-twist angles, penetrations, biases, effective masses) is
+        // constant across all `solver_iterations` sweeps. Each row caches it
+        // here ONCE per substep instead of recomputing it per sweep — at the
+        // migrated foot's 32-sweep setting the recomputation (~150 rows × 32
+        // × 7200/s of quaternion-to-matrix work) had pushed the flagship
+        // demo to 0.58× real time (docs/findings.md 2026-10-22). The caches
+        // hold values computed by the exact expressions the per-iteration
+        // code used (the bit-identity contract documented at each
+        // SolveCache), so trajectories are bit-identical to the
+        // recompute-per-sweep pipeline — asserted by the whole suite's
+        // sharp edges (T2's 1e-12 trajectory band, the bit-equality
+        // diagnostics, every canary band). JointAxis already caches in its
+        // own `prepare` above.
+        for c in &mut self.constraints {
+            c.prepare(&self.bodies, sub_dt);
+        }
+        for c in &mut self.angular_constraints {
+            c.prepare(&self.bodies, sub_dt);
+        }
+        for c in &mut self.contact_constraints {
+            c.prepare(&self.bodies, sub_dt);
+        }
+        for c in &mut self.ground_manifold {
+            c.prepare(&self.bodies, sub_dt);
+        }
         for _ in 0..self.solver_iterations {
             self.solve_constraints(sub_dt);
         }
@@ -778,13 +807,17 @@ impl XpbdWorld {
         }
     }
 
+    /// One Gauss-Seidel sweep over every row. Each row family reads its
+    /// per-substep `prepare` cache (built in `substep` right before the
+    /// sweep loop) through `solve_prepared` — nothing position-dependent is
+    /// recomputed inside the loop.
     fn solve_constraints(&mut self, dt: f64) {
         for i in 0..self.constraints.len() {
             let mut constraint = std::mem::replace(
                 &mut self.constraints[i],
                 PositionalConstraint::new(0, 0, 0.0, 0.0),
             );
-            constraint.solve(&mut self.bodies, dt);
+            constraint.solve_prepared(&mut self.bodies, dt);
             self.constraints[i] = constraint;
         }
         for i in 0..self.angular_constraints.len() {
@@ -792,7 +825,7 @@ impl XpbdWorld {
                 &mut self.angular_constraints[i],
                 AngularLimitConstraint::new(0, 1, Vec3::z(), 0.0, 0.0),
             );
-            constraint.solve(&mut self.bodies, dt);
+            constraint.solve_prepared(&mut self.bodies, dt);
             self.angular_constraints[i] = constraint;
         }
         // In-loop JointAxis rows (coupled_joint_solve): after the angular
@@ -809,7 +842,7 @@ impl XpbdWorld {
                 &mut self.contact_constraints[i],
                 ContactConstraint::new(0, Vec3::zeros()),
             );
-            cc.solve(&mut self.bodies, dt);
+            cc.solve_prepared(&mut self.bodies, dt);
             self.contact_constraints[i] = cc;
         }
         // Ground contact manifold — the multi-point non-penetration solve.
@@ -821,7 +854,7 @@ impl XpbdWorld {
                 &mut self.ground_manifold[i],
                 ContactConstraint::new(0, Vec3::zeros()),
             );
-            cc.solve(&mut self.bodies, dt);
+            cc.solve_prepared(&mut self.bodies, dt);
             self.ground_manifold[i] = cc;
         }
     }

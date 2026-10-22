@@ -449,3 +449,37 @@ release-transient artifact above), mean |ω_rel| unchanged (0.21 → 0.20
 rad/s), invisible at render scale. (At a 1e-6 floor the LEGACY engine
 flips sign 2200–2700 times/s in every scenario including quiet neutral —
 micro-noise, which is why the receipt carries an amplitude floor.)
+
+## 2026-10-22 — The 32-sweep setting regressed the demo below real time; fixed by caching the SI rows' frozen per-substep state
+
+Commit C's per-assembly L1 (32 SI sweeps on the foot's world) multiplied
+the ENTIRE Gauss-Seidel loop, and every row recomputed its
+position-dependent solve state inside every sweep: `world_inv_inertia`
+(a quaternion-to-matrix conversion plus two 3×3 multiplies) ran twice per
+axis per sweep in `PositionalConstraint` (×3 axes), twice per sweep in
+`AngularLimitConstraint` (plus a full quaternion swing-twist), and once
+per sweep in `ContactConstraint` — ~150 rows × 32 sweeps × 7200
+substeps/s on the loaded foot. Measured on the flagship demo
+(`foot_anatomical_demo --probe`, release): 56.25 s simulated in 97.6 s
+wall = 0.58× real time (pre-Commit-C, at 8 sweeps: 1.80×).
+
+The fix is the lever the coupled-solve design already used for JointAxis
+(§2.3 prepare caching): positions and orientations are FROZEN during the
+velocity-level SI loop — only `integrate_positions`, after the loop,
+moves them — so levers, world inverse inertias, swing-twist angles,
+penetrations, biases, and effective masses are substep constants. Every
+row family now builds a `prepare` cache once per substep (the pass runs
+in `substep` right before the sweep loop) and the sweeps solve from it;
+only velocities are read per iteration. THE CACHING RULE: a cache may
+hold only values computed by the exact expressions the per-iteration
+code used, from the same frozen inputs — bit-identical, so trajectories
+cannot change. Verified: the full release probe output is value-identical
+to the pre-cache engine's, and the entire suite (T2's 1e-12 trajectory
+band, the bit-equality diagnostics, every canary) is green unchanged.
+
+Measured after: 56.25 s simulated in 44.9 s wall = 1.25× real time
+(2.17× speedup, all of it the removed quaternion-matrix recomputation).
+The probe now prints a throughput record (`simulated/wall`) at exit —
+gate-by-visibility, deliberately NOT a CI assert (wall time is
+machine-dependent); a future real-time regression shows up in every
+probe run.

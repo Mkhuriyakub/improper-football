@@ -1547,6 +1547,13 @@ fn probe() {
     let mut wsum = [0.0f64; SCENARIO_COUNT];
     let mut wmax = [0.0f64; SCENARIO_COUNT];
     let mut last_sign: i8 = 0;
+    // Throughput record (gate-by-visibility, not a CI assert — wall time is
+    // machine-dependent): the probe prints simulated/wall at exit so a
+    // real-time regression in the interactive demo is visible in every
+    // probe run. History: the Commit C 32-sweep setting regressed this to
+    // 0.58× RT before the SI-row prepare caches (docs/findings.md
+    // 2026-10-22).
+    let wall_start = std::time::Instant::now();
     while t < total {
         if let Some(i) = scenario {
             commander.update(i, scenario_t);
@@ -1649,6 +1656,11 @@ fn probe() {
             );
         }
     }
+    let wall = wall_start.elapsed().as_secs_f64();
+    println!(
+        "throughput: simulated {t:.2} s in {wall:.1} s wall = {:.2}x real time",
+        t / wall
+    );
     if dip_trace {
         for i in 0..SCENARIO_COUNT {
             let secs = flip_substeps[i] as f64 * SUB_DT;
