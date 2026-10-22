@@ -16,8 +16,9 @@
 //! Commit B adds the acceptance gates (design §4), asserted on the flag-ON
 //! path with their flag-off receipts recorded in each doc comment:
 //!   E1 — static force transmission through a grounded toe tip (~100 N);
-//!        #[ignore] at cold start: its near-degenerate rig misses the 10%
-//!        band pending the L2 warm-start lever (miss recorded in-place);
+//!        landed #[ignore]'d at cold start (its near-degenerate rig missed
+//!        the 10% band — miss recorded in-place) and un-ignored once the
+//!        L2 warm-start lever closed it;
 //!   E2 — heel-lift threshold dt-independence (passes at cold start);
 //!   E5 — pressed-phase mechanical-energy monotonicity (no pump under the
 //!        sustained contact fight);
@@ -623,9 +624,10 @@ fn e1_two_phases(coupled: bool, iters: usize, sub_dt: f64) -> (E1Phase, E1Phase,
 /// 32) — this rig is in E6's near-degenerate alignment class (pinned
 /// proximal + grounded child, a → 1): the per-sweep residual tracks
 /// (D−1)/D with D ≈ 616, so the cold-start fraction is ~n_iter/D and L1
-/// (16 iterations) does not close the 10% band. Ignored pending the L2
-/// warm-start pair (design §2.6), whose cross-substep fixed point is exact
-/// for any alignment. NEVER weaken the bands instead.
+/// (16 iterations) does not close the 10% band. The gate landed
+/// #[ignore]'d on that miss, pending the L2 warm-start pair (design §2.6),
+/// whose cross-substep fixed point is exact for any alignment; L2 is now
+/// in and the ignore is lifted. NEVER weaken the bands instead.
 ///
 /// MEASURED AFTER L2 (2026-10-21, joint + manifold warm-start pair):
 /// fraction 1.0000 at both rates and at 8/16/32 iterations; ΔF_n 101.42 N
@@ -639,8 +641,6 @@ fn e1_two_phases(coupled: bool, iters: usize, sub_dt: f64) -> (E1Phase, E1Phase,
 /// sweep by the λ ≥ 0 clamp without pumping — E1's statics catch it, not
 /// the energy canary).
 #[test]
-#[ignore = "pending escalation lever, see E6: cold-start fraction 0.0255 @8 iters misses the \
-            10% band on this near-degenerate rig; L1 (16 iters) gives 0.0502 — awaiting L2"]
 fn e1_static_force_transmission() {
     let (n_f, p_f, _) = e1_two_phases(true, 8, SUB_DT_FINE);
     let (n_c, p_c, _) = e1_two_phases(true, 8, SUB_DT_COARSE);

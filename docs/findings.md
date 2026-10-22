@@ -222,3 +222,75 @@ positive tail (+1.5e-3 J/s at 4 s) is not a solver injection either: over a
 10 s run its energy is flat from t = 1 s to t = 8 s (+1.3e-4 J/s) with
 episodic bumps from the documented bare-foot structural twist (PD and
 ROM-limit events), and it does not track β.
+
+## 2026-10-21 — A joint pre-pass under a blocking contact transmits 1/D of its torque; fixed by moving JointAxis into the SI loop (+ warm-start pair)
+
+THE RECEIPT. A pinned-parent toe pressing its grounded tip (E6's rig,
+crates/physics/tests/coupled_joint.rs) transmitted 0.90% of its 1.2 N·m
+static PD demand through the contact at sub_dt = 1/7200, and 0.45% at
+1/3600 — a dt-DEPENDENT, three-orders force-transmission gap. On the
+Commit B E1 rig (foot-family damping, w ≈ 3.8e6) the fraction is 1/616;
+the design contract's diagnosis rig measured 1/1880. The divisor is
+exactly the joint's own implicit denominator D = 1 + dt·w·(d_act+d_pas)
++ dt²·w·(k_act+k_pas).
+
+THE MECHANISM (the ω⁺ booking). `JointAxis::apply_implicit` — like every
+sequential implicit pass — computes ω⁺ = (ω + dt·w·τ₀)/D and books the
+velocity-feedback terms (−kd·ω⁺, −kp·dt·ω⁺, −c·ω⁺) against ITS OWN
+predicted end-of-substep velocity. When the SI contact loop afterwards
+annihilates that velocity (a wedged toe), the feedback was charged against
+motion that never happened: with ω ≈ 0 the transmitted torque collapses to
+τ₀/D per substep, damping-dominated at toe scale (D − 1 ∝ dt·w·(kd+c), so
+the gap doubles when dt halves). The saturated branch transmitted
+correctly all along — a constant torque has no velocity feedback to
+mis-book — which is what the burst/ratchet artifacts of the artifact-era
+CoP figures rode on.
+
+THE FIX (design contract: docs/superpowers/specs/
+2026-10-21-coupled-joint-contact-solve.md). Each JointAxis runs INSIDE the
+SI Gauss-Seidel loop as an iterated incremental soft constraint — the
+exact constraint-space re-parameterization of the same backward-Euler
+solve (residual ω⁺ + γΛ + b = 0, γ = 1/(dt·(d + dt·k)), b = −γ·dt·τ₀),
+split into an active/passive 2×2 mini-block solved directly each sweep,
+with the torque budget as an accumulated-impulse clamp |λ_a| ≤ dt·τ_max.
+Free space is algebraically unchanged (iteration 1 lands on the pre-pass
+fixed point; measured trajectory divergence ≤ 7.3e-14 rad/s over 600
+substeps); under contact the joint and the contacts exchange impulses
+within each sweep and the coupled fixed point transmits the full static
+demand, dt-independently.
+
+CONVERGENCE, MEASURED (E6, transmitted-torque fraction vs iterations).
+Cold start on the worst-case alignment (pinned proximal + grounded child,
+a → 1): 0.069/0.132/0.241/0.412 at 4/8/16/32 iterations @1/7200, halving
+at 1/3600 — the per-sweep residual tracks (D−1)/D, so the escalation
+ladder's L1 (16 iterations) measured 0.050 on E1's 10% band and did NOT
+land. L2 (the warm-start pair) landed on that trigger: joint lambdas carry
+across substeps (clamped to the current ±cap, re-applied in prepare,
+BEFORE manifold generation so speculative admission sees the velocity) AND
+ground-manifold lambdas carry across the per-substep regeneration, matched
+by (body, endpoint slot). With both sides carried the cross-substep fixed
+point Λ* = dt·τ₀ is exact for ANY alignment — verified by measurement:
+the same sweep reads 0.9998/0.9999/0.9999/1.0000 @1/7200 and
+1.0020/1.0009/1.0003/1.0001 @1/3600. One side alone is NOT enough
+(bite-measured: joint seed with the manifold carry disabled = 0.049 — the
+contact side forgets the reaction each substep and iteration 1 re-crushes
+the joint lambda to ~τ₀/D).
+
+GATES (all green, flag default now true): E1 static transmission (2.4 N·m
+demand through a 23.7 mm lever = 101.4 N at the tip; transmitted fraction
+1.0000, ΔF_n = Δτ/l to 4 digits, 2% cross-rate band met exactly); E2
+heel-lift threshold (τ* = W·l exact by anchor placement; outcome AND
+settled lift height dt-independent, where the legacy path's outcome
+qualitatively flips with sub_dt); E5 pressed-phase energy monotone over
+5 s (max rise 0.0 J; an anti-damper injector pumps 10.9 J and fails it);
+T1–T5, the A–D equivalences, engine_regression 17, ankle_anatomical.
+One honest rig note: E2 runs μ = 0.05 because its pivot contact's
+spin-friction couple adds a REAL ±μ·N·R/kp hysteresis band to the settled
+lift height (±48% at μ = 0.6, measured landing anywhere inside the band by
+rate and iteration count) — friction path-dependence, physics, not a
+solver defect; the rig isolates the dt-independence claim from it.
+
+The legacy pre-pass (`apply_implicit`) and the sequential legacy
+primitives keep the documented gap and stay as the flag-off rollback path;
+un-migrated assemblies are unaffected until they adopt JointAxis (Commit C
+re-lands the foot).

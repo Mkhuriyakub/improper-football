@@ -95,21 +95,33 @@ pub struct XpbdWorld {
     pub solver_iterations: usize,
     /// Coupled joint+contact solve (design contract:
     /// docs/superpowers/specs/2026-10-21-coupled-joint-contact-solve.md).
-    /// When true, every `JointAxis` runs INSIDE the SI loop as an iterated
-    /// 2×2 soft constraint — `prepare` before manifold generation,
-    /// `solve_iteration` each GS sweep between the angular limits and the
-    /// contacts, `finalize` before position integration — instead of the
-    /// pre-pass `apply_implicit`, so joint and contact impulses couple
-    /// within each sweep and a joint transmits its full static demand
-    /// through a blocked axis. False (the default): the substep is exactly
-    /// the legacy pipeline, whose pre-pass keeps the documented
-    /// force-transmission gap under contact (torque throttled by the
-    /// joint's own denominator — the 1/1880 receipt, design §1).
+    /// When true (THE DEFAULT since Commit B, gated on E1/E2/E5 green),
+    /// every `JointAxis` runs INSIDE the SI loop as an iterated 2×2 soft
+    /// constraint — `prepare` (which warm-starts the joint lambdas, L2)
+    /// before manifold generation, `solve_iteration` each GS sweep between
+    /// the angular limits and the contacts, `finalize` before position
+    /// integration — instead of the pre-pass `apply_implicit`, and the
+    /// ground manifold carries its lambdas across regeneration (the other
+    /// half of L2), so joint and contact impulses couple within each sweep
+    /// and a joint transmits its full static demand through a blocked
+    /// axis, dt-independently (docs/findings.md 2026-10-21). False is the
+    /// one-flag rollback to the exact legacy pipeline, whose pre-pass
+    /// keeps the documented force-transmission gap under contact (torque
+    /// throttled by the joint's own denominator — the 1/1880 receipt,
+    /// design §1) and whose manifold cold-starts every substep.
     pub coupled_joint_solve: bool,
     /// Substep dt of the most recent `substep` call. Lets the read-only
     /// `engaged_endpoints` convert a converged manifold impulse
     /// (`lambda_normal`) into a normal force (`lambda_normal / last_sub_dt`).
     last_sub_dt: f64,
+    /// L2 manifold warm-start seeds matched by `generate_ground_manifold`
+    /// this substep — (ground_manifold index, λ_n, λ_t) — and APPLIED at
+    /// the contact-reset step, AFTER the legacy implicit passes ("at reset
+    /// time", design §2.6): applying them any earlier lets the legacy
+    /// dampers read the seed velocity as real motion and rectify it every
+    /// substep (measured: a 26 rad/s sustained limit cycle on the legacy
+    /// toe-ray pump canary with seeds applied at generation time).
+    manifold_warm_seeds: Vec<(usize, f64, Vec2)>,
 }
 
 impl XpbdWorld {
@@ -131,8 +143,9 @@ impl XpbdWorld {
             ground_manifold: Vec::new(),
             ground: Ground::at_y(0.0),
             solver_iterations: DEFAULT_SI_ITERATIONS,
-            coupled_joint_solve: false,
+            coupled_joint_solve: true,
             last_sub_dt: 0.0,
+            manifold_warm_seeds: Vec::new(),
         }
     }
 
@@ -340,6 +353,21 @@ impl XpbdWorld {
         for c in &mut self.contact_constraints {
             c.reset_impulses();
         }
+        // L2 manifold warm start, applied AT RESET TIME (design §2.6):
+        // the ground manifold's carried (body, endpoint-slot) impulses —
+        // matched during generation above — seed the fresh constraints and
+        // go onto the bodies here, immediately before the SI sweeps, so
+        // the seed velocity exists only inside the loop that can unwind it
+        // (λ ≥ 0 clamp / cone projection). See `manifold_warm_seeds` for
+        // why applying earlier is wrong.
+        while let Some((i, lambda_n, lambda_t)) = self.manifold_warm_seeds.pop() {
+            let mut cc = std::mem::replace(
+                &mut self.ground_manifold[i],
+                ContactConstraint::new(0, Vec3::zeros()),
+            );
+            cc.warm_start(&mut self.bodies, lambda_n, lambda_t);
+            self.ground_manifold[i] = cc;
+        }
         for _ in 0..self.solver_iterations {
             self.solve_constraints(sub_dt);
         }
@@ -453,16 +481,19 @@ impl XpbdWorld {
         // like the joint-side seed it pairs with): carry each ground-
         // manifold constraint's accumulated impulses across the per-substep
         // regeneration, matched by (body, endpoint slot) — the manifold's
-        // stable identity. The carried impulses are applied (and the
-        // lambdas seeded) AFTER generation below, so speculative admission
-        // reads velocities unchanged by the contact seeds themselves. A
-        // carried impulse whose endpoint is not re-admitted this substep is
-        // simply not re-created — nothing was applied, so there is nothing
-        // to unwind — and a stale seed on a separating contact unwinds
-        // within the first sweep via the λ ≥ 0 clamp (and the cone
-        // projection for its friction). Together with the joint-side seed,
-        // this gives the coupled solve its cross-substep static memory: the
-        // fixed point transmits the full joint demand for ANY alignment.
+        // stable identity. The carried impulses are only MATCHED here;
+        // they are applied (and the lambdas seeded) at the contact-reset
+        // step in `substep`, so speculative admission reads velocities
+        // unchanged by the contact seeds and the legacy implicit passes
+        // never see them (see `manifold_warm_seeds`). A carried impulse
+        // whose endpoint is not re-admitted this substep is simply not
+        // re-created — nothing is applied, so there is nothing to unwind —
+        // and a stale seed on a separating contact unwinds within the
+        // first sweep via the λ ≥ 0 clamp (and the cone projection for its
+        // friction). Together with the joint-side seed, this gives the
+        // coupled solve its cross-substep static memory: the fixed point
+        // transmits the full joint demand for ANY alignment.
+        self.manifold_warm_seeds.clear();
         let carried: Vec<(usize, u8, f64, Vec2)> = if self.coupled_joint_solve {
             self.ground_manifold
                 .iter()
@@ -550,16 +581,21 @@ impl XpbdWorld {
             }
         }
 
-        // Apply the L2 warm-start seeds to the freshly generated manifold
-        // (see the header comment: after generation, so admission decided
-        // on pre-seed velocities).
+        // Match the carried impulses to the freshly generated manifold.
+        // They are NOT applied here: application waits for the
+        // contact-reset step in `substep` (after the legacy implicit
+        // passes — see `manifold_warm_seeds`), so admission above decided
+        // on pre-seed velocities and the legacy dampers never see the
+        // seeds as motion. (The pending list was already cleared at the
+        // top, before any early-out, so a stale index can never survive
+        // into a rebuilt — or disabled — manifold.)
         for &(body, slot, lambda_n, lambda_t) in &carried {
-            if let Some(c) = self
+            if let Some(i) = self
                 .ground_manifold
-                .iter_mut()
-                .find(|c| c.body == body && c.endpoint_slot == slot)
+                .iter()
+                .position(|c| c.body == body && c.endpoint_slot == slot)
             {
-                c.warm_start(&mut self.bodies, lambda_n, lambda_t);
+                self.manifold_warm_seeds.push((i, lambda_n, lambda_t));
             }
         }
     }

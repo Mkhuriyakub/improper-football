@@ -138,9 +138,10 @@ impl SoftLimit {
 ///
 /// TWO EXECUTION MODES, one free-space fixed point: the pre-pass
 /// `apply_implicit` below (the executable spec — runs when
-/// `XpbdWorld::coupled_joint_solve` is false, the default) solves the
-/// joint once per substep before the SI loop; the in-loop lifecycle
-/// (`prepare`/`solve_iteration`/`finalize`, flag true) runs the SAME
+/// `XpbdWorld::coupled_joint_solve` is false, the one-flag rollback)
+/// solves the joint once per substep before the SI loop; the in-loop
+/// lifecycle (`prepare`/`solve_iteration`/`finalize`, flag true — the
+/// default since Commit B) runs the SAME
 /// backward-Euler solve as an iterated soft constraint inside the SI loop,
 /// so joint and contact impulses couple within each sweep. In free space
 /// the two are algebraically identical (the in-loop form lands on the
