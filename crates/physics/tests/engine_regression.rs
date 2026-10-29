@@ -1423,8 +1423,10 @@ fn run_chain_measured(world: &mut XpbdWorld, idxs: &[usize], seconds: f64) -> Ch
 /// migrated the foot and added the parallel `ja_toe_ray_press_canary` below,
 /// whose bands ARE the honest wedge statics (see the findings Stage-2
 /// re-land entry); this legacy ray stays on the legacy path, keeps the
-/// bias, and keeps this band calibrated to it — it is the flag-off
-/// pipeline's canary now. Its welded-grounded root also sits on the
+/// bias, and keeps this band calibrated to it — it is the legacy
+/// sequential pipeline's canary now (the engine-level rollback flag was
+/// removed in Commit D; the legacy primitives themselves remain, and
+/// un-migrated binaries depend on them). Its welded-grounded root also sits on the
 /// partial-warm-start preload valve (silently stored contact preload, see
 /// `legacy_ray_welded_root_preload_valve`), which its bands predate and
 /// tolerate at the default 8 sweeps.
@@ -1717,9 +1719,15 @@ fn ja_chain_energy(world: &XpbdWorld, idxs: &[usize]) -> f64 {
 /// the 1/7200×32 value within 2% (measured 2.4084 vs 2.4060, 0.1%).
 ///
 /// BITE-VERIFIED (2026-10-21), three independent legs:
-/// (1) `coupled_joint_solve = false` (the legacy pre-pass on the same
-///     rig): fails the P1 transmission band at fraction 0.0005 (= 1/D at
-///     this w), with ΣF_n 0.2 N far under the 50 N floor;
+/// (1) HISTORICAL: `coupled_joint_solve = false` (the legacy pre-pass on
+///     the same rig, a path deleted in Commit D): failed the P1
+///     transmission band at fraction 0.0005 (= 1/D at this w), with
+///     ΣF_n 0.2 N far under the 50 N floor. RE-ARMED (2026-10-29,
+///     Commit D) against the live path: with the L2 warm-start carry
+///     disabled on both sides (joint seeding + manifold carry) the gate
+///     fails the same P1 band at τ_tx 0.0987 vs demand 2.385 N·m
+///     (fraction 0.0414 — the chain's 32-sweep cold-start residual);
+///     restored, green at the recorded values;
 /// (2) `solver_iterations = 8` (the under-converged chain regime): fails
 ///     at P0 already — the RESTING chain limit-cycles under the seeds;
 /// (3) an anti-damper injector (passive_damping → −1.0 on the MTP after

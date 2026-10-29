@@ -54,6 +54,20 @@ regression gate for the manifold property is
 `manifold_keeps_resting_capsule_level_with_two_active_contacts` in the
 engine test suite.
 
+**Coupled joint+contact solve** (`crates/physics/src/joint_axis.rs`) — each
+joint axis solves all of its coaxial terms (active PD with a torque budget,
+passive spring, damper, nonlinear ROM limit) in one implicit solve with a
+shared denominator, iterated inside the sequential-impulse loop together
+with the contacts. This fixed a measured defect: solving joints in their own
+pass before the contact loop throttled transmitted torque under a blocking
+contact by the joint's own implicit denominator — as little as 1/1880 of the
+static demand, and dt-dependent. With the coupled solve a joint transmits
+its full static demand into ground contact, dt-independently (measured: a
+2.4 N·m toe-press demand arrives in full as ~101 N at the tip contact, at
+both tested substep rates) — the force-transmission prerequisite for
+Phase 3. The derivation, measurements, and staged migration live in
+`docs/superpowers/specs/2026-10-21-coupled-joint-contact-solve.md`.
+
 **Stiffness-safe integration** — explicit-Euler force application is
 unstable for stiff springs/dampers on small bodies (the foot's 2-gram
 distal phalanges violate `dt < 2m/c` by >10×). All springs, dampers, and
@@ -77,9 +91,10 @@ controllers (Drake/MuJoCo computed-torque style), with fractional load
 sharing for closed chains (bilateral stance).
 
 **Regression-tested engine** — `crates/physics/tests/engine_regression.rs`
-guards contact behavior, small-body stability, energy boundedness, and the
-manifold multi-contact property. Tests were adversarially verified to fail
-on revert before being trusted.
+and `crates/physics/tests/coupled_joint.rs` guard contact behavior,
+small-body stability, energy boundedness, joint force transmission through
+contact, and the manifold multi-contact property. Tests were adversarially
+verified to fail on revert before being trusted.
 
 ## Architecture
 
@@ -88,10 +103,13 @@ crates/physics/          The engine (no app dependencies)
   src/xpbd.rs            World, substep loop, SI solver, ground manifold
   src/rigid_body.rs      Capsule bodies
   src/contact_constraint.rs  Unilateral SI contact + friction cone
+  src/joint_axis.rs      Combined coaxial joint: one implicit solve per
+                         axis, iterated in the SI loop coupled with contacts
   src/angular_*.rs       Springs, dampers, soft limits, PD controllers,
                          angular SI constraints (all implicit/SI)
   src/inverse_dynamics.rs    Gravity feedforward G(q)
   tests/engine_regression.rs Engine acceptance suite
+  tests/coupled_joint.rs     Force-transmission and dt-independence gates
 
 src/anatomy/             Reusable anatomical assemblies (data-driven)
   foot.rs                26-bone foot: bone/joint tables + builders
@@ -166,6 +184,8 @@ and standards are paramount with AI in the loop.
 1. ~~Full-body joint topology with biological constraints~~ (done)
 2. ~~Ground contact: world-level ground, manifold multi-point SI contact~~ (done)
 3. Plantar fascia / windlass arch stiffening → articulated weight-bearing
+   (its force-transmission prerequisite is met: joints transmit their full
+   static demand into ground contact, dt-independently — measured)
 4. Hill-type muscle model (force-length/velocity, activation dynamics,
    tendon elasticity) replacing placeholder PDs
 5. Proprioception / reflex loops; coordinated whole-body control

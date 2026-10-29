@@ -489,3 +489,59 @@ The probe now prints a throughput record (`simulated/wall`) at exit —
 gate-by-visibility, deliberately NOT a CI assert (wall time is
 machine-dependent); a future real-time regression shows up in every
 probe run.
+
+## 2026-10-29 — Commit D: the coupled-solve flag removed; the in-loop path is the engine's only joint path
+
+The staged migration's cleanup commit (design §5 item 4).
+`XpbdWorld::coupled_joint_solve` and the in-substep pre-pass slot
+(`apply_joint_axes`, the world-level loop over `apply_implicit`) are
+deleted; the in-loop lifecycle (`prepare` → `apply_warm_start` at contact
+reset → `solve_iteration` in the SI sweeps → `finalize`) now runs
+unconditionally, as does the manifold-side L2 carry it pairs with.
+`JointAxis::apply_implicit` is KEPT as the documented single-solve
+primitive — the executable spec of the free-space fixed point — and the
+A–D equivalence gates now drive it DIRECTLY on a reference copy of each
+rig (`ReferencePath` in tests/coupled_joint.rs): on those free-space rigs
+the hand-driven solve is bit-identical to the deleted pre-pass pipeline
+(no torque accumulators, positions frozen until integration), verified by
+every recorded MEASURED value reproducing exactly. The legacy sequential
+primitives (apply_pd_kp_implicit, springs, dampers, soft limits) are
+untouched — un-migrated binaries depend on them, and the legacy toe-ray
+pump canary remains their canary.
+
+The flag removal is behaviorally inert (the default was already true):
+the full gate set is green with values unchanged — E1 fraction 1.0000 /
+ΔF_n 101.34 N, E2 lift 2.353/2.351 mm, JA canary P1 τ_tx 2.4060 (dual-rate
+2.4084 @1/3600×64), ankle_anatomical CoP +112.1 mm and MTP 0.7059 rad /
+5.33 mm, foot_anatomical_demo --probe ALL PASS.
+
+BITE RE-ARMAMENT (every flag-flip bite either re-armed against the live
+path or resolved with a written rationale; each re-arm was run
+break→red→restore→green):
+
+- A–D equivalences: the flag-off world is replaced by the direct
+  `apply_implicit` reference. The 0.999 impulse-scaling bite re-run: all
+  four red, restored green.
+- E2 heel-lift (its only bite was the flag flip): re-armed by severing the
+  live transmission path (`solve_iteration` no-op) — the 1.25·τ* lift
+  fails (clearance −3.0e-13 m); the dt-DEPENDENT flavor of the old failure
+  (demand throttled by the joint's own denominator) cannot recur, since
+  the one-shot booking that produced it is deleted.
+- E1 (live bites already existed — the L2 single-side/double-apply legs):
+  re-verified at this commit; with BOTH carries disabled it fails at
+  fraction 0.0255, bit-for-bit the recorded cold-start miss.
+- JA toe-ray canary leg (1) (was the flag flip, 0.0005): re-armed with the
+  both-carries-disabled break — fails P1 at fraction 0.0414 (the 32-sweep
+  cold-start residual); legs (2) and (3) were already live.
+- ankle_anatomical MTP 2 mm / CoP 5 mm bands (was the flag flip, 1.1 mm /
+  3.6 mm): re-armed with the severed-transmission break — tracking
+  achieves −0.000 rad and CoP collapses to 0.3 mm, binary exits red.
+  Margin finding from the attempt to re-arm with the carry-disable break:
+  it does NOT bite these bands — the migrated foot at 32 sweeps transmits
+  enough cold (Part B 2.48 mm at pose 0.476, CoP +87.1 mm, both PASS) —
+  so on this assembly the L2 carry is belt-and-braces for the bands, not
+  load-bearing; recorded at the test's doc comment.
+
+All flag-off receipts (E1 0.0016/0.0008, E2's qualitative outcome flip,
+E6's 0.0090/0.0045 rows, the canary's 0.0005, the MTP 1.1 mm) stay
+recorded in their doc comments, re-labeled HISTORICAL.

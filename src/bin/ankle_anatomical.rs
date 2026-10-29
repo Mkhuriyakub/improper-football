@@ -347,16 +347,35 @@ fn test_arch_compression() -> TestResult {
 /// 11.0 mm (migrated: 5.33 mm at 0.505 rad) and 6.7 mm (flag-off:
 /// 1.1 mm at 0.164 rad), because the pp rides a compliant positional
 /// anchor and the indeterminate contact/weld preload split. No clean
-/// geometric floor exists; the 2 mm threshold stands on its flag-off
-/// bite below, with the measured migrated value keeping 2.7× margin.
-/// (The mm-scale lift carries the ±40% preload-split scatter
+/// geometric floor exists; the 2 mm threshold stands on its historical
+/// flag-off bite below, with the measured migrated value keeping 2.7×
+/// margin. (The mm-scale lift carries the ±40% preload-split scatter
 /// documented at foot.rs's dual-rate test, so the band is NOT tightened
-/// to the measured value.) BITE-VERIFIED (2026-10-21): with
+/// to the measured value.)
+///
+/// HISTORICAL BITE (2026-10-21, a path deleted in Commit D): with
 /// `coupled_joint_solve = false` (the transmission-gap regime on this
-/// same foot) Part B measures 1.1 mm at 0.164 rad and FAILS the 2 mm
+/// same foot) Part B measured 1.1 mm at 0.164 rad and FAILED the 2 mm
 /// band — the OLD 1 mm threshold would have PASSED that regime, so the
-/// tightening is load-bearing; the CoP test fails the same bite at
+/// tightening is load-bearing; the CoP test failed the same bite at
 /// 3.6 mm (< 5 mm). Thresholds only ever tightened: 1 → 2 mm.
+///
+/// COMMIT D DISPOSITION (2026-10-29, flag + pre-pass removed): the exact
+/// flag-off regime — free-space behavior intact while grounded
+/// transmission is throttled by the joint's own denominator — physically
+/// cannot recur, because the one-shot booking that produced it is
+/// deleted. RE-ARMED BITE against the live path: with
+/// `JointAxis::solve_iteration` made a no-op (transmission severed) this
+/// binary goes red — Part A tracking achieves −0.000 rad vs the 0.8
+/// target and the CoP shift collapses to 0.3 mm (< 5 mm); restored, green
+/// at the recorded 5.33 mm / +112.1 mm. MARGIN, measured at the same
+/// commit: with the L2 warm-start carries disabled on both sides (the
+/// nearest live analogue of a weakened grounded solve; free space is
+/// exact without seeds) the bands still PASS at reduced response —
+/// Part B 2.48 mm at pose 0.476 rad (1.24× over the 2 mm band) and CoP
+/// +87.1 mm — the foot's 32-sweep cold-start convergence transmits
+/// enough on its own, so the carry is belt-and-braces here, not
+/// load-bearing.
 fn test_mtp_pushoff() -> TestResult {
     let target = 0.8;
     let ramp_time = 1.0; // ramp over 1 s, hold 1.5 s

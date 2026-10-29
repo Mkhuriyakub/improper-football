@@ -1,10 +1,13 @@
 //! The coupled joint+contact solve (design contract:
 //! docs/superpowers/specs/2026-10-21-coupled-joint-contact-solve.md): the
-//! in-loop JointAxis lifecycle behind `XpbdWorld::coupled_joint_solve` —
-//! default TRUE since Commit B (gated on E1/E2/E5 green); false is the
-//! one-flag rollback to the exact legacy pre-pass pipeline, which keeps
-//! the documented force-transmission gap under contact.
-//! The A–D tests pin the flag-ON free-space guarantee (design §2.4): the
+//! in-loop JointAxis lifecycle — the engine's ONLY joint path since
+//! Commit D removed the `coupled_joint_solve` flag and the pre-pass slot
+//! (the legacy pre-pass pipeline kept the documented force-transmission
+//! gap under contact; its receipts are preserved, re-labeled HISTORICAL,
+//! in the doc comments below). `JointAxis::apply_implicit` survives as
+//! the documented single-solve primitive, and the A–D tests drive it
+//! DIRECTLY on a reference copy of each rig (see `ReferencePath`).
+//! The A–D tests pin the free-space guarantee (design §2.4): the
 //! in-loop form lands on `apply_implicit`'s fixed point —
 //!   A  — single-substep equivalence, unsaturated 2×2 path;
 //!   B  — single-substep equivalence, saturated branch (accumulated clamp,
@@ -14,8 +17,9 @@
 //!   D  — multi-substep free-space trajectory equivalence (E3 precursor);
 //!   E6 — #[ignore] convergence-diagnostic harness on a grounded rig.
 //!
-//! Commit B adds the acceptance gates (design §4), asserted on the flag-ON
-//! path with their flag-off receipts recorded in each doc comment:
+//! Commit B added the acceptance gates (design §4), asserted on the
+//! coupled path with their (now historical) flag-off receipts recorded in
+//! each doc comment:
 //!   E1 — static force transmission through a grounded toe tip (~100 N);
 //!        landed #[ignore]'d at cold start (its near-degenerate rig missed
 //!        the 10% band — miss recorded in-place) and un-ignored once the
@@ -77,38 +81,66 @@ fn joint_angle(world: &XpbdWorld, a: usize, b: usize, axis: Vec3) -> f64 {
     swing_twist_angle(q_rel, axis)
 }
 
-/// Build the SAME free-space world twice — flag off (the pre-pass
-/// `apply_implicit`, today's default path) and flag on (the in-loop
-/// lifecycle) — from identical body states and one identical JointAxis.
+/// Reference evolution of a free-space rig that drives
+/// `JointAxis::apply_implicit` DIRECTLY — the documented single-solve
+/// primitive, the executable spec of the free-space fixed point (design
+/// §2.4). The joint lives OUTSIDE the world (the world holds the same
+/// bodies and nothing else), and each reference substep calls
+/// `apply_implicit` by hand and then advances the empty world. On these
+/// rigs that is BIT-IDENTICAL to the deleted pre-pass pipeline (Commit D
+/// removed the flag and the in-substep pre-pass slot): there are no
+/// torque accumulators, so `integrate_velocities` never touches angular
+/// velocity, and positions are frozen until `integrate_positions` — the
+/// hand-driven solve reads exactly the state the in-substep slot read, so
+/// the A–D comparisons keep their teeth (and their recorded MEASURED
+/// values) unchanged.
+struct ReferencePath {
+    world: XpbdWorld,
+    joint: JointAxis,
+}
+
+impl ReferencePath {
+    fn substep(&mut self, sub_dt: f64) {
+        self.joint.apply_implicit(&mut self.world.bodies, sub_dt);
+        self.world.substep(sub_dt);
+    }
+}
+
+/// Build the SAME free-space rig twice from identical body states and one
+/// identical JointAxis: the engine path (in-loop lifecycle, the world's
+/// only path) and the `apply_implicit` reference (see `ReferencePath`).
 fn equivalence_pair(
     make_joint: &dyn Fn(usize, usize) -> JointAxis,
     child_omega_z: f64,
-) -> (XpbdWorld, XpbdWorld) {
-    let build = |coupled: bool| -> XpbdWorld {
+) -> (ReferencePath, XpbdWorld) {
+    let build = || -> (XpbdWorld, usize, usize) {
         let mut world = XpbdWorld::new();
-        world.coupled_joint_solve = coupled;
         let (p, ch) = pinned_pair(&mut world, 0.05, 1e-6);
         world.bodies[ch].angular_velocity = Vec3::new(0.0, 0.0, child_omega_z);
-        world.joint_axes.push(make_joint(p, ch));
-        world
+        (world, p, ch)
     };
-    (build(false), build(true))
+    let (ref_world, p, ch) = build();
+    let reference = ReferencePath { world: ref_world, joint: make_joint(p, ch) };
+    let (mut on, p, ch) = build();
+    on.joint_axes.push(make_joint(p, ch));
+    (reference, on)
 }
 
-/// Max-divergence report after running both worlds one substep: child
+/// Max-divergence report after running both paths one substep: child
 /// angular velocity, total-torque diagnostic, active-torque diagnostic.
 fn single_substep_divergence(
-    off: &mut XpbdWorld,
+    reference: &mut ReferencePath,
     on: &mut XpbdWorld,
     sub_dt: f64,
 ) -> (f64, f64, f64) {
-    off.substep(sub_dt);
+    reference.substep(sub_dt);
     on.substep(sub_dt);
-    let dv = (on.bodies[1].angular_velocity - off.bodies[1].angular_velocity).norm();
+    let dv =
+        (on.bodies[1].angular_velocity - reference.world.bodies[1].angular_velocity).norm();
     let d_total =
-        (on.joint_axes[0].applied_total_torque - off.joint_axes[0].applied_total_torque).abs();
+        (on.joint_axes[0].applied_total_torque - reference.joint.applied_total_torque).abs();
     let d_active =
-        (on.joint_axes[0].applied_active_torque - off.joint_axes[0].applied_active_torque).abs();
+        (on.joint_axes[0].applied_active_torque - reference.joint.applied_active_torque).abs();
     (dv, d_total, d_active)
 }
 
@@ -124,10 +156,15 @@ fn single_substep_divergence(
 ///
 /// MEASURED: |Δω| 7.3e-14, |Δτ| ≤ 5.3e-16 — two-plus orders inside the
 /// bounds. BITE-VERIFIED (2026-10-20): scaling the in-loop applied impulse
-/// by 0.999 fails this test (and B, C, D).
+/// by 0.999 fails this test (and B, C, D). RE-RUN (2026-10-29, Commit D)
+/// against the `ReferencePath` restructure (the flag-off world replaced by
+/// the direct apply_implicit reference): the same 0.999 scaling fails all
+/// four of A/B/C/D; restored, green, with every MEASURED value in this
+/// file reproduced exactly (the reference is bit-identical to the deleted
+/// pre-pass pipeline on these rigs — see `ReferencePath`).
 #[test]
 fn a_single_substep_unsaturated_matches_apply_implicit() {
-    let (mut off, mut on) = equivalence_pair(
+    let (mut reference, mut on) = equivalence_pair(
         &|p, ch| {
             JointAxis::new(p, ch, Vec3::z())
                 .with_pd(4.0, 0.15)
@@ -137,7 +174,8 @@ fn a_single_substep_unsaturated_matches_apply_implicit() {
         },
         2.0,
     );
-    let (dv, d_total, d_active) = single_substep_divergence(&mut off, &mut on, SUB_DT_FINE);
+    let (dv, d_total, d_active) =
+        single_substep_divergence(&mut reference, &mut on, SUB_DT_FINE);
     println!("A: |Δω| {dv:.3e}, |Δτ_total| {d_total:.3e}, |Δτ_active| {d_active:.3e}");
     assert!(dv < TOL_OMEGA, "unsaturated in-loop ω diverged from apply_implicit: {dv:e}");
     assert!(d_total < TOL_TORQUE, "unsaturated total-torque diagnostic diverged: {d_total:e}");
@@ -172,7 +210,7 @@ fn a_single_substep_unsaturated_matches_apply_implicit() {
 #[test]
 fn b_single_substep_saturated_matches_apply_implicit() {
     let tau_max = 0.11;
-    let (mut off, mut on) = equivalence_pair(
+    let (mut reference, mut on) = equivalence_pair(
         &|p, ch| {
             JointAxis::new(p, ch, Vec3::z())
                 .with_pd(30.0, 0.1)
@@ -183,7 +221,7 @@ fn b_single_substep_saturated_matches_apply_implicit() {
         },
         2.0,
     );
-    let (dv, d_total, _) = single_substep_divergence(&mut off, &mut on, SUB_DT_FINE);
+    let (dv, d_total, _) = single_substep_divergence(&mut reference, &mut on, SUB_DT_FINE);
     println!("B: |Δω| {dv:.3e}, |Δτ_total| {d_total:.3e}");
     assert!(dv < TOL_OMEGA, "saturated in-loop ω diverged from apply_implicit: {dv:e}");
     assert!(d_total < TOL_TORQUE, "saturated total-torque diagnostic diverged: {d_total:e}");
@@ -195,8 +233,8 @@ fn b_single_substep_saturated_matches_apply_implicit() {
         "in-loop saturated active diagnostic is not bit-equal to τ_max"
     );
     assert_eq!(
-        off.joint_axes[0].applied_active_torque, tau_max,
-        "pre-pass saturated active diagnostic is not bit-equal to τ_max"
+        reference.joint.applied_active_torque, tau_max,
+        "single-solve saturated active diagnostic is not bit-equal to τ_max"
     );
 }
 
@@ -224,16 +262,16 @@ fn b_single_substep_saturated_matches_apply_implicit() {
 #[test]
 fn c_degenerate_gamma_branches_match_apply_implicit() {
     // ── C1: pure feedforward ──
-    let (mut off, mut on) =
+    let (mut reference, mut on) =
         equivalence_pair(&|p, ch| JointAxis::new(p, ch, Vec3::z()).with_feedforward(0.3), 2.0);
-    let (dv, d_total, d_active) = single_substep_divergence(&mut off, &mut on, SUB_DT_FINE);
+    let (dv, d_total, d_active) = single_substep_divergence(&mut reference, &mut on, SUB_DT_FINE);
     println!("C1 pure-ff: |Δω| {dv:.3e}, |Δτ_total| {d_total:.3e}, |Δτ_active| {d_active:.3e}");
     assert!(dv < TOL_OMEGA, "C1 ω diverged: {dv:e}");
     assert!(d_total < TOL_TORQUE, "C1 total torque diverged: {d_total:e}");
     assert!(d_active < TOL_TORQUE, "C1 active torque diverged: {d_active:e}");
 
     // ── C2: pure feedforward + passive damper ──
-    let (mut off, mut on) = equivalence_pair(
+    let (mut reference, mut on) = equivalence_pair(
         &|p, ch| {
             JointAxis::new(p, ch, Vec3::z())
                 .with_feedforward(0.3)
@@ -241,14 +279,14 @@ fn c_degenerate_gamma_branches_match_apply_implicit() {
         },
         2.0,
     );
-    let (dv, d_total, d_active) = single_substep_divergence(&mut off, &mut on, SUB_DT_FINE);
+    let (dv, d_total, d_active) = single_substep_divergence(&mut reference, &mut on, SUB_DT_FINE);
     println!("C2 ff+damper: |Δω| {dv:.3e}, |Δτ_total| {d_total:.3e}, |Δτ_active| {d_active:.3e}");
     assert!(dv < TOL_OMEGA, "C2 ω diverged: {dv:e}");
     assert!(d_total < TOL_TORQUE, "C2 total torque diverged: {d_total:e}");
     assert!(d_active < TOL_TORQUE, "C2 active torque diverged: {d_active:e}");
 
     // ── C3: clamped constant (|ff| = 0.5 > τ_max = 0.11) ──
-    let (mut off, mut on) = equivalence_pair(
+    let (mut reference, mut on) = equivalence_pair(
         &|p, ch| {
             JointAxis::new(p, ch, Vec3::z())
                 .with_feedforward(0.5)
@@ -257,30 +295,30 @@ fn c_degenerate_gamma_branches_match_apply_implicit() {
         },
         2.0,
     );
-    let (dv, d_total, _) = single_substep_divergence(&mut off, &mut on, SUB_DT_FINE);
+    let (dv, d_total, _) = single_substep_divergence(&mut reference, &mut on, SUB_DT_FINE);
     println!("C3 clamped-ff: |Δω| {dv:.3e}, |Δτ_total| {d_total:.3e}");
     assert!(dv < TOL_OMEGA, "C3 ω diverged: {dv:e}");
     assert!(d_total < TOL_TORQUE, "C3 total torque diverged: {d_total:e}");
     assert_eq!(on.joint_axes[0].applied_active_torque, 0.11);
-    assert_eq!(off.joint_axes[0].applied_active_torque, 0.11);
+    assert_eq!(reference.joint.applied_active_torque, 0.11);
 
     // ── C4: pure ext_torque (constant passive row) ──
-    let (mut off, mut on) =
+    let (mut reference, mut on) =
         equivalence_pair(&|p, ch| JointAxis::new(p, ch, Vec3::z()), 2.0);
-    off.joint_axes[0].ext_torque = 0.05;
+    reference.joint.ext_torque = 0.05;
     on.joint_axes[0].ext_torque = 0.05;
-    let (dv, d_total, _) = single_substep_divergence(&mut off, &mut on, SUB_DT_FINE);
+    let (dv, d_total, _) = single_substep_divergence(&mut reference, &mut on, SUB_DT_FINE);
     println!("C4 pure-ext: |Δω| {dv:.3e}, |Δτ_total| {d_total:.3e}");
     assert!(dv < TOL_OMEGA, "C4 ω diverged: {dv:e}");
     assert!(d_total < TOL_TORQUE, "C4 total torque diverged: {d_total:e}");
     // ext_* is a per-substep quantity on both paths: consumed by prepare
-    // (flag on) exactly as by the pre-pass (flag off).
+    // (in-loop) exactly as by the single solve (reference).
     assert_eq!(on.joint_axes[0].ext_torque, 0.0, "prepare did not consume ext_torque");
-    assert_eq!(off.joint_axes[0].ext_torque, 0.0);
-    // The pre-pass's torque must have actually arrived (the injection is
+    assert_eq!(reference.joint.ext_torque, 0.0);
+    // The reference's torque must have actually arrived (the injection is
     // not a silent no-op): dt·w·τ_ext changes ω by ~69 rad/s here.
     assert!(
-        (off.bodies[1].angular_velocity.z - 2.0).abs() > 1.0,
+        (reference.world.bodies[1].angular_velocity.z - 2.0).abs() > 1.0,
         "ext_torque had no effect — C4 is testing nothing"
     );
 }
@@ -291,16 +329,16 @@ fn c_degenerate_gamma_branches_match_apply_implicit() {
 /// plain is_finite() classification keeps the row Soft — but the 2×2
 /// block's downstream products overflow: the determinant γ_a·γ_p and the
 /// numerator (w+γ_p)·r_a both exceed f64 range, inf/inf = NaN lands in
-/// the deltas, and the flag-on world's velocities go NaN while the
-/// pre-pass D-form (denominator 1 + dt·w·d ≈ 1) stays exact. The
+/// the deltas, and the in-loop world's velocities go NaN while the
+/// single-solve D-form (denominator 1 + dt·w·d ≈ 1) stays exact. The
 /// GAMMA_MAX = 1e100 guard classifies any such row as the γ→∞
 /// constant-impulse limit, whose error is below one ulp of dt·τ₀ (see the
 /// derivation at the guard).
 ///
 /// Config: feedforward 0.3 with kd = 1e-280 (active row: nonzero τ₀ +
 /// overflow-scale γ) plus passive damping 3e-280 (passive row: zero τ₀ +
-/// overflow-scale γ ⇒ Absent under the guard). One substep, flag on vs
-/// flag off, the A/B/C tolerances.
+/// overflow-scale γ ⇒ Absent under the guard). One substep, in-loop vs
+/// the apply_implicit reference, the A/B/C tolerances.
 ///
 /// MEASURED: |Δω|, |Δτ_total|, |Δτ_active| all exactly 0.0 — at this
 /// scale the constant-impulse limit and the D-form agree bit-for-bit
@@ -310,7 +348,7 @@ fn c_degenerate_gamma_branches_match_apply_implicit() {
 /// velocity is NaN and this test fails; guard restored, it passes.
 #[test]
 fn c5_overflow_scale_stiffness_degrades_to_constant_row() {
-    let (mut off, mut on) = equivalence_pair(
+    let (mut reference, mut on) = equivalence_pair(
         &|p, ch| {
             JointAxis::new(p, ch, Vec3::z())
                 .with_feedforward(0.3)
@@ -319,11 +357,11 @@ fn c5_overflow_scale_stiffness_degrades_to_constant_row() {
         },
         2.0,
     );
-    let (dv, d_total, d_active) = single_substep_divergence(&mut off, &mut on, SUB_DT_FINE);
+    let (dv, d_total, d_active) = single_substep_divergence(&mut reference, &mut on, SUB_DT_FINE);
     println!("C5 overflow-γ: |Δω| {dv:.3e}, |Δτ_total| {d_total:.3e}, |Δτ_active| {d_active:.3e}");
     assert!(
         on.bodies[1].angular_velocity.z.is_finite(),
-        "C5: flag-on velocity went non-finite (overflow-γ row poisoned the block solve)"
+        "C5: in-loop velocity went non-finite (overflow-γ row poisoned the block solve)"
     );
     assert!(dv < TOL_OMEGA, "C5 ω diverged: {dv:e}");
     assert!(d_total < TOL_TORQUE, "C5 total torque diverged: {d_total:e}");
@@ -334,8 +372,8 @@ fn c5_overflow_scale_stiffness_degrades_to_constant_row() {
 // D — multi-substep free-space trajectory (E3 precursor)
 // ════════════════════════════════════════════════════════════════════════
 
-/// 600 substeps (1/12 s) of the full unsaturated stack, flag on vs flag
-/// off in lockstep.
+/// 600 substeps (1/12 s) of the full unsaturated stack, the in-loop path
+/// vs the apply_implicit reference in lockstep.
 ///
 /// TOLERANCE: per-substep op-order divergence is ≤ ~1e-13 absolute on ω
 /// (file-header derivation); the stack is strongly damped (contractive),
@@ -358,7 +396,7 @@ fn c5_overflow_scale_stiffness_degrades_to_constant_row() {
 #[test]
 fn d_multi_substep_free_space_trajectory_matches() {
     let axis = Vec3::z();
-    let (mut off, mut on) = equivalence_pair(
+    let (mut reference, mut on) = equivalence_pair(
         &|p, ch| {
             JointAxis::new(p, ch, axis)
                 .with_pd(4.0, 0.15)
@@ -371,21 +409,24 @@ fn d_multi_substep_free_space_trajectory_matches() {
     let mut max_dtheta: f64 = 0.0;
     let mut max_domega: f64 = 0.0;
     for _ in 0..600 {
-        off.substep(SUB_DT_FINE);
+        reference.substep(SUB_DT_FINE);
         on.substep(SUB_DT_FINE);
-        let da = (joint_angle(&on, 0, 1, axis) - joint_angle(&off, 0, 1, axis)).abs();
-        let dw = (on.bodies[1].angular_velocity - off.bodies[1].angular_velocity).norm();
+        let da =
+            (joint_angle(&on, 0, 1, axis) - joint_angle(&reference.world, 0, 1, axis)).abs();
+        let dw = (on.bodies[1].angular_velocity
+            - reference.world.bodies[1].angular_velocity)
+            .norm();
         if da > max_dtheta { max_dtheta = da; }
         if dw > max_domega { max_domega = dw; }
     }
     println!("D: max|Δθ| {max_dtheta:.3e}, max|Δω| {max_domega:.3e} over 600 substeps");
     assert!(
         max_dtheta < 1e-10,
-        "flag-on trajectory diverged from flag-off: max|Δθ| = {max_dtheta:e}"
+        "in-loop trajectory diverged from apply_implicit: max|Δθ| = {max_dtheta:e}"
     );
     assert!(
         max_domega < 1e-10,
-        "flag-on trajectory diverged from flag-off: max|Δω| = {max_domega:e}"
+        "in-loop trajectory diverged from apply_implicit: max|Δω| = {max_domega:e}"
     );
 }
 
@@ -403,11 +444,13 @@ fn d_multi_substep_free_space_trajectory_matches() {
 /// moves the +z tip down), so the contact blocks the axis and the joint
 /// must transmit THROUGH it. The table reports the fraction of the
 /// state-computed static demand kp·(target − θ) that arrives as
-/// `applied_total_torque` (under the flag: the REALIZED transmitted
-/// torque including contact coupling) over the last 0.1 s of a 1 s settle,
-/// at solver_iterations ∈ {4, 8, 16, 32} × sub_dt ∈ {1/7200, 1/3600},
-/// flag on — plus the flag-off pre-pass at 8 iterations as the legacy
-/// receipt. This measurement decides the design's escalation levers
+/// `applied_total_torque` (the REALIZED transmitted torque including
+/// contact coupling) over the last 0.1 s of a 1 s settle,
+/// at solver_iterations ∈ {4, 8, 16, 32} × sub_dt ∈ {1/7200, 1/3600}.
+/// The flag-off pre-pass rows this harness printed through Commit C are
+/// HISTORICAL (the pre-pass pipeline was deleted in Commit D); their
+/// receipts stay recorded below (0.0090 @1/7200, 0.0045 @1/3600). This
+/// measurement decided the design's escalation levers
 /// (L1: 16 iterations; L2: warm-start pair); it asserts nothing beyond
 /// running to finite numbers.
 ///
@@ -437,9 +480,8 @@ fn e6_transmitted_torque_fraction_vs_solver_iterations() {
     let kp = 2.0;
     let target = 0.6;
 
-    let run = |iters: usize, sub_dt: f64, coupled: bool| -> (f64, f64, f64) {
+    let run = |iters: usize, sub_dt: f64| -> (f64, f64, f64) {
         let mut world = XpbdWorld::new();
-        world.coupled_joint_solve = coupled;
         world.solver_iterations = iters;
         world.set_ground(0.0);
 
@@ -495,14 +537,8 @@ fn e6_transmitted_torque_fraction_vs_solver_iterations() {
 
     for &sub_dt in &[SUB_DT_FINE, SUB_DT_COARSE] {
         println!("── sub_dt = 1/{:.0} ──", 1.0 / sub_dt);
-        let (tx, demand, f_n) = run(8, sub_dt, false);
-        println!(
-            "  legacy pre-pass @ 8 iters: transmitted {tx:+.4e} N·m, demand {demand:+.4e} N·m, \
-             fraction {:+.4}, ΣF_n {f_n:.2} N",
-            tx / demand
-        );
         for &iters in &[4usize, 8, 16, 32] {
-            let (tx, demand, f_n) = run(iters, sub_dt, true);
+            let (tx, demand, f_n) = run(iters, sub_dt);
             let frac = tx / demand;
             println!(
                 "  coupled      @{iters:>2} iters: transmitted {tx:+.4e} N·m, demand \
@@ -554,10 +590,9 @@ const E1_ELEV: f64 = 0.004;
 const E1_KP: f64 = 4.0;
 const E1_PRESS: f64 = 0.6; // pressed target = φ₀ + 0.6 ⇒ demand ≈ 2.4 N·m
 
-fn e1_rig(coupled: bool, iters: usize) -> E1Rig {
+fn e1_rig(iters: usize) -> E1Rig {
     let phi0 = (E1_ELEV / (2.0 * E1_HALF_H)).asin();
     let mut world = XpbdWorld::new();
-    world.coupled_joint_solve = coupled;
     world.solver_iterations = iters;
     world.set_ground(0.0);
 
@@ -644,8 +679,8 @@ fn e1_run_phase(rig: &mut E1Rig, sub_dt: f64, seconds: f64) -> E1Phase {
 
 /// Neutral settle (1 s at target φ₀), then pressed settle (1 s at
 /// φ₀ + 0.6): the two phases E1 measures.
-fn e1_two_phases(coupled: bool, iters: usize, sub_dt: f64) -> (E1Phase, E1Phase, E1Rig) {
-    let mut rig = e1_rig(coupled, iters);
+fn e1_two_phases(iters: usize, sub_dt: f64) -> (E1Phase, E1Phase, E1Rig) {
+    let mut rig = e1_rig(iters);
     let neutral = e1_run_phase(&mut rig, sub_dt, 1.0);
     let press_target = rig.phi0 + E1_PRESS;
     rig.world.joint_axes[0].target_angle = press_target;
@@ -653,7 +688,7 @@ fn e1_two_phases(coupled: bool, iters: usize, sub_dt: f64) -> (E1Phase, E1Phase,
     (neutral, pressed, rig)
 }
 
-/// E1 — static force transmission (design §4, the ~100 N check), flag ON.
+/// E1 — static force transmission (design §4, the ~100 N check).
 ///
 /// Assertions, verbatim from the design:
 ///   (i)   `applied_total_torque` vs the state-computed static demand,
@@ -665,15 +700,18 @@ fn e1_two_phases(coupled: bool, iters: usize, sub_dt: f64) -> (E1Phase, E1Phase,
 ///   (iii) the 1/7200 and 1/3600 runs agree within 2% (on the pressed
 ///         transmitted torque and on ΔF_n).
 ///
-/// FLAG-OFF RECEIPT (2026-10-21, measured via the receipts harness below):
-/// the legacy pre-pass transmits 0.0039 of the 2.4000 N·m demand at 1/7200
+/// HISTORICAL FLAG-OFF RECEIPT (2026-10-21, measured via the receipts
+/// harness below while the deleted pre-pass path still existed):
+/// the legacy pre-pass transmitted 0.0039 of the 2.4000 N·m demand at 1/7200
 /// (fraction 0.0016 ≈ 1/D with D = 1 + dt·w·(kd+c) ≈ 616) and 0.0019 at
 /// 1/3600 (0.0008 — halving with dt, the damping-dominated signature);
 /// ΔF_n = 0.17 N where the lever statics demand ~101 N. The documented
-/// force-transmission gap at full strength; flipping this gate's builders
-/// to coupled = false reproduces exactly those numbers and fails (i).
+/// force-transmission gap at full strength; through Commit C, flipping
+/// this gate's builders to coupled = false reproduced exactly those
+/// numbers and failed (i). Commit D deleted that path; the live bites
+/// below (both L2 sides) remain runnable and are what now arm this gate.
 ///
-/// FLAG-ON COLD-START MISS (2026-10-21, 8 iters): fraction 0.0255 at
+/// COLD-START MISS (2026-10-21, 8 iters, historical): fraction 0.0255 at
 /// 1/7200 / 0.0128 at 1/3600 (0.0502/0.0254 at 16 iters, 0.0971/0.0501 at
 /// 32) — this rig is in E6's near-degenerate alignment class (pinned
 /// proximal + grounded child, a → 1): the per-sweep residual tracks
@@ -696,11 +734,15 @@ fn e1_two_phases(coupled: bool, iters: usize, sub_dt: f64) -> (E1Phase, E1Phase,
 /// double-applies the carried contact impulse fails this test (E5 stays
 /// green under that bug: the over-application is unwound within the first
 /// sweep by the λ ≥ 0 clamp without pumping — E1's statics catch it, not
-/// the energy canary).
+/// the energy canary). RE-VERIFIED at Commit D (2026-10-29, the flag and
+/// pre-pass deleted): with BOTH L2 carries disabled on the live path the
+/// gate fails at fraction 0.0255 — bit-for-bit the recorded cold-start
+/// miss above — and the JA toe-ray canary fails alongside it (fraction
+/// 0.0414); restored, green.
 #[test]
 fn e1_static_force_transmission() {
-    let (n_f, p_f, _) = e1_two_phases(true, 8, SUB_DT_FINE);
-    let (n_c, p_c, _) = e1_two_phases(true, 8, SUB_DT_COARSE);
+    let (n_f, p_f, _) = e1_two_phases(8, SUB_DT_FINE);
+    let (n_c, p_c, _) = e1_two_phases(8, SUB_DT_COARSE);
 
     for (n, p, rate) in [(&n_f, &p_f, "1/7200"), (&n_c, &p_c, "1/3600")] {
         println!(
@@ -769,7 +811,7 @@ fn e1_mechanical_energy(world: &XpbdWorld, child: usize) -> f64 {
 /// ≥ 10⁶× above the settled micro-jitter KE (½·I·ω² ≈ 1e-13 J at the
 /// measured post-speculative jitter scale).
 ///
-/// MEASURED (2026-10-21, flag on, cold start): max rise 0.000e0 J — the
+/// MEASURED (2026-10-21, cold start): max rise 0.000e0 J — the
 /// sampled energy is non-increasing at every one of the 500 samples.
 /// BITE-VERIFIED (2026-10-21): an anti-damper injector (passive_damping
 /// set to −1.0 at the window start — energy injection through the
@@ -781,7 +823,7 @@ const E5_BOUND: f64 = 1e-5;
 
 #[test]
 fn e5_pressed_phase_energy_is_monotone() {
-    let mut rig = e1_rig(true, 8);
+    let mut rig = e1_rig(8);
     let sub_dt = SUB_DT_FINE;
     e1_run_phase(&mut rig, sub_dt, 1.0);
     rig.world.joint_axes[0].target_angle = rig.phi0 + E1_PRESS;
@@ -829,7 +871,7 @@ fn e5_pressed_phase_energy_is_monotone() {
 /// STRADDLES the 1.25 command ratio across the two rates — D ≈ 1.20 at
 /// 1/7200, ≈ 1.40 at 1/3600 — the scenario class whose OUTCOME flips with
 /// sub_dt on the legacy path.
-fn e2_run(coupled: bool, iters: usize, cmd_frac: f64, sub_dt: f64) -> (bool, f64, f64) {
+fn e2_run(iters: usize, cmd_frac: f64, sub_dt: f64) -> (bool, f64, f64) {
     const M: f64 = 1.0;
     const HALF_H: f64 = 0.1;
     const R: f64 = 0.02;
@@ -837,7 +879,6 @@ fn e2_run(coupled: bool, iters: usize, cmd_frac: f64, sub_dt: f64) -> (bool, f64
     let kp = 20.0;
 
     let mut world = XpbdWorld::new();
-    world.coupled_joint_solve = coupled;
     world.solver_iterations = iters;
     world.set_ground(0.0);
     // The ball contact is the rig's rotation PIVOT: as the foot
@@ -907,7 +948,7 @@ fn e2_run(coupled: bool, iters: usize, cmd_frac: f64, sub_dt: f64) -> (bool, f64
     (clearance > 5e-4, clearance, heel_n)
 }
 
-/// E2 — grounded dt-independence (heel-lift threshold), flag ON.
+/// E2 — grounded dt-independence (heel-lift threshold).
 /// Commands realize 0.8·τ* (must NOT lift, heel stays loaded at both
 /// rates) and 1.25·τ* (must lift at both rates, settled heel height within
 /// 10% across rates). The lift outcomes are also asserted against the
@@ -923,19 +964,27 @@ fn e2_run(coupled: bool, iters: usize, cmd_frac: f64, sub_dt: f64) -> (bool, f64
 /// (D ≈ 1.2 ⇒ per-sweep residual ≤ 0.17, fully converged in 8 sweeps), so
 /// the gate passes at cold start — no lever needed.
 ///
-/// FLAG-OFF RECEIPT (2026-10-21): the outcome flips qualitatively with
+/// HISTORICAL FLAG-OFF RECEIPT (2026-10-21, the deleted pre-pass path):
+/// the outcome flipped qualitatively with
 /// sub_dt, as the design predicts for this scenario class: at 1/7200 the
-/// 1.25·τ* command unloads the heel (0.000 N) and creeps it to 4.6e-4 m
-/// (still rising at 2 s), while at 1/3600 the heel stays HARD GROUNDED
-/// under 0.543 N — the pre-pass denominator D straddles the 1.25 command
-/// ratio (1.20 vs 1.40). BITE-VERIFIED (2026-10-21): with this gate's
-/// builders flipped to coupled = false it fails the 1.25·τ* lift
-/// assertions at both rates.
+/// 1.25·τ* command unloaded the heel (0.000 N) and crept it to 4.6e-4 m
+/// (still rising at 2 s), while at 1/3600 the heel stayed HARD GROUNDED
+/// under 0.543 N — the pre-pass denominator D straddled the 1.25 command
+/// ratio (1.20 vs 1.40). The original bite flipped this gate's builders
+/// to coupled = false and failed the 1.25·τ* lift assertions at both
+/// rates; Commit D deleted that path, and the dt-DEPENDENT failure mode
+/// (demand throttled by the joint's own denominator) physically cannot
+/// recur — the in-loop fixed point is dt-independent by construction
+/// (design §2.5). RE-ARMED BITE (2026-10-29, Commit D): with
+/// `JointAxis::solve_iteration` made an early-return no-op (the live
+/// transmission path severed), the 1.25·τ* command transmits nothing and
+/// the lift assertion fails (measured: clearance −3.0e-13 m at 1/7200 —
+/// the heel never leaves the ground); restored, green.
 #[test]
 fn e2_heel_lift_threshold_is_dt_independent() {
     for &(frac, should_lift) in &[(0.8, false), (1.25, true)] {
-        let (lift_f, clear_f, heel_f) = e2_run(true, 8, frac, SUB_DT_FINE);
-        let (lift_c, clear_c, heel_c) = e2_run(true, 8, frac, SUB_DT_COARSE);
+        let (lift_f, clear_f, heel_f) = e2_run(8, frac, SUB_DT_FINE);
+        let (lift_c, clear_c, heel_c) = e2_run(8, frac, SUB_DT_COARSE);
         println!(
             "E2 @{frac}·τ*: fine lift {lift_f} (clear {clear_f:+.3e} m, heel {heel_f:.3} N), \
              coarse lift {lift_c} (clear {clear_c:+.3e} m, heel {heel_c:.3} N)"
@@ -1082,7 +1131,7 @@ fn mixed_same_pair_legacy_damper_press_transmits_to_ground() {
     const MIXED_E_BOUND: f64 = 1e-5;
     let sub_dt = SUB_DT_FINE;
 
-    let mut rig = e1_rig(true, 8);
+    let mut rig = e1_rig(8);
     rig.world
         .angular_dampers
         .push(AngularDamper::new(rig.parent, rig.child, Vec3::x(), 1.0));
@@ -1189,7 +1238,7 @@ fn mixed_adjacent_legacy_stack_press_stays_quiet() {
     const MIXED_E_BOUND: f64 = 1e-5;
     let sub_dt = SUB_DT_FINE;
 
-    let mut rig = e1_rig(true, 8);
+    let mut rig = e1_rig(8);
     let link = add_legacy_distal_link(&mut rig);
 
     e1_run_phase(&mut rig, sub_dt, 1.0);
@@ -1434,29 +1483,31 @@ fn saturated_diagnostic_is_bit_exact_through_convergence_skips() {
     println!("saturation diagnostic bit-equal on {exact}/{total} steady-state substeps");
 }
 
-/// DIAGNOSTIC harness for the E1/E2 receipts and the L1 iteration sweep —
+/// DIAGNOSTIC harness for the E1/E2 numbers and the L1 iteration sweep —
 /// run with `cargo test -p physics --test coupled_joint -- --ignored
-/// --nocapture`. Prints E1 and E2 at flag off/on × solver_iterations
-/// {8, 16, 32} × both sub_dts. The flag-off rows are the Commit B receipts;
-/// the 16-iteration rows are the design's L1 trigger measurement.
+/// --nocapture`. Prints E1 and E2 at solver_iterations {8, 16, 32} × both
+/// sub_dts. The 16-iteration rows were the design's L1 trigger
+/// measurement. The legacy flag-off rows this harness printed through
+/// Commit C were the Commit B receipts — that path was deleted in Commit D
+/// and the receipts are preserved (HISTORICAL) in E1's and E2's doc
+/// comments above.
 #[test]
-#[ignore = "diagnostic harness (E1/E2 receipts + L1 sweep) — run with --ignored --nocapture"]
+#[ignore = "diagnostic harness (E1/E2 numbers + L1 sweep) — run with --ignored --nocapture"]
 fn e1_e2_receipts_and_iteration_sweep() {
     for &sub_dt in &[SUB_DT_FINE, SUB_DT_COARSE] {
         println!("── sub_dt = 1/{:.0} ──", 1.0 / sub_dt);
-        for &(coupled, iters) in &[(false, 8usize), (true, 8), (true, 16), (true, 32)] {
-            let tag = if coupled { "coupled" } else { "legacy " };
-            let (n, p, _) = e1_two_phases(coupled, iters, sub_dt);
+        for &iters in &[8usize, 16, 32] {
+            let (n, p, _) = e1_two_phases(iters, sub_dt);
             println!(
-                "  E1 {tag}@{iters:>2}: τ_tx {:+.4} vs demand {:+.4} N·m (fraction {:+.4}), \
+                "  E1 coupled@{iters:>2}: τ_tx {:+.4} vs demand {:+.4} N·m (fraction {:+.4}), \
                  ΔF_n {:+.2} N vs Δτ/l {:+.2} N",
                 p.tau_tx, p.demand, p.tau_tx / p.demand,
                 p.f_n - n.f_n, (p.tau_tx - n.tau_tx) / p.lever
             );
             for &frac in &[0.8, 1.25] {
-                let (lift, clear, heel_n) = e2_run(coupled, iters, frac, sub_dt);
+                let (lift, clear, heel_n) = e2_run(iters, frac, sub_dt);
                 println!(
-                    "  E2 {tag}@{iters:>2} @{frac}·τ*: lift {lift} \
+                    "  E2 coupled@{iters:>2} @{frac}·τ*: lift {lift} \
                      (clearance {clear:+.3e} m, heel {heel_n:.3} N)"
                 );
             }

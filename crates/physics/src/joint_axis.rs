@@ -144,19 +144,20 @@ impl SoftLimit {
 ///   zero at the ROM boundary, so there is no jump). A predictor-corrector
 ///   (re-linearizing at the predicted θ⁺) is deliberately deferred.
 ///
-/// TWO EXECUTION MODES, one free-space fixed point: the pre-pass
-/// `apply_implicit` below (the executable spec — runs when
-/// `XpbdWorld::coupled_joint_solve` is false, the one-flag rollback)
-/// solves the joint once per substep before the SI loop; the in-loop
-/// lifecycle (`prepare`/`solve_iteration`/`finalize`, flag true — the
-/// default since Commit B) runs the SAME
-/// backward-Euler solve as an iterated soft constraint inside the SI loop,
-/// so joint and contact impulses couple within each sweep. In free space
-/// the two are algebraically identical (the in-loop form lands on the
-/// pre-pass fixed point on iteration 1); they differ exactly where the
-/// pre-pass is wrong — under contact, where the pre-pass books velocity
-/// feedback against motion the contacts then annihilate (the measured
-/// 1/1880 force-transmission gap). See the design contract:
+/// EXECUTION: `XpbdWorld::substep` runs the in-loop lifecycle
+/// (`prepare`/`apply_warm_start`/`solve_iteration`/`finalize`)
+/// unconditionally — Commit D of the coupled-solve design removed the
+/// `coupled_joint_solve` flag and the world-level pre-pass slot — so
+/// joint and contact impulses couple within each SI sweep. The
+/// single-solve `apply_implicit` below is KEPT as the documented
+/// primitive: the executable spec of the free-space fixed point, which
+/// the in-loop form lands on at iteration 1 when nothing else acts on
+/// the pair (the A–D equivalence gates in
+/// crates/physics/tests/coupled_joint.rs drive it directly against the
+/// engine path). The two differ exactly where the deleted pre-pass was
+/// wrong — under contact, where a one-shot solve books velocity feedback
+/// against motion the contacts then annihilate (the measured 1/1880
+/// force-transmission gap). See the design contract:
 /// docs/superpowers/specs/2026-10-21-coupled-joint-contact-solve.md.
 ///
 /// `enabled` gates only the ACTIVE terms (kp, kd, feedforward, torque
@@ -218,7 +219,7 @@ pub struct JointAxis {
     /// (= J/dt of the combined impulse).
     pub applied_total_torque: f64,
 
-    // ── In-loop coupled-solve state (XpbdWorld::coupled_joint_solve) ──
+    // ── In-loop coupled-solve state (the engine's substep path) ──
     /// Accumulated ACTIVE impulse (N·m·s) this substep, built up by
     /// `solve_iteration` inside the SI loop. The torque budget lives here:
     /// |lambda_a| ≤ dt·torque_limit, enforced on the ACCUMULATED value, so
@@ -465,9 +466,15 @@ impl JointAxis {
         e
     }
 
-    /// The combined implicit solve. Must be called once per substep, after
-    /// `integrate_velocities` (in `XpbdWorld::substep` it runs in the same
-    /// slot as the legacy implicit passes, immediately before them).
+    /// The combined implicit solve in ONE shot — the documented
+    /// single-solve primitive and the executable spec of the free-space
+    /// fixed point. `XpbdWorld::substep` does NOT call it (Commit D
+    /// removed the pre-pass slot; the in-loop lifecycle below is the
+    /// engine path): the A–D equivalence gates in
+    /// crates/physics/tests/coupled_joint.rs drive it directly on a
+    /// reference copy of the rig, asserting the in-loop path lands on this
+    /// solve's fixed point. Callers must invoke it once per substep-sized
+    /// dt from a state where positions and the axis velocity are current.
     ///
     /// Per substep (all quantities scalar, along the world axis
     /// n = q_a·axis_local_a):
@@ -642,9 +649,9 @@ impl JointAxis {
         }
     }
 
-    // ─── In-loop coupled solve (XpbdWorld::coupled_joint_solve) ─────────
+    // ─── In-loop coupled solve (the engine's unconditional path) ────────
     //
-    // The pre-pass above models ITS OWN impulse as the sole determinant of
+    // The single solve above models ITS OWN impulse as the sole determinant of
     // the end-of-substep velocity. When the SI contact loop afterwards
     // annihilates that velocity (a wedged toe), the booked velocity-
     // feedback terms were charged against motion that never happened and

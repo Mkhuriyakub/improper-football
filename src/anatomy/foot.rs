@@ -718,7 +718,8 @@ mod tests {
     /// the press genuinely lifts the pp (≥ 0.8 mm; grid minimum 0.90 mm,
     /// and the BLOCKED Stage-2 branch measured 0.6 mm — this bites the
     /// transmission gap). The legacy pipeline flipped grounded outcomes
-    /// qualitatively with sub_dt (E2's flag-off receipt), so the angle
+    /// qualitatively with sub_dt (E2's historical flag-off receipt — the
+    /// pre-pass path was deleted in Commit D), so the angle
     /// band is a real discriminator. BITE-VERIFIED: asserting the naive
     /// fixed-sweeps pair (32/32) fails the 2% angle band at 27% — the
     /// matched-effort comparison is load-bearing, not cosmetic.

@@ -738,7 +738,9 @@ fn build_bare() -> Built {
     // load-bearing for the neutral-stance Fn band and does NOT rectify the
     // seeds (the seeds apply after the legacy passes), so it stays. The
     // clean migration (folding it into each JointAxis's passive_damping)
-    // is Commit-D cleanup territory.
+    // remains deferred: Commit D (2026-10-29) removed only the engine
+    // flag and the pre-pass slot — folding these dampers changes a
+    // measured composition and needs its own gated change.
     let subtalar_axis = foot::anat_to_world(foot::subtalar_axis_anat());
     world.angular_dampers.push(physics::angular_damper::AngularDamper::new(
         foot.body(Bone::Talus), foot.body(Bone::Calcaneus), subtalar_axis, 3.0));
